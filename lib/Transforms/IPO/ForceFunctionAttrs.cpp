@@ -57,6 +57,7 @@ static Attribute::AttrKind parseAttrKind(StringRef Kind) {
       .Case("ssp", Attribute::StackProtect)
       .Case("sspreq", Attribute::StackProtectReq)
       .Case("sspstrong", Attribute::StackProtectStrong)
+      .Case("strictfp", Attribute::StrictFP)
       .Case("uwtable", Attribute::UWTable)
       .Default(Attribute::None);
 }
@@ -80,7 +81,8 @@ static void addForcedAttributes(Function &F) {
   }
 }
 
-PreservedAnalyses ForceFunctionAttrsPass::run(Module &M) {
+PreservedAnalyses ForceFunctionAttrsPass::run(Module &M,
+                                              ModuleAnalysisManager &) {
   if (ForceAttributes.empty())
     return PreservedAnalyses::all();
 

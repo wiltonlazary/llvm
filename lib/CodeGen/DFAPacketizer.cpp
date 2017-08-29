@@ -24,48 +24,66 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/CodeGen/DFAPacketizer.h"
+#include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineInstrBundle.h"
+#include "llvm/CodeGen/ScheduleDAG.h"
 #include "llvm/CodeGen/ScheduleDAGInstrs.h"
+#include "llvm/MC/MCInstrDesc.h"
 #include "llvm/MC/MCInstrItineraries.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetInstrInfo.h"
+#include "llvm/Target/TargetSubtargetInfo.h"
+#include <algorithm>
+#include <cassert>
+#include <iterator>
+#include <memory>
+#include <vector>
 
 using namespace llvm;
+
+#define DEBUG_TYPE "packets"
+
+static cl::opt<unsigned> InstrLimit("dfa-instr-limit", cl::Hidden,
+  cl::init(0), cl::desc("If present, stops packetizing after N instructions"));
+
+static unsigned InstrCount = 0;
 
 // --------------------------------------------------------------------
 // Definitions shared between DFAPacketizer.cpp and DFAPacketizerEmitter.cpp
 
-namespace {
-  DFAInput addDFAFuncUnits(DFAInput Inp, unsigned FuncUnits) {
-    return (Inp << DFA_MAX_RESOURCES) | FuncUnits;
-  }
-
-  /// Return the DFAInput for an instruction class input vector.
-  /// This function is used in both DFAPacketizer.cpp and in
-  /// DFAPacketizerEmitter.cpp.
-  DFAInput getDFAInsnInput(const std::vector<unsigned> &InsnClass) {
-    DFAInput InsnInput = 0;
-    assert((InsnClass.size() <= DFA_MAX_RESTERMS) &&
-           "Exceeded maximum number of DFA terms");
-    for (auto U : InsnClass)
-      InsnInput = addDFAFuncUnits(InsnInput, U);
-    return InsnInput;
-  }
+static DFAInput addDFAFuncUnits(DFAInput Inp, unsigned FuncUnits) {
+  return (Inp << DFA_MAX_RESOURCES) | FuncUnits;
 }
+
+/// Return the DFAInput for an instruction class input vector.
+/// This function is used in both DFAPacketizer.cpp and in
+/// DFAPacketizerEmitter.cpp.
+static DFAInput getDFAInsnInput(const std::vector<unsigned> &InsnClass) {
+  DFAInput InsnInput = 0;
+  assert((InsnClass.size() <= DFA_MAX_RESTERMS) &&
+         "Exceeded maximum number of DFA terms");
+  for (auto U : InsnClass)
+    InsnInput = addDFAFuncUnits(InsnInput, U);
+  return InsnInput;
+}
+
 // --------------------------------------------------------------------
 
 DFAPacketizer::DFAPacketizer(const InstrItineraryData *I,
                              const DFAStateInput (*SIT)[2],
                              const unsigned *SET):
-  InstrItins(I), CurrentState(0), DFAStateInputTable(SIT),
-  DFAStateEntryTable(SET) {
+  InstrItins(I), DFAStateInputTable(SIT), DFAStateEntryTable(SET) {
   // Make sure DFA types are large enough for the number of terms & resources.
-  assert((DFA_MAX_RESTERMS * DFA_MAX_RESOURCES) <= (8 * sizeof(DFAInput))
-        && "(DFA_MAX_RESTERMS * DFA_MAX_RESOURCES) too big for DFAInput");
-  assert((DFA_MAX_RESTERMS * DFA_MAX_RESOURCES) <= (8 * sizeof(DFAStateInput))
-        && "(DFA_MAX_RESTERMS * DFA_MAX_RESOURCES) too big for DFAStateInput");
+  static_assert((DFA_MAX_RESTERMS * DFA_MAX_RESOURCES) <=
+                    (8 * sizeof(DFAInput)),
+                "(DFA_MAX_RESTERMS * DFA_MAX_RESOURCES) too big for DFAInput");
+  static_assert(
+      (DFA_MAX_RESTERMS * DFA_MAX_RESOURCES) <= (8 * sizeof(DFAStateInput)),
+      "(DFA_MAX_RESTERMS * DFA_MAX_RESOURCES) too big for DFAStateInput");
 }
-
 
 // Read the DFA transition table and update CachedTable.
 //
@@ -88,7 +106,6 @@ void DFAPacketizer::ReadTable(unsigned int state) {
       DFAStateInputTable[i][1];
 }
 
-
 // Return the DFAInput for an instruction class.
 DFAInput DFAPacketizer::getInsnInput(unsigned InsnClass) {
   // Note: this logic must match that in DFAPacketizerDefs.h for input vectors.
@@ -103,16 +120,14 @@ DFAInput DFAPacketizer::getInsnInput(unsigned InsnClass) {
   return InsnInput;
 }
 
-
 // Return the DFAInput for an instruction class input vector.
 DFAInput DFAPacketizer::getInsnInput(const std::vector<unsigned> &InsnClass) {
   return getDFAInsnInput(InsnClass);
 }
 
-
 // Check if the resources occupied by a MCInstrDesc are available in the
 // current state.
-bool DFAPacketizer::canReserveResources(const llvm::MCInstrDesc *MID) {
+bool DFAPacketizer::canReserveResources(const MCInstrDesc *MID) {
   unsigned InsnClass = MID->getSchedClass();
   DFAInput InsnInput = getInsnInput(InsnClass);
   UnsignPair StateTrans = UnsignPair(CurrentState, InsnInput);
@@ -120,10 +135,9 @@ bool DFAPacketizer::canReserveResources(const llvm::MCInstrDesc *MID) {
   return CachedTable.count(StateTrans) != 0;
 }
 
-
 // Reserve the resources occupied by a MCInstrDesc and change the current
 // state to reflect that change.
-void DFAPacketizer::reserveResources(const llvm::MCInstrDesc *MID) {
+void DFAPacketizer::reserveResources(const MCInstrDesc *MID) {
   unsigned InsnClass = MID->getSchedClass();
   DFAInput InsnInput = getInsnInput(InsnClass);
   UnsignPair StateTrans = UnsignPair(CurrentState, InsnInput);
@@ -132,37 +146,47 @@ void DFAPacketizer::reserveResources(const llvm::MCInstrDesc *MID) {
   CurrentState = CachedTable[StateTrans];
 }
 
-
 // Check if the resources occupied by a machine instruction are available
 // in the current state.
-bool DFAPacketizer::canReserveResources(llvm::MachineInstr *MI) {
-  const llvm::MCInstrDesc &MID = MI->getDesc();
+bool DFAPacketizer::canReserveResources(MachineInstr &MI) {
+  const MCInstrDesc &MID = MI.getDesc();
   return canReserveResources(&MID);
 }
 
-
 // Reserve the resources occupied by a machine instruction and change the
 // current state to reflect that change.
-void DFAPacketizer::reserveResources(llvm::MachineInstr *MI) {
-  const llvm::MCInstrDesc &MID = MI->getDesc();
+void DFAPacketizer::reserveResources(MachineInstr &MI) {
+  const MCInstrDesc &MID = MI.getDesc();
   reserveResources(&MID);
 }
 
-
 namespace llvm {
+
 // This class extends ScheduleDAGInstrs and overrides the schedule method
 // to build the dependence graph.
 class DefaultVLIWScheduler : public ScheduleDAGInstrs {
 private:
   AliasAnalysis *AA;
+  /// Ordered list of DAG postprocessing steps.
+  std::vector<std::unique_ptr<ScheduleDAGMutation>> Mutations;
+
 public:
   DefaultVLIWScheduler(MachineFunction &MF, MachineLoopInfo &MLI,
                        AliasAnalysis *AA);
+
   // Actual scheduling work.
   void schedule() override;
-};
-}
 
+  /// DefaultVLIWScheduler takes ownership of the Mutation object.
+  void addMutation(std::unique_ptr<ScheduleDAGMutation> Mutation) {
+    Mutations.push_back(std::move(Mutation));
+  }
+
+protected:
+  void postprocessDAG();
+};
+
+} // end namespace llvm
 
 DefaultVLIWScheduler::DefaultVLIWScheduler(MachineFunction &MF,
                                            MachineLoopInfo &MLI,
@@ -171,12 +195,17 @@ DefaultVLIWScheduler::DefaultVLIWScheduler(MachineFunction &MF,
   CanHandleTerminators = true;
 }
 
+/// Apply each ScheduleDAGMutation step in order.
+void DefaultVLIWScheduler::postprocessDAG() {
+  for (auto &M : Mutations)
+    M->apply(this);
+}
 
 void DefaultVLIWScheduler::schedule() {
   // Build the scheduling graph.
   buildSchedGraph(AA);
+  postprocessDAG();
 }
-
 
 VLIWPacketizerList::VLIWPacketizerList(MachineFunction &mf,
                                        MachineLoopInfo &mli, AliasAnalysis *aa)
@@ -185,25 +214,29 @@ VLIWPacketizerList::VLIWPacketizerList(MachineFunction &mf,
   VLIWScheduler = new DefaultVLIWScheduler(MF, mli, AA);
 }
 
-
 VLIWPacketizerList::~VLIWPacketizerList() {
-  if (VLIWScheduler)
-    delete VLIWScheduler;
-  if (ResourceTracker)
-    delete ResourceTracker;
+  delete VLIWScheduler;
+  delete ResourceTracker;
 }
 
-
 // End the current packet, bundle packet instructions and reset DFA state.
-void VLIWPacketizerList::endPacket(MachineBasicBlock *MBB, MachineInstr *MI) {
+void VLIWPacketizerList::endPacket(MachineBasicBlock *MBB,
+                                   MachineBasicBlock::iterator MI) {
+  DEBUG({
+    if (!CurrentPacketMIs.empty()) {
+      dbgs() << "Finalizing packet:\n";
+      for (MachineInstr *MI : CurrentPacketMIs)
+        dbgs() << " * " << *MI;
+    }
+  });
   if (CurrentPacketMIs.size() > 1) {
-    MachineInstr *MIFirst = CurrentPacketMIs.front();
-    finalizeBundle(*MBB, MIFirst->getIterator(), MI->getIterator());
+    MachineInstr &MIFirst = *CurrentPacketMIs.front();
+    finalizeBundle(*MBB, MIFirst.getIterator(), MI.getInstrIterator());
   }
   CurrentPacketMIs.clear();
   ResourceTracker->clearResources();
+  DEBUG(dbgs() << "End packet\n");
 }
-
 
 // Bundle machine instructions into packets.
 void VLIWPacketizerList::PacketizeMIs(MachineBasicBlock *MBB,
@@ -215,14 +248,29 @@ void VLIWPacketizerList::PacketizeMIs(MachineBasicBlock *MBB,
                              std::distance(BeginItr, EndItr));
   VLIWScheduler->schedule();
 
+  DEBUG({
+    dbgs() << "Scheduling DAG of the packetize region\n";
+    for (SUnit &SU : VLIWScheduler->SUnits)
+      SU.dumpAll(VLIWScheduler);
+  });
+
   // Generate MI -> SU map.
   MIToSUnit.clear();
   for (SUnit &SU : VLIWScheduler->SUnits)
     MIToSUnit[SU.getInstr()] = &SU;
 
+  bool LimitPresent = InstrLimit.getPosition();
+
   // The main packetizer loop.
   for (; BeginItr != EndItr; ++BeginItr) {
-    MachineInstr *MI = BeginItr;
+    if (LimitPresent) {
+      if (InstrCount >= InstrLimit) {
+        EndItr = BeginItr;
+        break;
+      }
+      InstrCount++;
+    }
+    MachineInstr &MI = *BeginItr;
     initPacketizerState();
 
     // End the current packet if needed.
@@ -235,34 +283,50 @@ void VLIWPacketizerList::PacketizeMIs(MachineBasicBlock *MBB,
     if (ignorePseudoInstruction(MI, MBB))
       continue;
 
-    SUnit *SUI = MIToSUnit[MI];
+    SUnit *SUI = MIToSUnit[&MI];
     assert(SUI && "Missing SUnit Info!");
 
     // Ask DFA if machine resource is available for MI.
+    DEBUG(dbgs() << "Checking resources for adding MI to packet " << MI);
+
     bool ResourceAvail = ResourceTracker->canReserveResources(MI);
+    DEBUG({
+      if (ResourceAvail)
+        dbgs() << "  Resources are available for adding MI to packet\n";
+      else
+        dbgs() << "  Resources NOT available\n";
+    });
     if (ResourceAvail && shouldAddToPacket(MI)) {
       // Dependency check for MI with instructions in CurrentPacketMIs.
       for (auto MJ : CurrentPacketMIs) {
         SUnit *SUJ = MIToSUnit[MJ];
         assert(SUJ && "Missing SUnit Info!");
 
+        DEBUG(dbgs() << "  Checking against MJ " << *MJ);
         // Is it legal to packetize SUI and SUJ together.
         if (!isLegalToPacketizeTogether(SUI, SUJ)) {
+          DEBUG(dbgs() << "  Not legal to add MI, try to prune\n");
           // Allow packetization if dependency can be pruned.
           if (!isLegalToPruneDependencies(SUI, SUJ)) {
             // End the packet if dependency cannot be pruned.
+            DEBUG(dbgs() << "  Could not prune dependencies for adding MI\n");
             endPacket(MBB, MI);
             break;
           }
+          DEBUG(dbgs() << "  Pruned dependence for adding MI\n");
         }
       }
     } else {
+      DEBUG(if (ResourceAvail)
+        dbgs() << "Resources are available, but instruction should not be "
+                  "added to packet\n  " << MI);
       // End the packet if resource is not available, or if the instruction
       // shoud not be added to the current packet.
       endPacket(MBB, MI);
     }
 
     // Add MI to the current packet.
+    DEBUG(dbgs() << "* Adding MI to packet " << MI << '\n');
     BeginItr = addToPacket(MI);
   } // For all instructions in the packetization range.
 
@@ -270,4 +334,10 @@ void VLIWPacketizerList::PacketizeMIs(MachineBasicBlock *MBB,
   endPacket(MBB, EndItr);
   VLIWScheduler->exitRegion();
   VLIWScheduler->finishBlock();
+}
+
+// Add a DAG mutation object to the ordered list.
+void VLIWPacketizerList::addMutation(
+      std::unique_ptr<ScheduleDAGMutation> Mutation) {
+  VLIWScheduler->addMutation(std::move(Mutation));
 }

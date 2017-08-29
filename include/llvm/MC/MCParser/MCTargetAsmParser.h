@@ -1,4 +1,4 @@
-//===-- llvm/MC/MCTargetAsmParser.h - Target Assembly Parser ----*- C++ -*-===//
+//===- llvm/MC/MCTargetAsmParser.h - Target Assembly Parser -----*- C++ -*-===//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -10,74 +10,126 @@
 #ifndef LLVM_MC_MCPARSER_MCTARGETASMPARSER_H
 #define LLVM_MC_MCPARSER_MCTARGETASMPARSER_H
 
+#include "llvm/ADT/StringRef.h"
 #include "llvm/MC/MCExpr.h"
+#include "llvm/MC/MCParser/MCAsmLexer.h"
 #include "llvm/MC/MCParser/MCAsmParserExtension.h"
 #include "llvm/MC/MCTargetOptions.h"
+#include "llvm/Support/SMLoc.h"
+#include <cstdint>
 #include <memory>
 
 namespace llvm {
-class AsmToken;
+
 class MCInst;
 class MCParsedAsmOperand;
 class MCStreamer;
 class MCSubtargetInfo;
-class SMLoc;
-class StringRef;
 template <typename T> class SmallVectorImpl;
 
-typedef SmallVectorImpl<std::unique_ptr<MCParsedAsmOperand>> OperandVector;
+using OperandVector = SmallVectorImpl<std::unique_ptr<MCParsedAsmOperand>>;
 
 enum AsmRewriteKind {
-  AOK_Delete = 0,     // Rewrite should be ignored.
   AOK_Align,          // Rewrite align as .align.
   AOK_EVEN,           // Rewrite even as .even.
-  AOK_DotOperator,    // Rewrite a dot operator expression as an immediate.
-                      // E.g., [eax].foo.bar -> [eax].8
   AOK_Emit,           // Rewrite _emit as .byte.
-  AOK_Imm,            // Rewrite as $$N.
-  AOK_ImmPrefix,      // Add $$ before a parsed Imm.
   AOK_Input,          // Rewrite in terms of $N.
   AOK_Output,         // Rewrite in terms of $N.
   AOK_SizeDirective,  // Add a sizing directive (e.g., dword ptr).
   AOK_Label,          // Rewrite local labels.
-  AOK_Skip            // Skip emission (e.g., offset/type operators).
+  AOK_EndOfStatement, // Add EndOfStatement (e.g., "\n\t").
+  AOK_Skip,           // Skip emission (e.g., offset/type operators).
+  AOK_IntelExpr       // SizeDirective SymDisp [BaseReg + IndexReg * Scale + ImmDisp]
 };
 
 const char AsmRewritePrecedence [] = {
-  0, // AOK_Delete
   2, // AOK_Align
   2, // AOK_EVEN
-  2, // AOK_DotOperator
   2, // AOK_Emit
-  4, // AOK_Imm
-  4, // AOK_ImmPrefix
   3, // AOK_Input
   3, // AOK_Output
   5, // AOK_SizeDirective
   1, // AOK_Label
-  2  // AOK_Skip
+  5, // AOK_EndOfStatement
+  2, // AOK_Skip
+  2  // AOK_IntelExpr
+};
+
+// Represnt the various parts which makes up an intel expression,
+// used for emitting compound intel expressions
+struct IntelExpr {
+  bool NeedBracs;
+  int64_t Imm;
+  StringRef BaseReg;
+  StringRef IndexReg;
+  unsigned Scale;
+
+  IntelExpr(bool needBracs = false) : NeedBracs(needBracs), Imm(0),
+    BaseReg(StringRef()), IndexReg(StringRef()),
+    Scale(1) {}
+  // Compund immediate expression
+  IntelExpr(int64_t imm, bool needBracs) : IntelExpr(needBracs) {
+    Imm = imm;
+  }
+  // [Reg + ImmediateExpression]
+  // We don't bother to emit an immediate expression evaluated to zero
+  IntelExpr(StringRef reg, int64_t imm = 0, unsigned scale = 0,
+    bool needBracs = true) :
+    IntelExpr(imm, needBracs) {
+    IndexReg = reg;
+    if (scale)
+      Scale = scale;
+  }
+  // [BaseReg + IndexReg * ScaleExpression + ImmediateExpression]
+  IntelExpr(StringRef baseReg, StringRef indexReg, unsigned scale = 0,
+    int64_t imm = 0, bool needBracs = true) :
+    IntelExpr(indexReg, imm, scale, needBracs) {
+    BaseReg = baseReg;
+  }
+  bool hasBaseReg() const {
+    return BaseReg.size();
+  }
+  bool hasIndexReg() const {
+    return IndexReg.size();
+  }
+  bool hasRegs() const {
+    return hasBaseReg() || hasIndexReg();
+  }
+  bool isValid() const {
+    return (Scale == 1) ||
+           (hasIndexReg() && (Scale == 2 || Scale == 4 || Scale == 8));
+  }
 };
 
 struct AsmRewrite {
   AsmRewriteKind Kind;
   SMLoc Loc;
   unsigned Len;
-  unsigned Val;
+  int64_t Val;
   StringRef Label;
+  IntelExpr IntelExp;
+
 public:
-  AsmRewrite(AsmRewriteKind kind, SMLoc loc, unsigned len = 0, unsigned val = 0)
+  AsmRewrite(AsmRewriteKind kind, SMLoc loc, unsigned len = 0, int64_t val = 0)
     : Kind(kind), Loc(loc), Len(len), Val(val) {}
   AsmRewrite(AsmRewriteKind kind, SMLoc loc, unsigned len, StringRef label)
-    : Kind(kind), Loc(loc), Len(len), Val(0), Label(label) {}
+    : AsmRewrite(kind, loc, len) { Label = label; }
+  AsmRewrite(SMLoc loc, unsigned len, IntelExpr exp)
+    : AsmRewrite(AOK_IntelExpr, loc, len) { IntelExp = exp; }
 };
 
 struct ParseInstructionInfo {
+  SmallVectorImpl<AsmRewrite> *AsmRewrites = nullptr;
 
-  SmallVectorImpl<AsmRewrite> *AsmRewrites;
-
-  ParseInstructionInfo() : AsmRewrites(nullptr) {}
+  ParseInstructionInfo() = default;
   ParseInstructionInfo(SmallVectorImpl<AsmRewrite> *rewrites)
     : AsmRewrites(rewrites) {}
+};
+
+enum OperandMatchResultTy {
+  MatchOperand_Success,  // operand matched successfully
+  MatchOperand_NoMatch,  // operand did not match
+  MatchOperand_ParseFail // operand matched but had errors
 };
 
 /// MCTargetAsmParser - Generic interface to target specific assembly parsers.
@@ -91,9 +143,6 @@ public:
     FIRST_TARGET_MATCH_RESULT_TY
   };
 
-private:
-  MCTargetAsmParser(const MCTargetAsmParser &) = delete;
-  void operator=(const MCTargetAsmParser &) = delete;
 protected: // Can only create subclasses.
   MCTargetAsmParser(MCTargetOptions const &, const MCSubtargetInfo &STI);
 
@@ -101,10 +150,10 @@ protected: // Can only create subclasses.
   MCSubtargetInfo &copySTI();
 
   /// AvailableFeatures - The current set of available features.
-  uint64_t AvailableFeatures;
+  uint64_t AvailableFeatures = 0;
 
   /// ParsingInlineAsm - Are we parsing ms-style inline assembly?
-  bool ParsingInlineAsm;
+  bool ParsingInlineAsm = false;
 
   /// SemaCallback - The Sema callback implementation.  Must be set when parsing
   /// ms-style inline assembly.
@@ -117,6 +166,9 @@ protected: // Can only create subclasses.
   const MCSubtargetInfo *STI;
 
 public:
+  MCTargetAsmParser(const MCTargetAsmParser &) = delete;
+  MCTargetAsmParser &operator=(const MCTargetAsmParser &) = delete;
+
   ~MCTargetAsmParser() override;
 
   const MCSubtargetInfo &getSTI() const;
@@ -194,6 +246,13 @@ public:
     return Match_InvalidOperand;
   }
 
+  /// Validate the instruction match against any complex target predicates
+  /// before rendering any operands to it.
+  virtual unsigned
+  checkEarlyTargetMatchPredicate(MCInst &Inst, const OperandVector &Operands) {
+    return Match_Success;
+  }
+
   /// checkTargetMatchPredicate - Validate the instruction match against
   /// any complex target predicates not expressible via match classes.
   virtual unsigned checkTargetMatchPredicate(MCInst &Inst) {
@@ -214,9 +273,19 @@ public:
     return nullptr;
   }
 
-  virtual void onLabelParsed(MCSymbol *Symbol) { }
+  virtual void onLabelParsed(MCSymbol *Symbol) {}
+
+  /// Ensure that all previously parsed instructions have been emitted to the
+  /// output streamer, if the target does not emit them immediately.
+  virtual void flushPendingInstructions(MCStreamer &Out) {}
+
+  virtual const MCExpr *createTargetUnaryExpr(const MCExpr *E,
+                                              AsmToken::TokenKind OperatorToken,
+                                              MCContext &Ctx) {
+    return nullptr;
+  }
 };
 
-} // End llvm namespace
+} // end namespace llvm
 
-#endif
+#endif // LLVM_MC_MCPARSER_MCTARGETASMPARSER_H

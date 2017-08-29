@@ -17,7 +17,10 @@
 
 #include "llvm/ADT/DenseMapInfo.h"
 #include "llvm/ADT/PointerIntPair.h"
-#include "llvm/Support/Compiler.h"
+#include "llvm/Support/PointerLikeTypeTraits.h"
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
 
 namespace llvm {
 
@@ -28,7 +31,7 @@ template <typename T> struct PointerUnionTypeSelectorReturn {
 /// Get a type based on whether two types are the same or not.
 ///
 /// For:
-/// 
+///
 /// \code
 ///   typedef typename PointerUnionTypeSelector<T1, T2, EQ, NE>::Return Ret;
 /// \endcode
@@ -57,6 +60,7 @@ template <typename PT1, typename PT2> class PointerUnionUIntTraits {
 public:
   static inline void *getAsVoidPointer(void *P) { return P; }
   static inline void *getFromVoidPointer(void *P) { return P; }
+
   enum {
     PT1BitsAv = (int)(PointerLikeTypeTraits<PT1>::NumLowBitsAvailable),
     PT2BitsAv = (int)(PointerLikeTypeTraits<PT2>::NumLowBitsAvailable),
@@ -97,7 +101,7 @@ private:
   template <typename T> struct UNION_DOESNT_CONTAIN_TYPE {};
 
 public:
-  PointerUnion() {}
+  PointerUnion() = default;
 
   PointerUnion(PT1 V)
       : Val(const_cast<void *>(
@@ -154,7 +158,7 @@ public:
     assert(
         get<PT1>() == Val.getPointer() &&
         "Can't get the address because PointerLikeTypeTraits changes the ptr");
-    return (PT1 *)Val.getAddrOfPointer();
+    return const_cast<PT1 *>(reinterpret_cast<const PT1 *>(Val.getAddrOfPointer()));
   }
 
   /// Assignment from nullptr which just clears the union.
@@ -186,28 +190,28 @@ public:
 };
 
 template <typename PT1, typename PT2>
-static bool operator==(PointerUnion<PT1, PT2> lhs, PointerUnion<PT1, PT2> rhs) {
+bool operator==(PointerUnion<PT1, PT2> lhs, PointerUnion<PT1, PT2> rhs) {
   return lhs.getOpaqueValue() == rhs.getOpaqueValue();
 }
 
 template <typename PT1, typename PT2>
-static bool operator!=(PointerUnion<PT1, PT2> lhs, PointerUnion<PT1, PT2> rhs) {
+bool operator!=(PointerUnion<PT1, PT2> lhs, PointerUnion<PT1, PT2> rhs) {
   return lhs.getOpaqueValue() != rhs.getOpaqueValue();
 }
 
 template <typename PT1, typename PT2>
-static bool operator<(PointerUnion<PT1, PT2> lhs, PointerUnion<PT1, PT2> rhs) {
+bool operator<(PointerUnion<PT1, PT2> lhs, PointerUnion<PT1, PT2> rhs) {
   return lhs.getOpaqueValue() < rhs.getOpaqueValue();
 }
 
 // Teach SmallPtrSet that PointerUnion is "basically a pointer", that has
 // # low bits available = min(PT1bits,PT2bits)-1.
 template <typename PT1, typename PT2>
-class PointerLikeTypeTraits<PointerUnion<PT1, PT2>> {
-public:
+struct PointerLikeTypeTraits<PointerUnion<PT1, PT2>> {
   static inline void *getAsVoidPointer(const PointerUnion<PT1, PT2> &P) {
     return P.getOpaqueValue();
   }
+
   static inline PointerUnion<PT1, PT2> getFromVoidPointer(void *P) {
     return PointerUnion<PT1, PT2>::getFromOpaqueValue(P);
   }
@@ -249,7 +253,7 @@ private:
   };
 
 public:
-  PointerUnion3() {}
+  PointerUnion3() = default;
 
   PointerUnion3(PT1 V) { Val = InnerUnion(V); }
   PointerUnion3(PT2 V) { Val = InnerUnion(V); }
@@ -323,11 +327,11 @@ public:
 // Teach SmallPtrSet that PointerUnion3 is "basically a pointer", that has
 // # low bits available = min(PT1bits,PT2bits,PT2bits)-2.
 template <typename PT1, typename PT2, typename PT3>
-class PointerLikeTypeTraits<PointerUnion3<PT1, PT2, PT3>> {
-public:
+struct PointerLikeTypeTraits<PointerUnion3<PT1, PT2, PT3>> {
   static inline void *getAsVoidPointer(const PointerUnion3<PT1, PT2, PT3> &P) {
     return P.getOpaqueValue();
   }
+
   static inline PointerUnion3<PT1, PT2, PT3> getFromVoidPointer(void *P) {
     return PointerUnion3<PT1, PT2, PT3>::getFromOpaqueValue(P);
   }
@@ -352,7 +356,7 @@ private:
   ValTy Val;
 
 public:
-  PointerUnion4() {}
+  PointerUnion4() = default;
 
   PointerUnion4(PT1 V) { Val = InnerUnion1(V); }
   PointerUnion4(PT2 V) { Val = InnerUnion1(V); }
@@ -429,12 +433,12 @@ public:
 // Teach SmallPtrSet that PointerUnion4 is "basically a pointer", that has
 // # low bits available = min(PT1bits,PT2bits,PT2bits)-2.
 template <typename PT1, typename PT2, typename PT3, typename PT4>
-class PointerLikeTypeTraits<PointerUnion4<PT1, PT2, PT3, PT4>> {
-public:
+struct PointerLikeTypeTraits<PointerUnion4<PT1, PT2, PT3, PT4>> {
   static inline void *
   getAsVoidPointer(const PointerUnion4<PT1, PT2, PT3, PT4> &P) {
     return P.getOpaqueValue();
   }
+
   static inline PointerUnion4<PT1, PT2, PT3, PT4> getFromVoidPointer(void *P) {
     return PointerUnion4<PT1, PT2, PT3, PT4>::getFromOpaqueValue(P);
   }
@@ -469,6 +473,6 @@ template <typename T, typename U> struct DenseMapInfo<PointerUnion<T, U>> {
   }
 };
 
-}
+} // end namespace llvm
 
-#endif
+#endif // LLVM_ADT_POINTERUNION_H

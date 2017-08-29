@@ -11,7 +11,7 @@
 #define LLVM_LIB_TARGET_ARM_ARMASMBACKENDDARWIN_H
 
 #include "ARMAsmBackend.h"
-#include "llvm/Support/MachO.h"
+#include "llvm/BinaryFormat/MachO.h"
 
 namespace llvm {
 class ARMAsmBackendDarwin : public ARMAsmBackend {
@@ -21,7 +21,6 @@ public:
   ARMAsmBackendDarwin(const Target &T, const Triple &TT,
                       const MCRegisterInfo &MRI, MachO::CPUSubTypeARM st)
       : ARMAsmBackend(T, TT, /* IsLittleEndian */ true), MRI(MRI), Subtype(st) {
-    HasDataInCodeSupport = true;
   }
 
   MCObjectWriter *createObjectWriter(raw_pwrite_stream &OS) const override {

@@ -14,17 +14,19 @@
 // are all subclasses of the CallInst class.  Note that none of these classes
 // has state or virtual methods, which is an important part of this gross/neat
 // hack working.
-// 
+//
 // In some cases, arguments to intrinsics need to be generic and are defined as
 // type pointer to empty struct { }*.  To access the real item of interest the
-// cast instruction needs to be stripped away. 
+// cast instruction needs to be stripped away.
 //
 //===----------------------------------------------------------------------===//
 
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Metadata.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
 using namespace llvm;
 
@@ -32,25 +34,11 @@ using namespace llvm;
 /// DbgInfoIntrinsic - This is the common base class for debug info intrinsics
 ///
 
-static Value *CastOperand(Value *C) {
-  if (ConstantExpr *CE = dyn_cast<ConstantExpr>(C))
-    if (CE->isCast())
-      return CE->getOperand(0);
-  return nullptr;
-}
+Value *DbgInfoIntrinsic::getVariableLocation(bool AllowNullOp) const {
+  Value *Op = getArgOperand(0);
+  if (AllowNullOp && !Op)
+    return nullptr;
 
-Value *DbgInfoIntrinsic::StripCast(Value *C) {
-  if (Value *CO = CastOperand(C)) {
-    C = StripCast(CO);
-  } else if (GlobalVariable *GV = dyn_cast<GlobalVariable>(C)) {
-    if (GV->hasInitializer())
-      if (Value *CO = CastOperand(GV->getInitializer()))
-        C = StripCast(CO);
-  }
-  return dyn_cast<GlobalVariable>(C);
-}
-
-static Value *getValueImpl(Value *Op) {
   auto *MD = cast<MetadataAsValue>(Op)->getMetadata();
   if (auto *V = dyn_cast<ValueAsMetadata>(MD))
     return V->getValue();
@@ -59,27 +47,6 @@ static Value *getValueImpl(Value *Op) {
   assert(!cast<MDNode>(MD)->getNumOperands() && "Expected an empty MDNode");
   return nullptr;
 }
-
-//===----------------------------------------------------------------------===//
-/// DbgDeclareInst - This represents the llvm.dbg.declare instruction.
-///
-
-Value *DbgDeclareInst::getAddress() const {
-  if (!getArgOperand(0))
-    return nullptr;
-
-  return getValueImpl(getArgOperand(0));
-}
-
-//===----------------------------------------------------------------------===//
-/// DbgValueInst - This represents the llvm.dbg.value instruction.
-///
-
-const Value *DbgValueInst::getValue() const {
-  return const_cast<DbgValueInst *>(this)->getValue();
-}
-
-Value *DbgValueInst::getValue() { return getValueImpl(getArgOperand(0)); }
 
 int llvm::Intrinsic::lookupLLVMIntrinsicByName(ArrayRef<const char *> NameTable,
                                                StringRef Name) {
@@ -118,3 +85,75 @@ int llvm::Intrinsic::lookupLLVMIntrinsicByName(ArrayRef<const char *> NameTable,
     return LastLow - NameTable.begin();
   return -1;
 }
+
+Value *InstrProfIncrementInst::getStep() const {
+  if (InstrProfIncrementInstStep::classof(this)) {
+    return const_cast<Value *>(getArgOperand(4));
+  }
+  const Module *M = getModule();
+  LLVMContext &Context = M->getContext();
+  return ConstantInt::get(Type::getInt64Ty(Context), 1);
+}
+
+ConstrainedFPIntrinsic::RoundingMode
+ConstrainedFPIntrinsic::getRoundingMode() const {
+  unsigned NumOperands = getNumArgOperands();
+  Metadata *MD =
+      dyn_cast<MetadataAsValue>(getArgOperand(NumOperands - 2))->getMetadata();
+  if (!MD || !isa<MDString>(MD))
+    return rmInvalid;
+  StringRef RoundingArg = cast<MDString>(MD)->getString();
+
+  // For dynamic rounding mode, we use round to nearest but we will set the
+  // 'exact' SDNodeFlag so that the value will not be rounded.
+  return StringSwitch<RoundingMode>(RoundingArg)
+    .Case("round.dynamic",    rmDynamic)
+    .Case("round.tonearest",  rmToNearest)
+    .Case("round.downward",   rmDownward)
+    .Case("round.upward",     rmUpward)
+    .Case("round.towardzero", rmTowardZero)
+    .Default(rmInvalid);
+}
+
+ConstrainedFPIntrinsic::ExceptionBehavior
+ConstrainedFPIntrinsic::getExceptionBehavior() const {
+  unsigned NumOperands = getNumArgOperands();
+  Metadata *MD =
+      dyn_cast<MetadataAsValue>(getArgOperand(NumOperands - 1))->getMetadata();
+  if (!MD || !isa<MDString>(MD))
+    return ebInvalid;
+  StringRef ExceptionArg = cast<MDString>(MD)->getString();
+  return StringSwitch<ExceptionBehavior>(ExceptionArg)
+    .Case("fpexcept.ignore",  ebIgnore)
+    .Case("fpexcept.maytrap", ebMayTrap)
+    .Case("fpexcept.strict",  ebStrict)
+    .Default(ebInvalid);
+}
+
+bool ConstrainedFPIntrinsic::isUnaryOp() const {
+  switch (getIntrinsicID()) {
+    default:
+      return false;
+    case Intrinsic::experimental_constrained_sqrt:
+    case Intrinsic::experimental_constrained_sin:
+    case Intrinsic::experimental_constrained_cos:
+    case Intrinsic::experimental_constrained_exp:
+    case Intrinsic::experimental_constrained_exp2:
+    case Intrinsic::experimental_constrained_log:
+    case Intrinsic::experimental_constrained_log10:
+    case Intrinsic::experimental_constrained_log2:
+    case Intrinsic::experimental_constrained_rint:
+    case Intrinsic::experimental_constrained_nearbyint:
+      return true;
+  }
+}
+
+bool ConstrainedFPIntrinsic::isTernaryOp() const {
+  switch (getIntrinsicID()) {
+    default:
+      return false;
+    case Intrinsic::experimental_constrained_fma:
+      return true;
+  }
+}
+

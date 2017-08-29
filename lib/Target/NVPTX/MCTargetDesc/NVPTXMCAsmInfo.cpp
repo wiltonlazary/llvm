@@ -27,15 +27,15 @@ void NVPTXMCAsmInfo::anchor() {}
 
 NVPTXMCAsmInfo::NVPTXMCAsmInfo(const Triple &TheTriple) {
   if (TheTriple.getArch() == Triple::nvptx64) {
-    PointerSize = CalleeSaveStackSlotSize = 8;
+    CodePointerSize = CalleeSaveStackSlotSize = 8;
   }
 
   CommentString = "//";
 
   HasSingleParameterDotFile = false;
 
-  InlineAsmStart = " inline asm";
-  InlineAsmEnd = " inline asm";
+  InlineAsmStart = " begin inline asm";
+  InlineAsmEnd = " end inline asm";
 
   SupportsDebugInformation = CompileForDebugging;
   // PTX does not allow .align on functions.

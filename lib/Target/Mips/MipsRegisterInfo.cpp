@@ -1,4 +1,4 @@
-//===-- MipsRegisterInfo.cpp - MIPS Register Information -== --------------===//
+//===- MipsRegisterInfo.cpp - MIPS Register Information -------------------===//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -12,30 +12,26 @@
 //===----------------------------------------------------------------------===//
 
 #include "MipsRegisterInfo.h"
+#include "MCTargetDesc/MipsABIInfo.h"
 #include "Mips.h"
-#include "MipsAnalyzeImmediate.h"
-#include "MipsInstrInfo.h"
 #include "MipsMachineFunction.h"
 #include "MipsSubtarget.h"
 #include "MipsTargetMachine.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
-#include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
-#include "llvm/CodeGen/MachineInstrBuilder.h"
-#include "llvm/IR/Constants.h"
-#include "llvm/IR/DebugInfo.h"
+#include "llvm/CodeGen/MachineInstr.h"
+#include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/IR/Function.h"
-#include "llvm/IR/Type.h"
-#include "llvm/Support/CommandLine.h"
+#include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetFrameLowering.h"
-#include "llvm/Target/TargetInstrInfo.h"
-#include "llvm/Target/TargetMachine.h"
-#include "llvm/Target/TargetOptions.h"
+#include "llvm/Target/TargetRegisterInfo.h"
+#include "llvm/Target/TargetSubtargetInfo.h"
+#include <cstdint>
 
 using namespace llvm;
 
@@ -52,7 +48,21 @@ const TargetRegisterClass *
 MipsRegisterInfo::getPointerRegClass(const MachineFunction &MF,
                                      unsigned Kind) const {
   MipsABIInfo ABI = MF.getSubtarget<MipsSubtarget>().getABI();
-  return ABI.ArePtrs64bit() ? &Mips::GPR64RegClass : &Mips::GPR32RegClass;
+  MipsPtrClass PtrClassKind = static_cast<MipsPtrClass>(Kind);
+
+  switch (PtrClassKind) {
+  case MipsPtrClass::Default:
+    return ABI.ArePtrs64bit() ? &Mips::GPR64RegClass : &Mips::GPR32RegClass;
+  case MipsPtrClass::GPR16MM:
+    return ABI.ArePtrs64bit() ? &Mips::GPRMM16_64RegClass
+                              : &Mips::GPRMM16RegClass;
+  case MipsPtrClass::StackPointer:
+    return ABI.ArePtrs64bit() ? &Mips::SP64RegClass : &Mips::SP32RegClass;
+  case MipsPtrClass::GlobalPointer:                              
+    return ABI.ArePtrs64bit() ? &Mips::GP64RegClass : &Mips::GP32RegClass;
+  }
+
+  llvm_unreachable("Unknown pointer kind");
 }
 
 unsigned
@@ -150,7 +160,8 @@ getReservedRegs(const MachineFunction &MF) const {
 
   BitVector Reserved(getNumRegs());
   const MipsSubtarget &Subtarget = MF.getSubtarget<MipsSubtarget>();
-  typedef TargetRegisterClass::const_iterator RegIter;
+
+  using RegIter = TargetRegisterClass::const_iterator;
 
   for (unsigned I = 0; I < array_lengthof(ReservedGPR32); ++I)
     Reserved.set(ReservedGPR32[I]);
@@ -194,7 +205,7 @@ getReservedRegs(const MachineFunction &MF) const {
       // allocate variable-sized objects at runtime. This should test the
       // same conditions as MipsFrameLowering::hasBP().
       if (needsStackRealignment(MF) &&
-          MF.getFrameInfo()->hasVarSizedObjects()) {
+          MF.getFrameInfo().hasVarSizedObjects()) {
         Reserved.set(Mips::S7);
         Reserved.set(Mips::S7_64);
       }
@@ -269,12 +280,14 @@ eliminateFrameIndex(MachineBasicBlock::iterator II, int SPAdj,
         errs() << "<--------->\n" << MI);
 
   int FrameIndex = MI.getOperand(FIOperandNum).getIndex();
-  uint64_t stackSize = MF.getFrameInfo()->getStackSize();
-  int64_t spOffset = MF.getFrameInfo()->getObjectOffset(FrameIndex);
+  uint64_t stackSize = MF.getFrameInfo().getStackSize();
+  int64_t spOffset = MF.getFrameInfo().getObjectOffset(FrameIndex);
 
   DEBUG(errs() << "FrameIndex : " << FrameIndex << "\n"
                << "spOffset   : " << spOffset << "\n"
-               << "stackSize  : " << stackSize << "\n");
+               << "stackSize  : " << stackSize << "\n"
+               << "alignment  : "
+               << MF.getFrameInfo().getObjectAlignment(FrameIndex) << "\n");
 
   eliminateFI(MI, FIOperandNum, FrameIndex, stackSize, spOffset);
 }

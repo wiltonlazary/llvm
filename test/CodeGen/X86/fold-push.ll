@@ -1,5 +1,5 @@
 ; RUN: llc < %s -mtriple=i686-windows | FileCheck %s -check-prefix=CHECK -check-prefix=NORMAL
-; RUN: llc < %s -mtriple=i686-windows -mattr=call-reg-indirect | FileCheck %s -check-prefix=CHECK -check-prefix=SLM
+; RUN: llc < %s -mtriple=i686-windows -mattr=slow-two-mem-ops | FileCheck %s -check-prefix=CHECK -check-prefix=SLM
 
 declare void @foo(i32 %r)
 
@@ -14,7 +14,7 @@ define void @test(i32 %a, i32 %b) optsize nounwind {
 ; SLM: movl (%esp), [[RELOAD:%e..]]
 ; SLM-NEXT: pushl [[RELOAD]]
 ; CHECK: calll
-; CHECK-NEXT: addl $4, %esp
+; CHECK-NEXT: addl $8, %esp
   %c = add i32 %a, %b
   call void @foo(i32 %c)
   call void asm sideeffect "nop", "~{ax},~{bx},~{cx},~{dx},~{bp},~{si},~{di}"()

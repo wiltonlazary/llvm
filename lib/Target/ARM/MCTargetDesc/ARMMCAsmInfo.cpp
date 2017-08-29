@@ -13,7 +13,6 @@
 
 #include "ARMMCAsmInfo.h"
 #include "llvm/ADT/Triple.h"
-#include "llvm/Support/CommandLine.h"
 
 using namespace llvm;
 
@@ -59,7 +58,6 @@ ARMELFMCAsmInfo::ARMELFMCAsmInfo(const Triple &TheTriple) {
 
   // Exceptions handling
   switch (TheTriple.getOS()) {
-  case Triple::Bitrig:
   case Triple::NetBSD:
     ExceptionsType = ExceptionHandling::DwarfCFI;
     break;
@@ -91,6 +89,7 @@ ARMCOFFMCAsmInfoMicrosoft::ARMCOFFMCAsmInfoMicrosoft() {
 
   PrivateGlobalPrefix = "$M";
   PrivateLabelPrefix = "$M";
+  CommentString = ";";
 }
 
 void ARMCOFFMCAsmInfoGNU::anchor() { }
