@@ -456,10 +456,13 @@ private:
                                             const CastInst *CI2);
 
   Value *foldAndOfICmps(ICmpInst *LHS, ICmpInst *RHS, Instruction &CxtI);
-  Value *foldAndOfFCmps(FCmpInst *LHS, FCmpInst *RHS);
   Value *foldOrOfICmps(ICmpInst *LHS, ICmpInst *RHS, Instruction &CxtI);
-  Value *foldOrOfFCmps(FCmpInst *LHS, FCmpInst *RHS);
   Value *foldXorOfICmps(ICmpInst *LHS, ICmpInst *RHS);
+
+  /// Optimize (fcmp)&(fcmp) or (fcmp)|(fcmp).
+  /// NOTE: Unlike most of instcombine, this returns a Value which should
+  /// already be inserted into the function.
+  Value *foldLogicOfFCmps(FCmpInst *LHS, FCmpInst *RHS, bool IsAnd);
 
   Value *foldAndOrOfICmpsOfAndWithPow2(ICmpInst *LHS, ICmpInst *RHS,
                                        bool JoinedByAnd, Instruction &CxtI);
@@ -596,6 +599,11 @@ private:
   /// & (B | C) -> (A&B) | (A&C)" if this is a win).  Returns the simplified
   /// value, or null if it didn't simplify.
   Value *SimplifyUsingDistributiveLaws(BinaryOperator &I);
+
+  // Binary Op helper for select operations where the expression can be
+  // efficiently reorganized.
+  Value *SimplifySelectsFeedingBinaryOp(BinaryOperator &I, Value *LHS,
+                                        Value *RHS);
 
   /// This tries to simplify binary operations by factorizing out common terms
   /// (e. g. "(A*B)+(A*C)" -> "A*(B+C)").

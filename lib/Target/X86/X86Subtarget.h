@@ -61,7 +61,16 @@ protected:
   };
 
   enum X86ProcFamilyEnum {
-    Others, IntelAtom, IntelSLM, IntelGLM
+    Others, 
+    IntelAtom,
+    IntelSLM,
+    IntelGLM,
+    IntelHaswell,
+    IntelBroadwell,
+    IntelSkylake,
+    IntelKNL,
+    IntelSKX,
+    IntelCannonlake
   };
 
   /// X86 processor family: Intel Atom, and others
@@ -238,6 +247,9 @@ protected:
   /// True if SHLD based rotate is fast.
   bool HasFastSHLDRotate;
 
+  /// True if the processor supports macrofusion.
+  bool HasMacroFusion;
+
   /// True if the processor has enhanced REP MOVSB/STOSB.
   bool HasERMSB;
 
@@ -335,6 +347,10 @@ private:
 
   /// True if compiling for 16-bit, false for 32-bit or 64-bit.
   bool In16BitMode;
+
+  /// Contains the Overhead of gather\scatter instructions
+  int GatherOverhead;
+  int ScatterOverhead;
 
   X86SelectionDAGInfo TSInfo;
   // Ordering here is important. X86InstrInfo initializes X86RegisterInfo which
@@ -478,6 +494,8 @@ public:
   bool isPMULLDSlow() const { return IsPMULLDSlow; }
   bool isUnalignedMem16Slow() const { return IsUAMem16Slow; }
   bool isUnalignedMem32Slow() const { return IsUAMem32Slow; }
+  int getGatherOverhead() const { return GatherOverhead; }
+  int getScatterOverhead() const { return ScatterOverhead; }
   bool hasSSEUnalignedMem() const { return HasSSEUnalignedMem; }
   bool hasCmpxchg16b() const { return HasCmpxchg16b; }
   bool useLeaForSP() const { return UseLeaForSP; }
@@ -488,6 +506,7 @@ public:
   bool hasFastVectorFSQRT() const { return HasFastVectorFSQRT; }
   bool hasFastLZCNT() const { return HasFastLZCNT; }
   bool hasFastSHLDRotate() const { return HasFastSHLDRotate; }
+  bool hasMacroFusion() const { return HasMacroFusion; }
   bool hasERMSB() const { return HasERMSB; }
   bool hasSlowDivide32() const { return HasSlowDivide32; }
   bool hasSlowDivide64() const { return HasSlowDivide64; }
@@ -507,9 +526,13 @@ public:
   bool hasPKU() const { return HasPKU; }
   bool hasMPX() const { return HasMPX; }
   bool hasCLFLUSHOPT() const { return HasCLFLUSHOPT; }
+  bool hasCLWB() const { return HasCLWB; }
 
   bool isXRaySupported() const override { return is64Bit(); }
 
+  X86ProcFamilyEnum getProcFamily() const { return X86ProcFamily; }
+
+  /// TODO: to be removed later and replaced with suitable properties
   bool isAtom() const { return X86ProcFamily == IntelAtom; }
   bool isSLM() const { return X86ProcFamily == IntelSLM; }
   bool useSoftFloat() const { return UseSoftFloat; }
@@ -591,6 +614,7 @@ public:
     // On Win64, all these conventions just use the default convention.
     case CallingConv::C:
     case CallingConv::Fast:
+    case CallingConv::Swift:
     case CallingConv::X86_FastCall:
     case CallingConv::X86_StdCall:
     case CallingConv::X86_ThisCall:

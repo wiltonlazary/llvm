@@ -2860,7 +2860,8 @@ static Value *ensureValueAvailableInSuccessor(Value *V, BasicBlock *BB,
 static bool mergeConditionalStoreToAddress(BasicBlock *PTB, BasicBlock *PFB,
                                            BasicBlock *QTB, BasicBlock *QFB,
                                            BasicBlock *PostBB, Value *Address,
-                                           bool InvertPCond, bool InvertQCond) {
+                                           bool InvertPCond, bool InvertQCond,
+                                           const DataLayout &DL) {
   auto IsaBitcastOfPointerType = [](const Instruction &I) {
     return Operator::getOpcode(&I) == Instruction::BitCast &&
            I.getType()->isPointerTy();
@@ -2966,6 +2967,29 @@ static bool mergeConditionalStoreToAddress(BasicBlock *PTB, BasicBlock *PFB,
   PStore->getAAMetadata(AAMD, /*Merge=*/false);
   PStore->getAAMetadata(AAMD, /*Merge=*/true);
   SI->setAAMetadata(AAMD);
+  unsigned PAlignment = PStore->getAlignment();
+  unsigned QAlignment = QStore->getAlignment();
+  unsigned TypeAlignment =
+      DL.getABITypeAlignment(SI->getValueOperand()->getType());
+  unsigned MinAlignment;
+  unsigned MaxAlignment;
+  std::tie(MinAlignment, MaxAlignment) = std::minmax(PAlignment, QAlignment);
+  // Choose the minimum alignment. If we could prove both stores execute, we
+  // could use biggest one.  In this case, though, we only know that one of the
+  // stores executes.  And we don't know it's safe to take the alignment from a
+  // store that doesn't execute.
+  if (MinAlignment != 0) {
+    // Choose the minimum of all non-zero alignments.
+    SI->setAlignment(MinAlignment);
+  } else if (MaxAlignment != 0) {
+    // Choose the minimal alignment between the non-zero alignment and the ABI
+    // default alignment for the type of the stored value.
+    SI->setAlignment(std::min(MaxAlignment, TypeAlignment));
+  } else {
+    // If both alignments are zero, use ABI default alignment for the type of
+    // the stored value.
+    SI->setAlignment(TypeAlignment);
+  }
 
   QStore->eraseFromParent();
   PStore->eraseFromParent();
@@ -2973,7 +2997,8 @@ static bool mergeConditionalStoreToAddress(BasicBlock *PTB, BasicBlock *PFB,
   return true;
 }
 
-static bool mergeConditionalStores(BranchInst *PBI, BranchInst *QBI) {
+static bool mergeConditionalStores(BranchInst *PBI, BranchInst *QBI,
+                                   const DataLayout &DL) {
   // The intention here is to find diamonds or triangles (see below) where each
   // conditional block contains a store to the same address. Both of these
   // stores are conditional, so they can't be unconditionally sunk. But it may
@@ -3076,7 +3101,7 @@ static bool mergeConditionalStores(BranchInst *PBI, BranchInst *QBI) {
   bool Changed = false;
   for (auto *Address : CommonAddresses)
     Changed |= mergeConditionalStoreToAddress(
-        PTB, PFB, QTB, QFB, PostBB, Address, InvertPCond, InvertQCond);
+        PTB, PFB, QTB, QFB, PostBB, Address, InvertPCond, InvertQCond, DL);
   return Changed;
 }
 
@@ -3141,7 +3166,7 @@ static bool SimplifyCondBranchToCondBranch(BranchInst *PBI, BranchInst *BI,
   // If both branches are conditional and both contain stores to the same
   // address, remove the stores from the conditionals and create a conditional
   // merged store at the end.
-  if (MergeCondStores && mergeConditionalStores(PBI, BI))
+  if (MergeCondStores && mergeConditionalStores(PBI, BI, DL))
     return true;
 
   // If this is a conditional branch in an empty block, and if any
@@ -5166,8 +5191,7 @@ static bool SwitchToLookupTable(SwitchInst *SI, IRBuilder<> &Builder,
   // string and lookup indices into that.
 
   // Ignore switches with less than three cases. Lookup tables will not make
-  // them
-  // faster, so we don't analyze them.
+  // them faster, so we don't analyze them.
   if (SI->getNumCases() < 3)
     return false;
 
@@ -5251,8 +5275,12 @@ static bool SwitchToLookupTable(SwitchInst *SI, IRBuilder<> &Builder,
 
   // Compute the table index value.
   Builder.SetInsertPoint(SI);
-  Value *TableIndex =
-      Builder.CreateSub(SI->getCondition(), MinCaseVal, "switch.tableidx");
+  Value *TableIndex;
+  if (MinCaseVal->isNullValue())
+    TableIndex = SI->getCondition();
+  else
+    TableIndex = Builder.CreateSub(SI->getCondition(), MinCaseVal,
+                                   "switch.tableidx");
 
   // Compute the maximum table size representable by the integer type we are
   // switching upon.
@@ -5285,15 +5313,14 @@ static bool SwitchToLookupTable(SwitchInst *SI, IRBuilder<> &Builder,
   Builder.SetInsertPoint(LookupBB);
 
   if (NeedMask) {
-    // Before doing the lookup we do the hole check.
-    // The LookupBB is therefore re-purposed to do the hole check
-    // and we create a new LookupBB.
+    // Before doing the lookup, we do the hole check. The LookupBB is therefore
+    // re-purposed to do the hole check, and we create a new LookupBB.
     BasicBlock *MaskBB = LookupBB;
     MaskBB->setName("switch.hole_check");
     LookupBB = BasicBlock::Create(Mod.getContext(), "switch.lookup",
                                   CommonDest->getParent(), CommonDest);
 
-    // Make the mask's bitwidth at least 8bit and a power-of-2 to avoid
+    // Make the mask's bitwidth at least 8-bit and a power-of-2 to avoid
     // unnecessary illegal types.
     uint64_t TableSizePowOf2 = NextPowerOf2(std::max(7ULL, TableSize - 1ULL));
     APInt MaskInt(TableSizePowOf2, 0);
@@ -5323,7 +5350,7 @@ static bool SwitchToLookupTable(SwitchInst *SI, IRBuilder<> &Builder,
   }
 
   if (!DefaultIsReachable || GeneratingCoveredLookupTable) {
-    // We cached PHINodes in PHIs, to avoid accessing deleted PHINodes later,
+    // We cached PHINodes in PHIs. To avoid accessing deleted PHINodes later,
     // do not delete PHINodes here.
     SI->getDefaultDest()->removePredecessor(SI->getParent(),
                                             /*DontDeleteUselessPHIs=*/true);
@@ -5394,14 +5421,14 @@ static bool isSwitchDense(ArrayRef<int64_t> Values) {
   return NumCases * 100 >= Range * MinDensity;
 }
 
-// Try and transform a switch that has "holes" in it to a contiguous sequence
-// of cases.
-//
-// A switch such as: switch(i) {case 5: case 9: case 13: case 17:} can be
-// range-reduced to: switch ((i-5) / 4) {case 0: case 1: case 2: case 3:}.
-//
-// This converts a sparse switch into a dense switch which allows better
-// lowering and could also allow transforming into a lookup table.
+/// Try to transform a switch that has "holes" in it to a contiguous sequence
+/// of cases.
+///
+/// A switch such as: switch(i) {case 5: case 9: case 13: case 17:} can be
+/// range-reduced to: switch ((i-5) / 4) {case 0: case 1: case 2: case 3:}.
+///
+/// This converts a sparse switch into a dense switch which allows better
+/// lowering and could also allow transforming into a lookup table.
 static bool ReduceSwitchRange(SwitchInst *SI, IRBuilder<> &Builder,
                               const DataLayout &DL,
                               const TargetTransformInfo &TTI) {
@@ -5527,11 +5554,11 @@ bool SimplifyCFGOpt::SimplifySwitch(SwitchInst *SI, IRBuilder<> &Builder) {
   if (ForwardSwitchConditionToPHI(SI))
     return SimplifyCFG(BB, TTI, BonusInstThreshold, AC) | true;
 
-  // The conversion from switch to lookup tables results in difficult
-  // to analyze code and makes pruning branches much harder.
-  // This is a problem of the switch expression itself can still be
-  // restricted as a result of inlining or CVP. There only apply this
-  // transformation during late steps of the optimisation chain.
+  // The conversion from switch to lookup tables results in difficult-to-analyze
+  // code and makes pruning branches much harder. This is a problem if the
+  // switch expression itself can still be restricted as a result of inlining or
+  // CVP. Therefore, only apply this transformation during late stages of the
+  // optimisation pipeline.
   if (LateSimplifyCFG && SwitchToLookupTable(SI, Builder, DL, TTI))
     return SimplifyCFG(BB, TTI, BonusInstThreshold, AC) | true;
 
@@ -5665,8 +5692,8 @@ bool SimplifyCFGOpt::SimplifyUncondBranch(BranchInst *BI,
     return true;
 
   // If the Terminator is the only non-phi instruction, simplify the block.
-  // if LoopHeader is provided, check if the block or its successor is a loop
-  // header (This is for early invocations before loop simplify and
+  // If LoopHeader is provided, check if the block or its successor is a loop
+  // header. (This is for early invocations before loop simplify and
   // vectorization to keep canonical loop forms for nested loops. These blocks
   // can be eliminated when the pass is invoked later in the back-end.)
   bool NeedCanonicalLoop =
@@ -5677,8 +5704,8 @@ bool SimplifyCFGOpt::SimplifyUncondBranch(BranchInst *BI,
       !NeedCanonicalLoop && TryToSimplifyUncondBranchFromEmptyBlock(BB))
     return true;
 
-  // If the only instruction in the block is a seteq/setne comparison
-  // against a constant, try to simplify the block.
+  // If the only instruction in the block is a seteq/setne comparison against a
+  // constant, try to simplify the block.
   if (ICmpInst *ICI = dyn_cast<ICmpInst>(I))
     if (ICI->isEquality() && isa<ConstantInt>(ICI->getOperand(1))) {
       for (++I; isa<DbgInfoIntrinsic>(I); ++I)
@@ -5829,7 +5856,7 @@ bool SimplifyCFGOpt::SimplifyCondBranch(BranchInst *BI, IRBuilder<> &Builder) {
     if (BasicBlock *PrevBB = allPredecessorsComeFromSameSource(BB))
       if (BranchInst *PBI = dyn_cast<BranchInst>(PrevBB->getTerminator()))
         if (PBI != BI && PBI->isConditional())
-          if (mergeConditionalStores(PBI, BI))
+          if (mergeConditionalStores(PBI, BI, DL))
             return SimplifyCFG(BB, TTI, BonusInstThreshold, AC) | true;
 
   return false;

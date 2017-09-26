@@ -24,6 +24,11 @@
 using namespace llvm;
 using namespace llvm::dwarf;
 
+cl::opt<bool>
+    UseDbgAddr("use-dbg-addr",
+                llvm::cl::desc("Use llvm.dbg.addr for all local variables"),
+                cl::init(false));
+
 DIBuilder::DIBuilder(Module &m, bool AllowUnresolvedNodes)
   : M(m), VMContext(M.getContext()), CUNode(nullptr),
       DeclareFn(nullptr), ValueFn(nullptr),
@@ -127,7 +132,7 @@ DICompileUnit *DIBuilder::createCompileUnit(
     unsigned Lang, DIFile *File, StringRef Producer, bool isOptimized,
     StringRef Flags, unsigned RunTimeVer, StringRef SplitName,
     DICompileUnit::DebugEmissionKind Kind, uint64_t DWOId,
-    bool SplitDebugInlining, bool DebugInfoForProfiling) {
+    bool SplitDebugInlining, bool DebugInfoForProfiling, bool GnuPubnames) {
 
   assert(((Lang <= dwarf::DW_LANG_Fortran08 && Lang >= dwarf::DW_LANG_C89) ||
           (Lang <= dwarf::DW_LANG_hi_user && Lang >= dwarf::DW_LANG_lo_user)) &&
@@ -137,7 +142,7 @@ DICompileUnit *DIBuilder::createCompileUnit(
   CUNode = DICompileUnit::getDistinct(
       VMContext, Lang, File, Producer, isOptimized, Flags, RunTimeVer,
       SplitName, Kind, nullptr, nullptr, nullptr, nullptr, nullptr, DWOId,
-      SplitDebugInlining, DebugInfoForProfiling);
+      SplitDebugInlining, DebugInfoForProfiling, GnuPubnames);
 
   // Create a named metadata so that it is easier to find cu in a module.
   NamedMDNode *NMD = M.getOrInsertNamedMetadata("llvm.dbg.cu");
@@ -595,6 +600,8 @@ DIGlobalVariableExpression *DIBuilder::createGlobalVariableExpression(
       VMContext, cast_or_null<DIScope>(Context), Name, LinkageName, F,
       LineNumber, Ty, isLocalToUnit, true, cast_or_null<DIDerivedType>(Decl),
       AlignInBits);
+  if (!Expr)
+    Expr = createExpression();
   auto *N = DIGlobalVariableExpression::get(VMContext, GV, Expr);
   AllGVs.push_back(N);
   return N;
@@ -666,33 +673,6 @@ DIExpression *DIBuilder::createExpression(ArrayRef<int64_t> Signed) {
   // TODO: Remove the callers of this signed version and delete.
   SmallVector<uint64_t, 8> Addr(Signed.begin(), Signed.end());
   return createExpression(Addr);
-}
-
-DIExpression *DIBuilder::createFragmentExpression(unsigned OffsetInBits,
-                                                  unsigned SizeInBits,
-                                                  const DIExpression *Expr) {
-  SmallVector<uint64_t, 8> Ops;
-  // Copy over the expression, but leave off any trailing DW_OP_LLVM_fragment.
-  if (Expr) {
-    for (auto Op : Expr->expr_ops()) {
-      if (Op.getOp() == dwarf::DW_OP_LLVM_fragment) {
-        // Make the new offset point into the existing fragment.
-        uint64_t FragmentOffsetInBits = Op.getArg(0);
-        // Op.getArg(1) is FragmentSizeInBits.
-        assert((OffsetInBits + SizeInBits <= Op.getArg(1)) &&
-               "new fragment outside of original fragment");
-        OffsetInBits += FragmentOffsetInBits;
-        break;
-      }
-      Ops.push_back(Op.getOp());
-      for (unsigned I = 0; I < Op.getNumArgs(); ++I)
-        Ops.push_back(Op.getArg(I));
-    }
-  }
-  Ops.push_back(dwarf::DW_OP_LLVM_fragment);
-  Ops.push_back(OffsetInBits);
-  Ops.push_back(SizeInBits);
-  return DIExpression::get(VMContext, Ops);
 }
 
 template <class... Ts>
@@ -801,6 +781,11 @@ static Instruction *withDebugLoc(Instruction *I, const DILocation *DL) {
   return I;
 }
 
+static Function *getDeclareIntrin(Module &M) {
+  return Intrinsic::getDeclaration(&M, UseDbgAddr ? Intrinsic::dbg_addr
+                                                  : Intrinsic::dbg_declare);
+}
+
 Instruction *DIBuilder::insertDeclare(Value *Storage, DILocalVariable *VarInfo,
                                       DIExpression *Expr, const DILocation *DL,
                                       Instruction *InsertBefore) {
@@ -810,7 +795,7 @@ Instruction *DIBuilder::insertDeclare(Value *Storage, DILocalVariable *VarInfo,
              VarInfo->getScope()->getSubprogram() &&
          "Expected matching subprograms");
   if (!DeclareFn)
-    DeclareFn = Intrinsic::getDeclaration(&M, Intrinsic::dbg_declare);
+    DeclareFn = getDeclareIntrin(M);
 
   trackIfUnresolved(VarInfo);
   trackIfUnresolved(Expr);
@@ -829,7 +814,7 @@ Instruction *DIBuilder::insertDeclare(Value *Storage, DILocalVariable *VarInfo,
              VarInfo->getScope()->getSubprogram() &&
          "Expected matching subprograms");
   if (!DeclareFn)
-    DeclareFn = Intrinsic::getDeclaration(&M, Intrinsic::dbg_declare);
+    DeclareFn = getDeclareIntrin(M);
 
   trackIfUnresolved(VarInfo);
   trackIfUnresolved(Expr);

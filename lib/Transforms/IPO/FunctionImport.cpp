@@ -187,6 +187,21 @@ selectCallee(const ModuleSummaryIndex &Index,
 using EdgeInfo = std::tuple<const FunctionSummary *, unsigned /* Threshold */,
                             GlobalValue::GUID>;
 
+static ValueInfo
+updateValueInfoForIndirectCalls(const ModuleSummaryIndex &Index, ValueInfo VI) {
+  if (!VI.getSummaryList().empty())
+    return VI;
+  // For SamplePGO, the indirect call targets for local functions will
+  // have its original name annotated in profile. We try to find the
+  // corresponding PGOFuncName as the GUID.
+  // FIXME: Consider updating the edges in the graph after building
+  // it, rather than needing to perform this mapping on each walk.
+  auto GUID = Index.getGUIDFromOriginalID(VI.getGUID());
+  if (GUID == 0)
+    return nullptr;
+  return Index.getValueInfo(GUID);
+}
+
 /// Compute the list of functions to import for a given caller. Mark these
 /// imported functions and the symbols they reference in their source module as
 /// exported from their source module.
@@ -201,17 +216,9 @@ static void computeImportForFunction(
     DEBUG(dbgs() << " edge -> " << VI.getGUID() << " Threshold:" << Threshold
                  << "\n");
 
-    if (VI.getSummaryList().empty()) {
-      // For SamplePGO, the indirect call targets for local functions will
-      // have its original name annotated in profile. We try to find the
-      // corresponding PGOFuncName as the GUID.
-      auto GUID = Index.getGUIDFromOriginalID(VI.getGUID());
-      if (GUID == 0)
-        continue;
-      VI = Index.getValueInfo(GUID);
-      if (!VI)
-        continue;
-    }
+    VI = updateValueInfoForIndirectCalls(Index, VI);
+    if (!VI)
+      continue;
 
     if (DefinedGVSummaries.count(VI.getGUID())) {
       DEBUG(dbgs() << "ignored! Target already in destination module.\n");
@@ -317,10 +324,8 @@ static void ComputeImportForModule(
       DEBUG(dbgs() << "Ignores Dead GUID: " << GVSummary.first << "\n");
       continue;
     }
-    auto *Summary = GVSummary.second;
-    if (auto *AS = dyn_cast<AliasSummary>(Summary))
-      Summary = &AS->getAliasee();
-    auto *FuncSummary = dyn_cast<FunctionSummary>(Summary);
+    auto *FuncSummary =
+        dyn_cast<FunctionSummary>(GVSummary.second->getBaseObject());
     if (!FuncSummary)
       // Skip import for global variables
       continue;
@@ -458,6 +463,17 @@ void llvm::computeDeadSymbols(
   // Make value live and add it to the worklist if it was not live before.
   // FIXME: we should only make the prevailing copy live here
   auto visit = [&](ValueInfo VI) {
+    // FIXME: If we knew which edges were created for indirect call profiles,
+    // we could skip them here. Any that are live should be reached via
+    // other edges, e.g. reference edges. Otherwise, using a profile collected
+    // on a slightly different binary might provoke preserving, importing
+    // and ultimately promoting calls to functions not linked into this
+    // binary, which increases the binary size unnecessarily. Note that
+    // if this code changes, the importer needs to change so that edges
+    // to functions marked dead are skipped.
+    VI = updateValueInfoForIndirectCalls(Index, VI);
+    if (!VI)
+      return;
     for (auto &S : VI.getSummaryList())
       if (S->isLive())
         return;
@@ -470,17 +486,12 @@ void llvm::computeDeadSymbols(
   while (!Worklist.empty()) {
     auto VI = Worklist.pop_back_val();
     for (auto &Summary : VI.getSummaryList()) {
-      for (auto Ref : Summary->refs())
+      GlobalValueSummary *Base = Summary->getBaseObject();
+      for (auto Ref : Base->refs())
         visit(Ref);
-      if (auto *FS = dyn_cast<FunctionSummary>(Summary.get()))
+      if (auto *FS = dyn_cast<FunctionSummary>(Base))
         for (auto Call : FS->calls())
           visit(Call.first);
-      if (auto *AS = dyn_cast<AliasSummary>(Summary.get())) {
-        auto AliaseeGUID = AS->getAliasee().getOriginalName();
-        ValueInfo AliaseeVI = Index.getValueInfo(AliaseeGUID);
-        if (AliaseeVI)
-          visit(AliaseeVI);
-      }
     }
   }
   Index.setWithGlobalValueDeadStripping();
@@ -726,43 +737,17 @@ Expected<bool> FunctionImporter::importFunctions(
         GlobalsToImport.insert(&GV);
       }
     }
+#ifndef NDEBUG
     for (GlobalAlias &GA : SrcModule->aliases()) {
-      // FIXME: This should eventually be controlled entirely by the summary.
-      if (FunctionImportGlobalProcessing::doImportAsDefinition(
-              &GA, &GlobalsToImport)) {
-        GlobalsToImport.insert(&GA);
-        continue;
-      }
-
       if (!GA.hasName())
         continue;
       auto GUID = GA.getGUID();
-      auto Import = ImportGUIDs.count(GUID);
-      DEBUG(dbgs() << (Import ? "Is" : "Not") << " importing alias " << GUID
+      assert(!ImportGUIDs.count(GUID) && "Unexpected alias in import list");
+      DEBUG(dbgs() << "Not importing alias " << GUID
                    << " " << GA.getName() << " from "
                    << SrcModule->getSourceFileName() << "\n");
-      if (Import) {
-        // Alias can't point to "available_externally". However when we import
-        // linkOnceODR the linkage does not change. So we import the alias
-        // and aliasee only in this case. This has been handled by
-        // computeImportForFunction()
-        GlobalObject *GO = GA.getBaseObject();
-        assert(GO->hasLinkOnceODRLinkage() &&
-               "Unexpected alias to a non-linkonceODR in import list");
-#ifndef NDEBUG
-        if (!GlobalsToImport.count(GO))
-          DEBUG(dbgs() << " alias triggers importing aliasee " << GO->getGUID()
-                       << " " << GO->getName() << " from "
-                       << SrcModule->getSourceFileName() << "\n");
-#endif
-        if (Error Err = GO->materialize())
-          return std::move(Err);
-        GlobalsToImport.insert(GO);
-        if (Error Err = GA.materialize())
-          return std::move(Err);
-        GlobalsToImport.insert(&GA);
-      }
     }
+#endif
 
     // Upgrade debug info after we're done materializing all the globals and we
     // have loaded all the required metadata!

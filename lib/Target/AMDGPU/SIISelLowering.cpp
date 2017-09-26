@@ -502,6 +502,7 @@ SITargetLowering::SITargetLowering(const TargetMachine &TM,
   setTargetDAGCombine(ISD::SCALAR_TO_VECTOR);
   setTargetDAGCombine(ISD::ZERO_EXTEND);
   setTargetDAGCombine(ISD::EXTRACT_VECTOR_ELT);
+  setTargetDAGCombine(ISD::BUILD_VECTOR);
 
   // All memory operations. Some folding on the pointer operand is done to help
   // matching the constant offsets in the addressing modes.
@@ -2148,10 +2149,12 @@ SDValue SITargetLowering::LowerCall(CallLoweringInfo &CLI,
   MachineFrameInfo &MFI = MF.getFrameInfo();
   SmallVector<std::pair<unsigned, SDValue>, 8> RegsToPass;
 
+  SDValue CallerSavedFP;
+
   // Adjust the stack pointer for the new arguments...
   // These operations are automatically eliminated by the prolog/epilog pass
   if (!IsSibCall) {
-    Chain = DAG.getCALLSEQ_START(Chain, NumBytes, 0, DL);
+    Chain = DAG.getCALLSEQ_START(Chain, 0, 0, DL);
 
     unsigned OffsetReg = Info->getScratchWaveOffsetReg();
 
@@ -2164,6 +2167,13 @@ SDValue SITargetLowering::LowerCall(CallLoweringInfo &CLI,
     SDValue ScratchWaveOffsetReg
       = DAG.getCopyFromReg(Chain, DL, OffsetReg, MVT::i32);
     RegsToPass.emplace_back(AMDGPU::SGPR4, ScratchWaveOffsetReg);
+
+    if (!Info->isEntryFunction()) {
+      // Avoid clobbering this function's FP value. In the current convention
+      // callee will overwrite this, so do save/restore around the call site.
+      CallerSavedFP = DAG.getCopyFromReg(Chain, DL,
+                                         Info->getFrameOffsetReg(), MVT::i32);
+    }
   }
 
   // Stack pointer relative accesses are done by changing the offset SGPR. This
@@ -2344,8 +2354,14 @@ SDValue SITargetLowering::LowerCall(CallLoweringInfo &CLI,
   Chain = Call.getValue(0);
   InFlag = Call.getValue(1);
 
-  uint64_t CalleePopBytes = 0;
-  Chain = DAG.getCALLSEQ_END(Chain, DAG.getTargetConstant(NumBytes, DL, MVT::i32),
+  if (CallerSavedFP) {
+    SDValue FPReg = DAG.getRegister(Info->getFrameOffsetReg(), MVT::i32);
+    Chain = DAG.getCopyToReg(Chain, DL, FPReg, CallerSavedFP, InFlag);
+    InFlag = Chain.getValue(1);
+  }
+
+  uint64_t CalleePopBytes = NumBytes;
+  Chain = DAG.getCALLSEQ_END(Chain, DAG.getTargetConstant(0, DL, MVT::i32),
                              DAG.getTargetConstant(CalleePopBytes, DL, MVT::i32),
                              InFlag, DL);
   if (!Ins.empty())
@@ -4430,6 +4446,9 @@ SDValue SITargetLowering::LowerLOAD(SDValue Op, SelectionDAG &DAG) const {
   EVT MemVT = Load->getMemoryVT();
 
   if (ExtType == ISD::NON_EXTLOAD && MemVT.getSizeInBits() < 32) {
+    if (MemVT == MVT::i16 && isTypeLegal(MVT::i16))
+      return SDValue();
+
     // FIXME: Copied from PPC
     // First, load into 32 bits, then truncate to 1 bit.
 
@@ -5644,15 +5663,27 @@ SDValue SITargetLowering::performIntMed3ImmCombine(
   return DAG.getNode(ISD::TRUNCATE, SL, VT, Med3);
 }
 
+static ConstantFPSDNode *getSplatConstantFP(SDValue Op) {
+  if (ConstantFPSDNode *C = dyn_cast<ConstantFPSDNode>(Op))
+    return C;
+
+  if (BuildVectorSDNode *BV = dyn_cast<BuildVectorSDNode>(Op)) {
+    if (ConstantFPSDNode *C = BV->getConstantFPSplatNode())
+      return C;
+  }
+
+  return nullptr;
+}
+
 SDValue SITargetLowering::performFPMed3ImmCombine(SelectionDAG &DAG,
                                                   const SDLoc &SL,
                                                   SDValue Op0,
                                                   SDValue Op1) const {
-  ConstantFPSDNode *K1 = dyn_cast<ConstantFPSDNode>(Op1);
+  ConstantFPSDNode *K1 = getSplatConstantFP(Op1);
   if (!K1)
     return SDValue();
 
-  ConstantFPSDNode *K0 = dyn_cast<ConstantFPSDNode>(Op0.getOperand(1));
+  ConstantFPSDNode *K0 = getSplatConstantFP(Op0.getOperand(1));
   if (!K0)
     return SDValue();
 
@@ -5662,7 +5693,7 @@ SDValue SITargetLowering::performFPMed3ImmCombine(SelectionDAG &DAG,
     return SDValue();
 
   // TODO: Check IEEE bit enabled?
-  EVT VT = K0->getValueType(0);
+  EVT VT = Op0.getValueType();
   if (Subtarget->enableDX10Clamp()) {
     // If dx10_clamp is enabled, NaNs clamp to 0.0. This is the same as the
     // hardware fmed3 behavior converting to a min.
@@ -5671,19 +5702,21 @@ SDValue SITargetLowering::performFPMed3ImmCombine(SelectionDAG &DAG,
       return DAG.getNode(AMDGPUISD::CLAMP, SL, VT, Op0.getOperand(0));
   }
 
-  // med3 for f16 is only available on gfx9+.
-  if (VT == MVT::f64 || (VT == MVT::f16 && !Subtarget->hasMed3_16()))
-    return SDValue();
+  // med3 for f16 is only available on gfx9+, and not available for v2f16.
+  if (VT == MVT::f32 || (VT == MVT::f16 && Subtarget->hasMed3_16())) {
+    // This isn't safe with signaling NaNs because in IEEE mode, min/max on a
+    // signaling NaN gives a quiet NaN. The quiet NaN input to the min would
+    // then give the other result, which is different from med3 with a NaN
+    // input.
+    SDValue Var = Op0.getOperand(0);
+    if (!isKnownNeverSNan(DAG, Var))
+      return SDValue();
 
-  // This isn't safe with signaling NaNs because in IEEE mode, min/max on a
-  // signaling NaN gives a quiet NaN. The quiet NaN input to the min would then
-  // give the other result, which is different from med3 with a NaN input.
-  SDValue Var = Op0.getOperand(0);
-  if (!isKnownNeverSNan(DAG, Var))
-    return SDValue();
+    return DAG.getNode(AMDGPUISD::FMED3, SL, K0->getValueType(0),
+                       Var, SDValue(K0, 0), SDValue(K1, 0));
+  }
 
-  return DAG.getNode(AMDGPUISD::FMED3, SL, K0->getValueType(0),
-                     Var, SDValue(K0, 0), SDValue(K1, 0));
+  return SDValue();
 }
 
 SDValue SITargetLowering::performMinMaxCombine(SDNode *N,
@@ -5744,7 +5777,8 @@ SDValue SITargetLowering::performMinMaxCombine(SDNode *N,
        (Opc == AMDGPUISD::FMIN_LEGACY &&
         Op0.getOpcode() == AMDGPUISD::FMAX_LEGACY)) &&
       (VT == MVT::f32 || VT == MVT::f64 ||
-       (VT == MVT::f16 && Subtarget->has16BitInsts())) &&
+       (VT == MVT::f16 && Subtarget->has16BitInsts()) ||
+       (VT == MVT::v2f16 && Subtarget->hasVOP3PInsts())) &&
       Op0.hasOneUse()) {
     if (SDValue Res = performFPMed3ImmCombine(DAG, SDLoc(N), Op0, Op1))
       return Res;
@@ -5820,7 +5854,7 @@ SDValue SITargetLowering::performExtractVectorEltCombine(
   SDNode *N, DAGCombinerInfo &DCI) const {
   SDValue Vec = N->getOperand(0);
 
-  SelectionDAG &DAG= DCI.DAG;
+  SelectionDAG &DAG = DCI.DAG;
   if (Vec.getOpcode() == ISD::FNEG && allUsesHaveSourceMods(N)) {
     SDLoc SL(N);
     EVT EltVT = N->getValueType(0);
@@ -5833,6 +5867,47 @@ SDValue SITargetLowering::performExtractVectorEltCombine(
   return SDValue();
 }
 
+static bool convertBuildVectorCastElt(SelectionDAG &DAG,
+                                      SDValue &Lo, SDValue &Hi) {
+  if (Hi.getOpcode() == ISD::BITCAST &&
+      Hi.getOperand(0).getValueType() == MVT::f16 &&
+      (isa<ConstantSDNode>(Lo) || Lo.isUndef())) {
+    Lo = DAG.getNode(ISD::BITCAST, SDLoc(Lo), MVT::f16, Lo);
+    Hi = Hi.getOperand(0);
+    return true;
+  }
+
+  return false;
+}
+
+SDValue SITargetLowering::performBuildVectorCombine(
+  SDNode *N, DAGCombinerInfo &DCI) const {
+  SDLoc SL(N);
+
+  if (!isTypeLegal(MVT::v2i16))
+    return SDValue();
+  SelectionDAG &DAG = DCI.DAG;
+  EVT VT = N->getValueType(0);
+
+  if (VT == MVT::v2i16) {
+    SDValue Lo = N->getOperand(0);
+    SDValue Hi = N->getOperand(1);
+
+    // v2i16 build_vector (const|undef), (bitcast f16:$x)
+    // -> bitcast (v2f16 build_vector const|undef, $x
+    if (convertBuildVectorCastElt(DAG, Lo, Hi)) {
+      SDValue NewVec = DAG.getBuildVector(MVT::v2f16, SL, { Lo, Hi  });
+      return DAG.getNode(ISD::BITCAST, SL, VT, NewVec);
+    }
+
+    if (convertBuildVectorCastElt(DAG, Hi, Lo)) {
+      SDValue NewVec = DAG.getBuildVector(MVT::v2f16, SL, { Hi, Lo  });
+      return DAG.getNode(ISD::BITCAST, SL, VT, NewVec);
+    }
+  }
+
+  return SDValue();
+}
 
 unsigned SITargetLowering::getFusedOpcode(const SelectionDAG &DAG,
                                           const SDNode *N0,
@@ -6254,6 +6329,8 @@ SDValue SITargetLowering::PerformDAGCombine(SDNode *N,
   }
   case ISD::EXTRACT_VECTOR_ELT:
     return performExtractVectorEltCombine(N, DCI);
+  case ISD::BUILD_VECTOR:
+    return performBuildVectorCombine(N, DCI);
   }
   return AMDGPUTargetLowering::PerformDAGCombine(N, DCI);
 }

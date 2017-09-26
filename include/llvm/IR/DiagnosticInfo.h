@@ -188,17 +188,13 @@ private:
 public:
   /// \p The function that is concerned by this stack size diagnostic.
   /// \p The computed stack size.
-  DiagnosticInfoResourceLimit(const Function &Fn,
-                              const char *ResourceName,
+  DiagnosticInfoResourceLimit(const Function &Fn, const char *ResourceName,
                               uint64_t ResourceSize,
                               DiagnosticSeverity Severity = DS_Warning,
                               DiagnosticKind Kind = DK_ResourceLimit,
                               uint64_t ResourceLimit = 0)
-      : DiagnosticInfo(Kind, Severity),
-        Fn(Fn),
-        ResourceName(ResourceName),
-        ResourceSize(ResourceSize),
-        ResourceLimit(ResourceLimit) {}
+      : DiagnosticInfo(Kind, Severity), Fn(Fn), ResourceName(ResourceName),
+        ResourceSize(ResourceSize), ResourceLimit(ResourceLimit) {}
 
   const Function &getFunction() const { return Fn; }
   const char *getResourceName() const { return ResourceName; }
@@ -209,19 +205,17 @@ public:
   void print(DiagnosticPrinter &DP) const override;
 
   static bool classof(const DiagnosticInfo *DI) {
-    return DI->getKind() == DK_ResourceLimit ||
-           DI->getKind() == DK_StackSize;
+    return DI->getKind() == DK_ResourceLimit || DI->getKind() == DK_StackSize;
   }
 };
 
 class DiagnosticInfoStackSize : public DiagnosticInfoResourceLimit {
 public:
-  DiagnosticInfoStackSize(const Function &Fn,
-                          uint64_t StackSize,
+  DiagnosticInfoStackSize(const Function &Fn, uint64_t StackSize,
                           DiagnosticSeverity Severity = DS_Warning,
                           uint64_t StackLimit = 0)
-    : DiagnosticInfoResourceLimit(Fn, "stack size", StackSize,
-                                  Severity, DK_StackSize, StackLimit) {}
+      : DiagnosticInfoResourceLimit(Fn, "stack size", StackSize, Severity,
+                                    DK_StackSize, StackLimit) {}
 
   uint64_t getStackSize() const { return getResourceSize(); }
   uint64_t getStackLimit() const { return getResourceLimit(); }
@@ -244,7 +238,7 @@ public:
   /// \p The module that is concerned by this debug metadata version diagnostic.
   /// \p The actual metadata version.
   DiagnosticInfoDebugMetadataVersion(const Module &M, unsigned MetadataVersion,
-                          DiagnosticSeverity Severity = DS_Warning)
+                                     DiagnosticSeverity Severity = DS_Warning)
       : DiagnosticInfo(DK_DebugMetadataVersion, Severity), M(M),
         MetadataVersion(MetadataVersion) {}
 
@@ -411,7 +405,7 @@ public:
   /// \brief Used in the streaming interface as the general argument type.  It
   /// internally converts everything into a key-value pair.
   struct Argument {
-    StringRef Key;
+    std::string Key;
     std::string Val;
     // If set, the debug location corresponding to the value.
     DiagnosticLocation Loc;
@@ -444,10 +438,10 @@ public:
       : DiagnosticInfoWithLocationBase(Kind, Severity, Fn, Loc),
         PassName(PassName), RemarkName(RemarkName) {}
 
-  DiagnosticInfoOptimizationBase &operator<<(StringRef S);
-  DiagnosticInfoOptimizationBase &operator<<(Argument A);
-  DiagnosticInfoOptimizationBase &operator<<(setIsVerbose V);
-  DiagnosticInfoOptimizationBase &operator<<(setExtraArgs EA);
+  void insert(StringRef S);
+  void insert(Argument A);
+  void insert(setIsVerbose V);
+  void insert(setExtraArgs EA);
 
   /// \see DiagnosticInfo::print.
   void print(DiagnosticPrinter &DP) const override;
@@ -516,6 +510,81 @@ protected:
 
   friend struct yaml::MappingTraits<DiagnosticInfoOptimizationBase *>;
 };
+
+/// Allow the insertion operator to return the actual remark type rather than a
+/// common base class.  This allows returning the result of the insertion
+/// directly by value, e.g. return OptimizationRemarkAnalysis(...) << "blah".
+template <class RemarkT>
+RemarkT &
+operator<<(RemarkT &R,
+           typename std::enable_if<
+               std::is_base_of<DiagnosticInfoOptimizationBase, RemarkT>::value,
+               StringRef>::type S) {
+  R.insert(S);
+  return R;
+}
+
+/// Also allow r-value for the remark to allow insertion into a
+/// temporarily-constructed remark.
+template <class RemarkT>
+RemarkT &
+operator<<(RemarkT &&R,
+           typename std::enable_if<
+               std::is_base_of<DiagnosticInfoOptimizationBase, RemarkT>::value,
+               StringRef>::type S) {
+  R.insert(S);
+  return R;
+}
+
+template <class RemarkT>
+RemarkT &
+operator<<(RemarkT &R,
+           typename std::enable_if<
+               std::is_base_of<DiagnosticInfoOptimizationBase, RemarkT>::value,
+               DiagnosticInfoOptimizationBase::Argument>::type A) {
+  R.insert(A);
+  return R;
+}
+
+template <class RemarkT>
+RemarkT &
+operator<<(RemarkT &&R,
+           typename std::enable_if<
+               std::is_base_of<DiagnosticInfoOptimizationBase, RemarkT>::value,
+               DiagnosticInfoOptimizationBase::Argument>::type A) {
+  R.insert(A);
+  return R;
+}
+
+template <class RemarkT>
+RemarkT &
+operator<<(RemarkT &R,
+           typename std::enable_if<
+               std::is_base_of<DiagnosticInfoOptimizationBase, RemarkT>::value,
+               DiagnosticInfoOptimizationBase::setIsVerbose>::type V) {
+  R.insert(V);
+  return R;
+}
+
+template <class RemarkT>
+RemarkT &
+operator<<(RemarkT &&R,
+           typename std::enable_if<
+               std::is_base_of<DiagnosticInfoOptimizationBase, RemarkT>::value,
+               DiagnosticInfoOptimizationBase::setIsVerbose>::type V) {
+  R.insert(V);
+  return R;
+}
+
+template <class RemarkT>
+RemarkT &
+operator<<(RemarkT &R,
+           typename std::enable_if<
+               std::is_base_of<DiagnosticInfoOptimizationBase, RemarkT>::value,
+               DiagnosticInfoOptimizationBase::setExtraArgs>::type EA) {
+  R.insert(EA);
+  return R;
+}
 
 /// \brief Common features for diagnostics dealing with optimization remarks
 /// that are used by IR passes.
@@ -610,10 +679,8 @@ public:
     return DI->getKind() == DK_OptimizationRemark;
   }
 
-  static bool isEnabled(StringRef PassName);
-
   /// \see DiagnosticInfoOptimizationBase::isEnabled.
-  bool isEnabled() const override { return isEnabled(getPassName()); }
+  bool isEnabled() const override;
 
 private:
   /// This is deprecated now and only used by the function API below.
@@ -653,10 +720,8 @@ public:
     return DI->getKind() == DK_OptimizationRemarkMissed;
   }
 
-  static bool isEnabled(StringRef PassName);
-
   /// \see DiagnosticInfoOptimizationBase::isEnabled.
-  bool isEnabled() const override { return isEnabled(getPassName()); }
+  bool isEnabled() const override;
 
 private:
   /// This is deprecated now and only used by the function API below.
@@ -707,12 +772,8 @@ public:
     return DI->getKind() == DK_OptimizationRemarkAnalysis;
   }
 
-  static bool isEnabled(StringRef PassName);
-
   /// \see DiagnosticInfoOptimizationBase::isEnabled.
-  bool isEnabled() const override {
-    return shouldAlwaysPrint() || isEnabled(getPassName());
-  }
+  bool isEnabled() const override;
 
   static const char *AlwaysPrint;
 

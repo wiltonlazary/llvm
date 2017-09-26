@@ -251,6 +251,8 @@ public:
 
   bool isLegalMaskedGather(Type *DataType) { return false; }
 
+  bool hasDivRemOp(Type *DataType, bool IsSigned) { return false; }
+
   bool prefersVectorizedAddressing() { return true; }
 
   int getScalingFactorCost(Type *Ty, GlobalValue *BaseGV, int64_t BaseOffset,
@@ -288,7 +290,7 @@ public:
 
   bool enableAggressiveInterleaving(bool LoopHasReductions) { return false; }
 
-  bool expandMemCmp(Instruction *I, unsigned &MaxLoadSize) { return false; }
+  bool enableMemCmpExpansion(unsigned &MaxLoadSize) { return false; }
 
   bool enableInterleavedAccessVectorization() { return false; }
 
@@ -450,6 +452,8 @@ public:
   }
 
   unsigned getArithmeticReductionCost(unsigned, Type *, bool) { return 1; }
+
+  unsigned getMinMaxReductionCost(Type *, Type *, bool, bool) { return 1; }
 
   unsigned getCostOfKeepingLiveOverCall(ArrayRef<Type *> Tys) { return 0; }
 
@@ -674,7 +678,13 @@ public:
     int64_t Scale = 0;
 
     auto GTI = gep_type_begin(PointeeType, Operands);
-    Type *TargetType;
+    Type *TargetType = nullptr;
+
+    // Handle the case where the GEP instruction has a single operand,
+    // the basis, therefore TargetType is a nullptr.
+    if (Operands.empty())
+      return !BaseGV ? TTI::TCC_Free : TTI::TCC_Basic;
+
     for (auto I = Operands.begin(); I != Operands.end(); ++I, ++GTI) {
       TargetType = GTI.getIndexedType();
       // We assume that the cost of Scalar GEP with constant index and the
@@ -730,6 +740,11 @@ public:
     if (isa<PHINode>(U))
       return TTI::TCC_Free; // Model all PHI nodes as free.
 
+    // Static alloca doesn't generate target instructions.
+    if (auto *A = dyn_cast<AllocaInst>(U))
+      if (A->isStaticAlloca())
+        return TTI::TCC_Free;
+
     if (const GEPOperator *GEP = dyn_cast<GEPOperator>(U)) {
       return static_cast<T *>(this)->getGEPCost(GEP->getSourceElementType(),
                                                 GEP->getPointerOperand(),
@@ -762,6 +777,38 @@ public:
     return static_cast<T *>(this)->getOperationCost(
         Operator::getOpcode(U), U->getType(),
         U->getNumOperands() == 1 ? U->getOperand(0)->getType() : nullptr);
+  }
+
+  int getInstructionLatency(const Instruction *I) {
+    SmallVector<const Value *, 4> Operands(I->value_op_begin(),
+                                           I->value_op_end());
+    if (getUserCost(I, Operands) == TTI::TCC_Free)
+      return 0;
+
+    if (isa<LoadInst>(I))
+      return 4;
+
+    Type *DstTy = I->getType();
+
+    // Usually an intrinsic is a simple instruction.
+    // A real function call is much slower.
+    if (auto *CI = dyn_cast<CallInst>(I)) {
+      const Function *F = CI->getCalledFunction();
+      if (static_cast<T *>(this)->isLoweredToCall(F))
+        return 40;
+      // Some intrinsics return a value and a flag, we use the value type
+      // to decide its latency.
+      if (StructType* StructTy = dyn_cast<StructType>(DstTy))
+        DstTy = StructTy->getElementType(0);
+      // Fall through to simple instructions.
+    }
+
+    if (VectorType *VectorTy = dyn_cast<VectorType>(DstTy))
+      DstTy = VectorTy->getElementType();
+    if (DstTy->isFloatingPointTy())
+      return 3;
+
+    return 1;
   }
 };
 }

@@ -94,6 +94,7 @@ class LLVM_LIBRARY_VISIBILITY CodeViewDebug : public DebugHandlerBase {
   struct LocalVariable {
     const DILocalVariable *DIVar = nullptr;
     SmallVector<LocalVarDefRange, 1> DefRanges;
+    bool UseReferenceType = false;
   };
 
   struct InlineSite {
@@ -117,6 +118,8 @@ class LLVM_LIBRARY_VISIBILITY CodeViewDebug : public DebugHandlerBase {
     SmallVector<const DILocation *, 1> ChildSites;
 
     SmallVector<LocalVariable, 1> Locals;
+
+    std::vector<std::pair<MCSymbol *, MDNode *>> Annotations;
 
     const MCSymbol *Begin = nullptr;
     const MCSymbol *End = nullptr;
@@ -146,6 +149,9 @@ class LLVM_LIBRARY_VISIBILITY CodeViewDebug : public DebugHandlerBase {
                             const DISubprogram *Inlinee);
 
   codeview::TypeIndex getFuncIdForSubprogram(const DISubprogram *SP);
+
+  void calculateRanges(LocalVariable &Var,
+                       const DbgValueHistoryMap::InstrRanges &Ranges);
 
   static void collectInlineSiteChildren(SmallVectorImpl<unsigned> &Children,
                                         const FunctionInfo &FI,
@@ -259,6 +265,8 @@ class LLVM_LIBRARY_VISIBILITY CodeViewDebug : public DebugHandlerBase {
   codeview::TypeIndex getTypeIndex(DITypeRef TypeRef,
                                    DITypeRef ClassTyRef = DITypeRef());
 
+  codeview::TypeIndex getTypeIndexForReferenceTo(DITypeRef TypeRef);
+
   codeview::TypeIndex getMemberFunctionType(const DISubprogram *SP,
                                             const DICompositeType *Class);
 
@@ -279,7 +287,8 @@ class LLVM_LIBRARY_VISIBILITY CodeViewDebug : public DebugHandlerBase {
   codeview::TypeIndex lowerTypeVFTableShape(const DIDerivedType *Ty);
   codeview::TypeIndex lowerTypeMemberFunction(const DISubroutineType *Ty,
                                               const DIType *ClassTy,
-                                              int ThisAdjustment);
+                                              int ThisAdjustment,
+                                              bool IsStaticMethod);
   codeview::TypeIndex lowerTypeEnum(const DICompositeType *Ty);
   codeview::TypeIndex lowerTypeClass(const DICompositeType *Ty);
   codeview::TypeIndex lowerTypeUnion(const DICompositeType *Ty);

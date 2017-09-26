@@ -343,6 +343,14 @@ bool PPCBranchCoalescing::identicalOperands(
                  << "Op2: " << Op2 << "\n");
 
     if (Op1.isIdenticalTo(Op2)) {
+      // filter out instructions with physical-register uses
+      if (Op1.isReg() && TargetRegisterInfo::isPhysicalRegister(Op1.getReg())
+        // If the physical register is constant then we can assume the value
+        // has not changed between uses.
+          && !(Op1.isUse() && MRI->isConstantPhysReg(Op1.getReg()))) {
+        DEBUG(dbgs() << "The operands are not provably identical.\n");
+        return false;
+      }
       DEBUG(dbgs() << "Op1 and Op2 are identical!\n");
       continue;
     }
@@ -367,6 +375,7 @@ bool PPCBranchCoalescing::identicalOperands(
       return false;
     }
   }
+
   return true;
 }
 

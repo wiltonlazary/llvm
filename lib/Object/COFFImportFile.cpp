@@ -558,9 +558,9 @@ NewArchiveMember ObjectFactory::createWeakExternal(StringRef Sym,
   return {MemoryBufferRef(StringRef(Buf, Buffer.size()), ImportName)};
 }
 
-std::error_code writeImportLibrary(StringRef ImportName, StringRef Path,
-                                   ArrayRef<COFFShortExport> Exports,
-                                   MachineTypes Machine, bool MakeWeakAliases) {
+Error writeImportLibrary(StringRef ImportName, StringRef Path,
+                         ArrayRef<COFFShortExport> Exports,
+                         MachineTypes Machine, bool MakeWeakAliases) {
 
   std::vector<NewArchiveMember> Members;
   ObjectFactory OF(llvm::sys::path::filename(ImportName), Machine);
@@ -596,19 +596,16 @@ std::error_code writeImportLibrary(StringRef ImportName, StringRef Path,
                                      ? SymbolName
                                      : replace(SymbolName, E.Name, E.ExtName);
 
-    if (!Name) {
-      return errorToErrorCode(Name.takeError());
-    }
+    if (!Name)
+      return Name.takeError();
 
     Members.push_back(
         OF.createShortImport(*Name, E.Ordinal, ImportType, NameType));
   }
 
-  std::pair<StringRef, std::error_code> Result =
-      writeArchive(Path, Members, /*WriteSymtab*/ true, object::Archive::K_GNU,
-                   /*Deterministic*/ true, /*Thin*/ false);
-
-  return Result.second;
+  return writeArchive(Path, Members, /*WriteSymtab*/ true,
+                      object::Archive::K_GNU,
+                      /*Deterministic*/ true, /*Thin*/ false);
 }
 
 } // namespace object

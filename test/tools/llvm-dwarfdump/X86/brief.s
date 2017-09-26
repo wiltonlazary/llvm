@@ -1,16 +1,33 @@
 # RUN: llvm-mc %s -filetype obj -triple x86_64-apple-darwin -o - \
-# RUN: | llvm-dwarfdump -debug-dump=info -brief - \
+# RUN: | llvm-dwarfdump --debug-info --debug-line - \
 # RUN: | FileCheck %s
+# RUN: llvm-mc %s -filetype obj -triple x86_64-apple-darwin -o - \
+# RUN: | llvm-dwarfdump --debug-info --debug-line - -o %t
+# RUN: cat %t | FileCheck %s
 
+# CHECK-NOT: .debug_abbrev contents:
+#
+# CHECK: .debug_info contents:
 # CHECK: DW_TAG_compile_unit
 # CHECK-NOT: DW_FORM
-# CHECK: DW_AT
+# CHECK: DW_AT_name        ("brief.c")
+# CHECK: DW_AT_name      ("main")
+# CHECK: DW_AT_name      ("int")
 # CHECK-NOT: debug_str
 # CHECK-NOT: DW_AT_type {{.*}} =>
 
-# This test is meant to verify that -brief hides DW_FORMs and abbreviation
-# codes from .debug_info section. Furthermore it verifies that it also hides
-# .debug_str and die reference offsets into the CU.
+# CHECK: Address            Line   Column File   ISA Discriminator Flags
+# CHECK-NEXT:------------------ ------ ------ ------ --- ------------- -------------
+# CHECK-NEXT:0x0000000000000000      1      0      1   0             0  is_stmt
+# CHECK-NEXT:0x0000000000000006      1     12      1   0             0  is_stmt prologue_end
+# CHECK-NEXT:0x0000000000000008      1     12      1   0             0  is_stmt end_sequence
+
+# CHECK-NOT: {{.*}} contents:
+
+# This test is meant to verify that without specifying -verbose DW_FORMs and
+# abbreviation codes are hidden from .debug_info section. Furthermore it
+# verifies that it also hides .debug_str and die reference offsets into the CU
+# and that the .debug_line table is printed rather than the opcodes.
 
 	.section	__TEXT,__text,regular,pure_instructions
 	.macosx_version_min 10, 12
