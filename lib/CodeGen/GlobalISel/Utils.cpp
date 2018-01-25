@@ -17,10 +17,10 @@
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineOptimizationRemarkEmitter.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
+#include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/IR/Constants.h"
-#include "llvm/Target/TargetInstrInfo.h"
-#include "llvm/Target/TargetRegisterInfo.h"
 
 #define DEBUG_TYPE "globalisel-utils"
 
@@ -54,6 +54,51 @@ unsigned llvm::constrainOperandRegClass(
 
   const TargetRegisterClass *RegClass = TII.getRegClass(II, OpIdx, &TRI, MF);
   return constrainRegToClass(MRI, TII, RBI, InsertPt, Reg, *RegClass);
+}
+
+bool llvm::constrainSelectedInstRegOperands(MachineInstr &I,
+                                            const TargetInstrInfo &TII,
+                                            const TargetRegisterInfo &TRI,
+                                            const RegisterBankInfo &RBI) {
+  MachineBasicBlock &MBB = *I.getParent();
+  MachineFunction &MF = *MBB.getParent();
+  MachineRegisterInfo &MRI = MF.getRegInfo();
+
+  for (unsigned OpI = 0, OpE = I.getNumExplicitOperands(); OpI != OpE; ++OpI) {
+    MachineOperand &MO = I.getOperand(OpI);
+
+    // There's nothing to be done on non-register operands.
+    if (!MO.isReg())
+      continue;
+
+    DEBUG(dbgs() << "Converting operand: " << MO << '\n');
+    assert(MO.isReg() && "Unsupported non-reg operand");
+
+    unsigned Reg = MO.getReg();
+    // Physical registers don't need to be constrained.
+    if (TRI.isPhysicalRegister(Reg))
+      continue;
+
+    // Register operands with a value of 0 (e.g. predicate operands) don't need
+    // to be constrained.
+    if (Reg == 0)
+      continue;
+
+    // If the operand is a vreg, we should constrain its regclass, and only
+    // insert COPYs if that's impossible.
+    // constrainOperandRegClass does that for us.
+    MO.setReg(constrainOperandRegClass(MF, TRI, MRI, TII, RBI, I, I.getDesc(),
+                                       Reg, OpI));
+
+    // Tie uses to defs as indicated in MCInstrDesc if this hasn't already been
+    // done.
+    if (MO.isUse()) {
+      int DefIdx = I.getDesc().getOperandConstraint(OpI, MCOI::TIED_TO);
+      if (DefIdx != -1 && !I.isRegTiedToUseOperand(DefIdx))
+        I.tieOperands(DefIdx, OpI);
+    }
+  }
+  return true;
 }
 
 bool llvm::isTriviallyDead(const MachineInstr &MI,
@@ -128,4 +173,20 @@ const llvm::ConstantFP* llvm::getConstantFPVRegVal(unsigned VReg,
   if (TargetOpcode::G_FCONSTANT != MI->getOpcode())
     return nullptr;
   return MI->getOperand(1).getFPImm();
+}
+
+llvm::MachineInstr *llvm::getOpcodeDef(unsigned Opcode, unsigned Reg,
+                                       const MachineRegisterInfo &MRI) {
+  auto *DefMI = MRI.getVRegDef(Reg);
+  auto DstTy = MRI.getType(DefMI->getOperand(0).getReg());
+  if (!DstTy.isValid())
+    return nullptr;
+  while (DefMI->getOpcode() == TargetOpcode::COPY) {
+    unsigned SrcReg = DefMI->getOperand(1).getReg();
+    auto SrcTy = MRI.getType(SrcReg);
+    if (!SrcTy.isValid() || SrcTy != DstTy)
+      break;
+    DefMI = MRI.getVRegDef(SrcReg);
+  }
+  return DefMI->getOpcode() == Opcode ? DefMI : nullptr;
 }

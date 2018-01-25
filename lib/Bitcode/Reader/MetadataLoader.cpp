@@ -21,7 +21,6 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringRef.h"
-#include "llvm/ADT/Triple.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Bitcode/BitstreamReader.h"
@@ -30,7 +29,6 @@
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/AutoUpgrade.h"
 #include "llvm/IR/BasicBlock.h"
-#include "llvm/IR/CallSite.h"
 #include "llvm/IR/CallingConv.h"
 #include "llvm/IR/Comdat.h"
 #include "llvm/IR/Constant.h"
@@ -39,7 +37,6 @@
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/DebugLoc.h"
 #include "llvm/IR/DerivedTypes.h"
-#include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/DiagnosticPrinter.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GVMaterializer.h"
@@ -59,7 +56,6 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/ModuleSummaryIndex.h"
 #include "llvm/IR/OperandTraits.h"
-#include "llvm/IR/Operator.h"
 #include "llvm/IR/TrackingMDRef.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/ValueHandle.h"
@@ -169,7 +165,7 @@ public:
   /// necessary.
   Metadata *getMetadataFwdRef(unsigned Idx);
 
-  /// Return the the given metadata only if it is fully resolved.
+  /// Return the given metadata only if it is fully resolved.
   ///
   /// Gives the same result as \a lookup(), unless \a MDNode::isResolved()
   /// would give \c false.
@@ -1178,14 +1174,25 @@ Error MetadataLoader::MetadataLoaderImpl::parseOneMetadata(
     break;
   }
   case bitc::METADATA_SUBRANGE: {
-    if (Record.size() != 3)
-      return error("Invalid record");
+    Metadata *Val = nullptr;
+    // Operand 'count' is interpreted as:
+    // - Signed integer (version 0)
+    // - Metadata node  (version 1)
+    switch (Record[0] >> 1) {
+    case 0:
+      Val = GET_OR_DISTINCT(DISubrange,
+                            (Context, Record[1], unrotateSign(Record.back())));
+      break;
+    case 1:
+      Val = GET_OR_DISTINCT(DISubrange, (Context, getMDOrNull(Record[1]),
+                                         unrotateSign(Record.back())));
+      break;
+    default:
+      return error("Invalid record: Unsupported version of DISubrange");
+    }
 
-    IsDistinct = Record[0];
-    MetadataList.assignValue(
-        GET_OR_DISTINCT(DISubrange,
-                        (Context, Record[1], unrotateSign(Record[2]))),
-        NextMetadataNo);
+    MetadataList.assignValue(Val, NextMetadataNo);
+    IsDistinct = Record[0] & 1;
     NextMetadataNo++;
     break;
   }

@@ -157,7 +157,8 @@ TEST(Local, ReplaceDbgDeclare) {
   ASSERT_TRUE(DII);
   Value *NewBase = Constant::getNullValue(Type::getInt32PtrTy(C));
   DIBuilder DIB(*M);
-  replaceDbgDeclare(AI, NewBase, DII, DIB, /*Deref=*/false, /*Offset=*/0);
+  replaceDbgDeclare(AI, NewBase, DII, DIB, DIExpression::NoDeref, 0,
+                    DIExpression::NoDeref);
 
   // There should be exactly two dbg.declares.
   int Declares = 0;
@@ -165,4 +166,174 @@ TEST(Local, ReplaceDbgDeclare) {
     if (isa<DbgDeclareInst>(I))
       Declares++;
   EXPECT_EQ(2, Declares);
+}
+
+/// Build the dominator tree for the function and run the Test.
+static void runWithDomTree(
+    Module &M, StringRef FuncName,
+    function_ref<void(Function &F, DominatorTree *DT)> Test) {
+  auto *F = M.getFunction(FuncName);
+  ASSERT_NE(F, nullptr) << "Could not find " << FuncName;
+  // Compute the dominator tree for the function.
+  DominatorTree DT(*F);
+  Test(*F, &DT);
+}
+
+TEST(Local, MergeBasicBlockIntoOnlyPred) {
+  LLVMContext C;
+
+  std::unique_ptr<Module> M = parseIR(
+      C,
+      "define i32 @f(i8* %str) {\n"
+      "entry:\n"
+      "  br label %bb2.i\n"
+      "bb2.i:                                            ; preds = %bb4.i, %entry\n"
+      "  br i1 false, label %bb4.i, label %base2flt.exit204\n"
+      "bb4.i:                                            ; preds = %bb2.i\n"
+      "  br i1 false, label %base2flt.exit204, label %bb2.i\n"
+      "bb10.i196.bb7.i197_crit_edge:                     ; No predecessors!\n"
+      "  br label %bb7.i197\n"
+      "bb7.i197:                                         ; preds = %bb10.i196.bb7.i197_crit_edge\n"
+      "  %.reg2mem.0 = phi i32 [ %.reg2mem.0, %bb10.i196.bb7.i197_crit_edge ]\n"
+      "  br i1 undef, label %base2flt.exit204, label %base2flt.exit204\n"
+      "base2flt.exit204:                                 ; preds = %bb7.i197, %bb7.i197, %bb2.i, %bb4.i\n"
+      "  ret i32 0\n"
+      "}\n");
+  runWithDomTree(
+      *M, "f", [&](Function &F, DominatorTree *DT) {
+        for (Function::iterator I = F.begin(), E = F.end(); I != E;) {
+          BasicBlock *BB = &*I++;
+          BasicBlock *SinglePred = BB->getSinglePredecessor();
+          if (!SinglePred || SinglePred == BB || BB->hasAddressTaken()) continue;
+          BranchInst *Term = dyn_cast<BranchInst>(SinglePred->getTerminator());
+          if (Term && !Term->isConditional())
+            MergeBasicBlockIntoOnlyPred(BB, DT);
+        }
+        EXPECT_TRUE(DT->verify());
+      });
+}
+
+TEST(Local, ConstantFoldTerminator) {
+  LLVMContext C;
+
+  std::unique_ptr<Module> M = parseIR(
+      C,
+      "define void @br_same_dest() {\n"
+      "entry:\n"
+      "  br i1 false, label %bb0, label %bb0\n"
+      "bb0:\n"
+      "  ret void\n"
+      "}\n"
+      "\n"
+      "define void @br_different_dest() {\n"
+      "entry:\n"
+      "  br i1 true, label %bb0, label %bb1\n"
+      "bb0:\n"
+      "  br label %exit\n"
+      "bb1:\n"
+      "  br label %exit\n"
+      "exit:\n"
+      "  ret void\n"
+      "}\n"
+      "\n"
+      "define void @switch_2_different_dest() {\n"
+      "entry:\n"
+      "  switch i32 0, label %default [ i32 0, label %bb0 ]\n"
+      "default:\n"
+      "  ret void\n"
+      "bb0:\n"
+      "  ret void\n"
+      "}\n"
+      "define void @switch_2_different_dest_default() {\n"
+      "entry:\n"
+      "  switch i32 1, label %default [ i32 0, label %bb0 ]\n"
+      "default:\n"
+      "  ret void\n"
+      "bb0:\n"
+      "  ret void\n"
+      "}\n"
+      "define void @switch_3_different_dest() {\n"
+      "entry:\n"
+      "  switch i32 0, label %default [ i32 0, label %bb0\n"
+      "                                 i32 1, label %bb1 ]\n"
+      "default:\n"
+      "  ret void\n"
+      "bb0:\n"
+      "  ret void\n"
+      "bb1:\n"
+      "  ret void\n"
+      "}\n"
+      "\n"
+      "define void @switch_variable_2_default_dest(i32 %arg) {\n"
+      "entry:\n"
+      "  switch i32 %arg, label %default [ i32 0, label %default ]\n"
+      "default:\n"
+      "  ret void\n"
+      "}\n"
+      "\n"
+      "define void @switch_constant_2_default_dest() {\n"
+      "entry:\n"
+      "  switch i32 1, label %default [ i32 0, label %default ]\n"
+      "default:\n"
+      "  ret void\n"
+      "}\n"
+      "\n"
+      "define void @switch_constant_3_repeated_dest() {\n"
+      "entry:\n"
+      "  switch i32 0, label %default [ i32 0, label %bb0\n"
+      "                                 i32 1, label %bb0 ]\n"
+      " bb0:\n"
+      "   ret void\n"
+      "default:\n"
+      "  ret void\n"
+      "}\n"
+      "\n"
+      "define void @indirectbr() {\n"
+      "entry:\n"
+      "  indirectbr i8* blockaddress(@indirectbr, %bb0), [label %bb0, label %bb1]\n"
+      "bb0:\n"
+      "  ret void\n"
+      "bb1:\n"
+      "  ret void\n"
+      "}\n"
+      "\n"
+      "define void @indirectbr_repeated() {\n"
+      "entry:\n"
+      "  indirectbr i8* blockaddress(@indirectbr_repeated, %bb0), [label %bb0, label %bb0]\n"
+      "bb0:\n"
+      "  ret void\n"
+      "}\n"
+      "\n"
+      "define void @indirectbr_unreachable() {\n"
+      "entry:\n"
+      "  indirectbr i8* blockaddress(@indirectbr_unreachable, %bb0), [label %bb1]\n"
+      "bb0:\n"
+      "  ret void\n"
+      "bb1:\n"
+      "  ret void\n"
+      "}\n"
+      "\n"
+    );
+
+  auto CFAllTerminators = [&](Function &F, DominatorTree *DT) {
+    DeferredDominance DDT(*DT);
+    for (Function::iterator I = F.begin(), E = F.end(); I != E;) {
+      BasicBlock *BB = &*I++;
+      ConstantFoldTerminator(BB, true, nullptr, &DDT);
+    }
+
+    EXPECT_TRUE(DDT.flush().verify());
+  };
+
+  runWithDomTree(*M, "br_same_dest", CFAllTerminators);
+  runWithDomTree(*M, "br_different_dest", CFAllTerminators);
+  runWithDomTree(*M, "switch_2_different_dest", CFAllTerminators);
+  runWithDomTree(*M, "switch_2_different_dest_default", CFAllTerminators);
+  runWithDomTree(*M, "switch_3_different_dest", CFAllTerminators);
+  runWithDomTree(*M, "switch_variable_2_default_dest", CFAllTerminators);
+  runWithDomTree(*M, "switch_constant_2_default_dest", CFAllTerminators);
+  runWithDomTree(*M, "switch_constant_3_repeated_dest", CFAllTerminators);
+  runWithDomTree(*M, "indirectbr", CFAllTerminators);
+  runWithDomTree(*M, "indirectbr_repeated", CFAllTerminators);
+  runWithDomTree(*M, "indirectbr_unreachable", CFAllTerminators);
 }

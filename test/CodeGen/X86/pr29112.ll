@@ -7,9 +7,8 @@ declare <4 x float> @foo(<4 x float>, <4 x float>, <4 x float>, <4 x float>, <4 
 
 define <4 x float> @bar(<4 x float>* %a1p, <4 x float>* %a2p, <4 x float> %a3, <4 x float> %a4, <16 x float>%c1, <16 x float>%c2) {
 ; CHECK-LABEL: bar:
-; CHECK:       # BB#0:
+; CHECK:       # %bb.0:
 ; CHECK-NEXT:    subq $88, %rsp
-; CHECK-NEXT:  .Lcfi0:
 ; CHECK-NEXT:    .cfi_def_cfa_offset 96
 ; CHECK-NEXT:    vmovaps %xmm1, {{[0-9]+}}(%rsp) # 16-byte Spill
 ; CHECK-NEXT:    vextractf128 $1, %ymm3, %xmm1

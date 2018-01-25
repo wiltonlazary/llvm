@@ -61,6 +61,12 @@ def FeatureZCRegMove : SubtargetFeature<"zcm", "HasZeroCycleRegMove", "true",
 def FeatureZCZeroing : SubtargetFeature<"zcz", "HasZeroCycleZeroing", "true",
                                         "Has zero-cycle zeroing instructions">;
 
+/// ... but the floating-point version doesn't quite work in rare cases on older
+/// CPUs.
+def FeatureZCZeroingFPWorkaround : SubtargetFeature<"zcz-fp-workaround",
+    "HasZeroCycleZeroingFPWorkaround", "true",
+    "The zero-cycle floating-point zeroing instruction has a bug">;
+
 def FeatureStrictAlign : SubtargetFeature<"strict-align",
                                           "StrictAlign", "true",
                                           "Disallow all unaligned memory "
@@ -142,6 +148,7 @@ def FeatureNoNegativeImmediates : SubtargetFeature<"no-neg-immediates",
 def FeatureLSLFast : SubtargetFeature<
     "lsl-fast", "HasLSLFast", "true",
     "CPU has a fastpath logical shift of up to 3 places">;
+
 //===----------------------------------------------------------------------===//
 // Architectures.
 //
@@ -274,19 +281,22 @@ def ProcA75     : SubtargetFeature<"a75", "ARMProcFamily", "CortexA75",
                                    FeaturePerfMon
                                    ]>;
 
+// Note that cyclone does not fuse AES instructions, but newer apple chips do
+// perform the fusion and cyclone is used by default when targetting apple OSes.
 def ProcCyclone : SubtargetFeature<"cyclone", "ARMProcFamily", "Cyclone",
                                    "Cyclone", [
                                    FeatureAlternateSExtLoadCVTF32Pattern,
+                                   FeatureArithmeticBccFusion,
+                                   FeatureArithmeticCbzFusion,
                                    FeatureCrypto,
                                    FeatureDisableLatencySchedHeuristic,
                                    FeatureFPARMv8,
-                                   FeatureArithmeticBccFusion,
-                                   FeatureArithmeticCbzFusion,
+                                   FeatureFuseAES,
                                    FeatureNEON,
                                    FeaturePerfMon,
-                                   FeatureSlowMisaligned128Store,
                                    FeatureZCRegMove,
-                                   FeatureZCZeroing
+                                   FeatureZCZeroing,
+                                   FeatureZCZeroingFPWorkaround
                                    ]>;
 
 def ProcExynosM1 : SubtargetFeature<"exynosm1", "ARMProcFamily", "ExynosM1",
@@ -305,7 +315,7 @@ def ProcExynosM1 : SubtargetFeature<"exynosm1", "ARMProcFamily", "ExynosM1",
                                      FeatureZCZeroing]>;
 
 def ProcExynosM2 : SubtargetFeature<"exynosm2", "ARMProcFamily", "ExynosM1",
-                                    "Samsung Exynos-M2/M3 processors",
+                                    "Samsung Exynos-M2 processors",
                                     [FeatureSlowPaired128,
                                      FeatureCRC,
                                      FeatureCrypto,
@@ -316,6 +326,21 @@ def ProcExynosM2 : SubtargetFeature<"exynosm2", "ARMProcFamily", "ExynosM1",
                                      FeaturePerfMon,
                                      FeaturePostRAScheduler,
                                      FeatureSlowMisaligned128Store,
+                                     FeatureZCZeroing]>;
+
+def ProcExynosM3 : SubtargetFeature<"exynosm3", "ARMProcFamily", "ExynosM1",
+                                    "Samsung Exynos-M3 processors",
+                                    [FeatureCRC,
+                                     FeatureCrypto,
+                                     FeatureCustomCheapAsMoveHandling,
+                                     FeatureFPARMv8,
+                                     FeatureFuseAES,
+                                     FeatureFuseLiterals,
+                                     FeatureNEON,
+                                     FeaturePerfMon,
+                                     FeaturePostRAScheduler,
+                                     FeatureSlowMisaligned128Store,
+                                     FeatureSlowPaired128,
                                      FeatureZCZeroing]>;
 
 def ProcKryo    : SubtargetFeature<"kryo", "ARMProcFamily", "Kryo",
@@ -438,7 +463,7 @@ def : ProcessorModel<"cortex-a75", CortexA57Model, [ProcA75]>;
 def : ProcessorModel<"cyclone", CycloneModel, [ProcCyclone]>;
 def : ProcessorModel<"exynos-m1", ExynosM1Model, [ProcExynosM1]>;
 def : ProcessorModel<"exynos-m2", ExynosM1Model, [ProcExynosM2]>;
-def : ProcessorModel<"exynos-m3", ExynosM1Model, [ProcExynosM2]>;
+def : ProcessorModel<"exynos-m3", ExynosM1Model, [ProcExynosM3]>;
 def : ProcessorModel<"falkor", FalkorModel, [ProcFalkor]>;
 def : ProcessorModel<"saphira", FalkorModel, [ProcSaphira]>;
 def : ProcessorModel<"kryo", KryoModel, [ProcKryo]>;
@@ -458,12 +483,14 @@ def GenericAsmParserVariant : AsmParserVariant {
   int Variant = 0;
   string Name = "generic";
   string BreakCharacters = ".";
+  string TokenizingCharacters = "[]*!/";
 }
 
 def AppleAsmParserVariant : AsmParserVariant {
   int Variant = 1;
   string Name = "apple-neon";
   string BreakCharacters = ".";
+  string TokenizingCharacters = "[]*!/";
 }
 
 //===----------------------------------------------------------------------===//

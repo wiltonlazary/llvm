@@ -11,9 +11,18 @@
 //
 //===----------------------------------------------------------------------===//
 
+def isGCN : Predicate<"Subtarget->getGeneration() "
+                      ">= SISubtarget::SOUTHERN_ISLANDS">,
+            AssemblerPredicate<"FeatureGCN">;
+def isSI : Predicate<"Subtarget->getGeneration() "
+                      "== SISubtarget::SOUTHERN_ISLANDS">,
+           AssemblerPredicate<"FeatureSouthernIslands">;
+
+
 class InstSI <dag outs, dag ins, string asm = "",
               list<dag> pattern = []> :
   AMDGPUInst<outs, ins, asm, pattern>, PredicateControl {
+  let SubtargetPredicate = isGCN;
 
   // Low bits - basic encoding information.
   field bit SALU = 0;
@@ -86,9 +95,9 @@ class InstSI <dag outs, dag ins, string asm = "",
   // Is it possible for this instruction to be atomic?
   field bit maybeAtomic = 0;
 
-  // This bit indicates that this is a 16-bit instruction which zero-fills
-  // unused bits in dst. Note that new GFX9 opcodes preserve unused bits.
-  field bit F16_ZFILL = 0;
+  // This bit indicates that this is a VI instruction which is renamed
+  // in GFX9. Required for correct mapping from pseudo to MC.
+  field bit renamedInGFX9 = 0;
 
   // This bit indicates that this has a floating point result type, so
   // the clamp modifier has floating point semantics.
@@ -105,6 +114,12 @@ class InstSI <dag outs, dag ins, string asm = "",
   // This field indicates that the clamp applies to the high component
   // of a packed output register.
   field bit ClampHi = 0;
+
+  // This bit indicates that this is a packed VOP3P instruction
+  field bit IsPacked = 0;
+
+  // This bit indicates that this is a D16 instruction.
+  field bit D16 = 0;
 
   // These need to be kept in sync with the enum in SIInstrFlags.
   let TSFlags{0} = SALU;
@@ -152,12 +167,16 @@ class InstSI <dag outs, dag ins, string asm = "",
   let TSFlags{42} = VOP3_OPSEL;
 
   let TSFlags{43} = maybeAtomic;
-  let TSFlags{44} = F16_ZFILL;
+  let TSFlags{44} = renamedInGFX9;
 
   let TSFlags{45} = FPClamp;
   let TSFlags{46} = IntClamp;
   let TSFlags{47} = ClampLo;
   let TSFlags{48} = ClampHi;
+
+  let TSFlags{49} = IsPacked;
+
+  let TSFlags{50} = D16;
 
   let SchedRW = [Write32Bit];
 
@@ -233,6 +252,7 @@ class MIMGe <bits<7> op> : Enc64 {
   bits<1> tfe;
   bits<1> lwe;
   bits<1> slc;
+  bits<1> d16 = 0;
   bits<8> vaddr;
   bits<7> srsrc;
   bits<7> ssamp;
@@ -251,6 +271,7 @@ class MIMGe <bits<7> op> : Enc64 {
   let Inst{47-40} = vdata;
   let Inst{52-48} = srsrc{6-2};
   let Inst{57-53} = ssamp{6-2};
+  let Inst{63} = d16;
 }
 
 class EXPe : Enc64 {

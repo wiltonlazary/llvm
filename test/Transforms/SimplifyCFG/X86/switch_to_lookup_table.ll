@@ -1,4 +1,4 @@
-; RUN: opt < %s -latesimplifycfg -S -mtriple=x86_64-unknown-linux-gnu | FileCheck %s
+; RUN: opt < %s -simplifycfg -switch-to-lookup=true -keep-loops=false -S -mtriple=x86_64-unknown-linux-gnu | FileCheck %s
 
 target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v64:64:64-v128:128:128-a0:0:64-s0:64:64-f80:128:128-n8:16:32:64-S128"
 target triple = "x86_64-unknown-linux-gnu"
@@ -1173,10 +1173,10 @@ return:
   ret i32 %retval.0
 ; CHECK-LABEL: @reuse_cmp2(
 ; CHECK: entry:
-; CHECK-NEXT: %switch = icmp ult i32 %x, 4
-; CHECK-NEXT: %x. = select i1 %switch, i32 %x, i32 4
+; CHECK-NEXT: %0 = icmp ult i32 %x, 4
+; CHECK-NEXT: %x. = select i1 %0, i32 %x, i32 4
 ; CHECK-NEXT: [[C:%.+]] = icmp ne i32 %x., 4
-; CHECK:      [[R:%.+]] = select i1 [[C]], i32 {{.*}}, i32 100
+; CHECK:      [[R:%.+]] = select i1 %0, i32 {{.*}}, i32 100
 ; CHECK-NEXT: ret i32 [[R]]
 }
 

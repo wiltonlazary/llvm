@@ -3,7 +3,7 @@
 # RUN: | FileCheck %s
 
 # CHECK: Verifying .debug_info Unit Header Chain...
-# CHECK-NEXT: error: Invalid address range [0x00000007 - 0x00000006].
+# CHECK-NEXT: error: Invalid address range [0x0000000000000007, 0x0000000000000006)
 
 	.section	__TEXT,__text,regular,pure_instructions
 	.macosx_version_min 10, 12
@@ -14,14 +14,11 @@ Lfunc_begin0:
 	.file	1 "basic.c"
 	.loc	1 1 0                   ## basic.c:1:0
 	.cfi_startproc
-## BB#0:                                ## %entry
+## %bb.0:                               ## %entry
 	pushq	%rbp
-Lcfi0:
 	.cfi_def_cfa_offset 16
-Lcfi1:
 	.cfi_offset %rbp, -16
 	movq	%rsp, %rbp
-Lcfi2:
 	.cfi_def_cfa_register %rbp
 Ltmp0:
 	.loc	1 1 17 prologue_end     ## basic.c:1:17
@@ -73,7 +70,7 @@ Lset0 = Lsection_abbrev-Lsection_abbrev ## Offset Into Abbrev. Section
 Lset1 = Lline_table_start0-Lsection_line ## DW_AT_stmt_list
 	.long	Lset1
 	.long	63                      ## DW_AT_comp_dir
-	.quad	7        				## DW_AT_low_pc -- error: Invalid address range [0x00000007 - 0x00000006].
+	.quad	7        				## DW_AT_low_pc -- error: Invalid address range [0x0000000000000007, 0x0000000000000006)
 	.quad	6             			## DW_AT_high_pc
 	.byte	0                       ## End Of Children Mark
 .subsections_via_symbols

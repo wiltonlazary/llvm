@@ -309,23 +309,23 @@ bool TypeSetByHwMode::intersect(SetType &Out, const SetType &In) {
   return Changed;
 }
 
-void TypeSetByHwMode::validate() const {
+bool TypeSetByHwMode::validate() const {
 #ifndef NDEBUG
   if (empty())
-    return;
+    return true;
   bool AllEmpty = true;
   for (const auto &I : *this)
     AllEmpty &= I.second.empty();
-  assert(!AllEmpty &&
-          "type set is empty for each HW mode: type contradiction?");
+  return !AllEmpty;
 #endif
+  return true;
 }
 
 // --- TypeInfer
 
 bool TypeInfer::MergeInTypeInfo(TypeSetByHwMode &Out,
                                 const TypeSetByHwMode &In) {
-  ValidateOnExit _1(Out);
+  ValidateOnExit _1(Out, *this);
   In.validate();
   if (In.empty() || Out == In || TP.hasError())
     return false;
@@ -342,7 +342,7 @@ bool TypeInfer::MergeInTypeInfo(TypeSetByHwMode &Out,
 }
 
 bool TypeInfer::forceArbitrary(TypeSetByHwMode &Out) {
-  ValidateOnExit _1(Out);
+  ValidateOnExit _1(Out, *this);
   if (TP.hasError())
     return false;
   assert(!Out.empty() && "cannot pick from an empty set");
@@ -361,7 +361,7 @@ bool TypeInfer::forceArbitrary(TypeSetByHwMode &Out) {
 }
 
 bool TypeInfer::EnforceInteger(TypeSetByHwMode &Out) {
-  ValidateOnExit _1(Out);
+  ValidateOnExit _1(Out, *this);
   if (TP.hasError())
     return false;
   if (!Out.empty())
@@ -371,7 +371,7 @@ bool TypeInfer::EnforceInteger(TypeSetByHwMode &Out) {
 }
 
 bool TypeInfer::EnforceFloatingPoint(TypeSetByHwMode &Out) {
-  ValidateOnExit _1(Out);
+  ValidateOnExit _1(Out, *this);
   if (TP.hasError())
     return false;
   if (!Out.empty())
@@ -381,7 +381,7 @@ bool TypeInfer::EnforceFloatingPoint(TypeSetByHwMode &Out) {
 }
 
 bool TypeInfer::EnforceScalar(TypeSetByHwMode &Out) {
-  ValidateOnExit _1(Out);
+  ValidateOnExit _1(Out, *this);
   if (TP.hasError())
     return false;
   if (!Out.empty())
@@ -391,7 +391,7 @@ bool TypeInfer::EnforceScalar(TypeSetByHwMode &Out) {
 }
 
 bool TypeInfer::EnforceVector(TypeSetByHwMode &Out) {
-  ValidateOnExit _1(Out);
+  ValidateOnExit _1(Out, *this);
   if (TP.hasError())
     return false;
   if (!Out.empty())
@@ -401,7 +401,7 @@ bool TypeInfer::EnforceVector(TypeSetByHwMode &Out) {
 }
 
 bool TypeInfer::EnforceAny(TypeSetByHwMode &Out) {
-  ValidateOnExit _1(Out);
+  ValidateOnExit _1(Out, *this);
   if (TP.hasError() || !Out.empty())
     return false;
 
@@ -440,7 +440,7 @@ static Iter max_if(Iter B, Iter E, Pred P, Less L) {
 /// Make sure that for each type in Small, there exists a larger type in Big.
 bool TypeInfer::EnforceSmallerThan(TypeSetByHwMode &Small,
                                    TypeSetByHwMode &Big) {
-  ValidateOnExit _1(Small), _2(Big);
+  ValidateOnExit _1(Small, *this), _2(Big, *this);
   if (TP.hasError())
     return false;
   bool Changed = false;
@@ -514,48 +514,26 @@ bool TypeInfer::EnforceSmallerThan(TypeSetByHwMode &Small,
     // MinS = min scalar in Small, remove all scalars from Big that are
     // smaller-or-equal than MinS.
     auto MinS = min_if(S.begin(), S.end(), isScalar, LT);
-    if (MinS != S.end()) {
+    if (MinS != S.end())
       Changed |= berase_if(B, std::bind(LE, std::placeholders::_1, *MinS));
-      if (B.empty()) {
-        TP.error("Type contradiction in " +
-                 Twine(__func__) + ":" + Twine(__LINE__));
-        return Changed;
-      }
-    }
+
     // MaxS = max scalar in Big, remove all scalars from Small that are
     // larger than MaxS.
     auto MaxS = max_if(B.begin(), B.end(), isScalar, LT);
-    if (MaxS != B.end()) {
+    if (MaxS != B.end())
       Changed |= berase_if(S, std::bind(LE, *MaxS, std::placeholders::_1));
-      if (B.empty()) {
-        TP.error("Type contradiction in " +
-                 Twine(__func__) + ":" + Twine(__LINE__));
-        return Changed;
-      }
-    }
 
     // MinV = min vector in Small, remove all vectors from Big that are
     // smaller-or-equal than MinV.
     auto MinV = min_if(S.begin(), S.end(), isVector, LT);
-    if (MinV != S.end()) {
+    if (MinV != S.end())
       Changed |= berase_if(B, std::bind(LE, std::placeholders::_1, *MinV));
-      if (B.empty()) {
-        TP.error("Type contradiction in " +
-                 Twine(__func__) + ":" + Twine(__LINE__));
-        return Changed;
-      }
-    }
+
     // MaxV = max vector in Big, remove all vectors from Small that are
     // larger than MaxV.
     auto MaxV = max_if(B.begin(), B.end(), isVector, LT);
-    if (MaxV != B.end()) {
+    if (MaxV != B.end())
       Changed |= berase_if(S, std::bind(LE, *MaxV, std::placeholders::_1));
-      if (B.empty()) {
-        TP.error("Type contradiction in " +
-                 Twine(__func__) + ":" + Twine(__LINE__));
-        return Changed;
-      }
-    }
   }
 
   return Changed;
@@ -567,7 +545,7 @@ bool TypeInfer::EnforceSmallerThan(TypeSetByHwMode &Small,
 ///    type T in Vec, such that U is the element type of T.
 bool TypeInfer::EnforceVectorEltTypeIs(TypeSetByHwMode &Vec,
                                        TypeSetByHwMode &Elem) {
-  ValidateOnExit _1(Vec), _2(Elem);
+  ValidateOnExit _1(Vec, *this), _2(Elem, *this);
   if (TP.hasError())
     return false;
   bool Changed = false;
@@ -600,12 +578,6 @@ bool TypeInfer::EnforceVectorEltTypeIs(TypeSetByHwMode &Vec,
     // Remove from E all (scalar) types, for which there is no corresponding
     // type in V.
     Changed |= berase_if(E, [&VT](MVT T) -> bool { return !VT.count(T); });
-
-    if (V.empty() || E.empty()) {
-      TP.error("Type contradiction in " +
-               Twine(__func__) + ":" + Twine(__LINE__));
-      return Changed;
-    }
   }
 
   return Changed;
@@ -614,7 +586,7 @@ bool TypeInfer::EnforceVectorEltTypeIs(TypeSetByHwMode &Vec,
 bool TypeInfer::EnforceVectorEltTypeIs(TypeSetByHwMode &Vec,
                                        const ValueTypeByHwMode &VVT) {
   TypeSetByHwMode Tmp(VVT);
-  ValidateOnExit _1(Vec), _2(Tmp);
+  ValidateOnExit _1(Vec, *this), _2(Tmp, *this);
   return EnforceVectorEltTypeIs(Vec, Tmp);
 }
 
@@ -623,13 +595,18 @@ bool TypeInfer::EnforceVectorEltTypeIs(TypeSetByHwMode &Vec,
 /// element type as T and at least as many elements as T.
 bool TypeInfer::EnforceVectorSubVectorTypeIs(TypeSetByHwMode &Vec,
                                              TypeSetByHwMode &Sub) {
-  ValidateOnExit _1(Vec), _2(Sub);
+  ValidateOnExit _1(Vec, *this), _2(Sub, *this);
   if (TP.hasError())
     return false;
 
   /// Return true if B is a suB-vector of P, i.e. P is a suPer-vector of B.
   auto IsSubVec = [](MVT B, MVT P) -> bool {
     if (!B.isVector() || !P.isVector())
+      return false;
+    // Logically a <4 x i32> is a valid subvector of <n x 4 x i32>
+    // but until there are obvious use-cases for this, keep the
+    // types separate.
+    if (B.isScalableVector() != P.isScalableVector())
       return false;
     if (B.getVectorElementType() != P.getVectorElementType())
       return false;
@@ -666,27 +643,12 @@ bool TypeInfer::EnforceVectorSubVectorTypeIs(TypeSetByHwMode &Vec,
     TypeSetByHwMode::SetType &V = Vec.get(M);
 
     Changed |= berase_if(S, isScalar);
-    if (S.empty()) {
-      TP.error("Type contradiction in " +
-               Twine(__func__) + ":" + Twine(__LINE__));
-      return Changed;
-    }
 
     // Erase all types from S that are not sub-vectors of a type in V.
     Changed |= berase_if(S, std::bind(NoSubV, V, std::placeholders::_1));
-    if (S.empty()) {
-      TP.error("Type contradiction in " +
-               Twine(__func__) + ":" + Twine(__LINE__));
-      return Changed;
-    }
 
     // Erase all types from V that are not super-vectors of a type in S.
     Changed |= berase_if(V, std::bind(NoSupV, S, std::placeholders::_1));
-    if (V.empty()) {
-      TP.error("Type contradiction in " +
-               Twine(__func__) + ":" + Twine(__LINE__));
-      return Changed;
-    }
   }
 
   return Changed;
@@ -699,7 +661,7 @@ bool TypeInfer::EnforceVectorSubVectorTypeIs(TypeSetByHwMode &Vec,
 ///    type T in V, such that T and U have the same number of elements
 ///    (reverse of 2).
 bool TypeInfer::EnforceSameNumElts(TypeSetByHwMode &V, TypeSetByHwMode &W) {
-  ValidateOnExit _1(V), _2(W);
+  ValidateOnExit _1(V, *this), _2(W, *this);
   if (TP.hasError())
     return false;
 
@@ -737,7 +699,7 @@ bool TypeInfer::EnforceSameNumElts(TypeSetByHwMode &V, TypeSetByHwMode &W) {
 /// 2. Ensure that for each type U in B, there exists a type T in A
 ///    such that T and U have equal size in bits (reverse of 1).
 bool TypeInfer::EnforceSameSize(TypeSetByHwMode &A, TypeSetByHwMode &B) {
-  ValidateOnExit _1(A), _2(B);
+  ValidateOnExit _1(A, *this), _2(B, *this);
   if (TP.hasError())
     return false;
   bool Changed = false;
@@ -768,7 +730,7 @@ bool TypeInfer::EnforceSameSize(TypeSetByHwMode &A, TypeSetByHwMode &B) {
 }
 
 void TypeInfer::expandOverloads(TypeSetByHwMode &VTS) {
-  ValidateOnExit _1(VTS);
+  ValidateOnExit _1(VTS, *this);
   TypeSetByHwMode Legal = getLegalTypes();
   bool HaveLegalDef = Legal.hasDefault();
 
@@ -844,28 +806,354 @@ TypeSetByHwMode TypeInfer::getLegalTypes() {
   return VTS;
 }
 
+#ifndef NDEBUG
+TypeInfer::ValidateOnExit::~ValidateOnExit() {
+  if (!VTS.validate()) {
+    dbgs() << "Type set is empty for each HW mode:\n"
+              "possible type contradiction in the pattern below "
+              "(use -print-records with llvm-tblgen to see all "
+              "expanded records).\n";
+    Infer.TP.dump();
+    llvm_unreachable(nullptr);
+  }
+}
+#endif
+
 //===----------------------------------------------------------------------===//
 // TreePredicateFn Implementation
 //===----------------------------------------------------------------------===//
 
 /// TreePredicateFn constructor.  Here 'N' is a subclass of PatFrag.
 TreePredicateFn::TreePredicateFn(TreePattern *N) : PatFragRec(N) {
-  assert((getPredCode().empty() || getImmCode().empty()) &&
-        ".td file corrupt: can't have a node predicate *and* an imm predicate");
+  assert(
+      (!hasPredCode() || !hasImmCode()) &&
+      ".td file corrupt: can't have a node predicate *and* an imm predicate");
+}
+
+bool TreePredicateFn::hasPredCode() const {
+  return isLoad() || isStore() || isAtomic() ||
+         !PatFragRec->getRecord()->getValueAsString("PredicateCode").empty();
 }
 
 std::string TreePredicateFn::getPredCode() const {
-  return PatFragRec->getRecord()->getValueAsString("PredicateCode");
+  std::string Code = "";
+
+  if (!isLoad() && !isStore() && !isAtomic()) {
+    Record *MemoryVT = getMemoryVT();
+
+    if (MemoryVT)
+      PrintFatalError(getOrigPatFragRecord()->getRecord()->getLoc(),
+                      "MemoryVT requires IsLoad or IsStore");
+  }
+
+  if (!isLoad() && !isStore()) {
+    if (isUnindexed())
+      PrintFatalError(getOrigPatFragRecord()->getRecord()->getLoc(),
+                      "IsUnindexed requires IsLoad or IsStore");
+
+    Record *ScalarMemoryVT = getScalarMemoryVT();
+
+    if (ScalarMemoryVT)
+      PrintFatalError(getOrigPatFragRecord()->getRecord()->getLoc(),
+                      "ScalarMemoryVT requires IsLoad or IsStore");
+  }
+
+  if (isLoad() + isStore() + isAtomic() > 1)
+    PrintFatalError(getOrigPatFragRecord()->getRecord()->getLoc(),
+                    "IsLoad, IsStore, and IsAtomic are mutually exclusive");
+
+  if (isLoad()) {
+    if (!isUnindexed() && !isNonExtLoad() && !isAnyExtLoad() &&
+        !isSignExtLoad() && !isZeroExtLoad() && getMemoryVT() == nullptr &&
+        getScalarMemoryVT() == nullptr)
+      PrintFatalError(getOrigPatFragRecord()->getRecord()->getLoc(),
+                      "IsLoad cannot be used by itself");
+  } else {
+    if (isNonExtLoad())
+      PrintFatalError(getOrigPatFragRecord()->getRecord()->getLoc(),
+                      "IsNonExtLoad requires IsLoad");
+    if (isAnyExtLoad())
+      PrintFatalError(getOrigPatFragRecord()->getRecord()->getLoc(),
+                      "IsAnyExtLoad requires IsLoad");
+    if (isSignExtLoad())
+      PrintFatalError(getOrigPatFragRecord()->getRecord()->getLoc(),
+                      "IsSignExtLoad requires IsLoad");
+    if (isZeroExtLoad())
+      PrintFatalError(getOrigPatFragRecord()->getRecord()->getLoc(),
+                      "IsZeroExtLoad requires IsLoad");
+  }
+
+  if (isStore()) {
+    if (!isUnindexed() && !isTruncStore() && !isNonTruncStore() &&
+        getMemoryVT() == nullptr && getScalarMemoryVT() == nullptr)
+      PrintFatalError(getOrigPatFragRecord()->getRecord()->getLoc(),
+                      "IsStore cannot be used by itself");
+  } else {
+    if (isNonTruncStore())
+      PrintFatalError(getOrigPatFragRecord()->getRecord()->getLoc(),
+                      "IsNonTruncStore requires IsStore");
+    if (isTruncStore())
+      PrintFatalError(getOrigPatFragRecord()->getRecord()->getLoc(),
+                      "IsTruncStore requires IsStore");
+  }
+
+  if (isAtomic()) {
+    if (getMemoryVT() == nullptr && !isAtomicOrderingMonotonic() &&
+        !isAtomicOrderingAcquire() && !isAtomicOrderingRelease() &&
+        !isAtomicOrderingAcquireRelease() &&
+        !isAtomicOrderingSequentiallyConsistent() &&
+        !isAtomicOrderingAcquireOrStronger() &&
+        !isAtomicOrderingReleaseOrStronger() &&
+        !isAtomicOrderingWeakerThanAcquire() &&
+        !isAtomicOrderingWeakerThanRelease())
+      PrintFatalError(getOrigPatFragRecord()->getRecord()->getLoc(),
+                      "IsAtomic cannot be used by itself");
+  } else {
+    if (isAtomicOrderingMonotonic())
+      PrintFatalError(getOrigPatFragRecord()->getRecord()->getLoc(),
+                      "IsAtomicOrderingMonotonic requires IsAtomic");
+    if (isAtomicOrderingAcquire())
+      PrintFatalError(getOrigPatFragRecord()->getRecord()->getLoc(),
+                      "IsAtomicOrderingAcquire requires IsAtomic");
+    if (isAtomicOrderingRelease())
+      PrintFatalError(getOrigPatFragRecord()->getRecord()->getLoc(),
+                      "IsAtomicOrderingRelease requires IsAtomic");
+    if (isAtomicOrderingAcquireRelease())
+      PrintFatalError(getOrigPatFragRecord()->getRecord()->getLoc(),
+                      "IsAtomicOrderingAcquireRelease requires IsAtomic");
+    if (isAtomicOrderingSequentiallyConsistent())
+      PrintFatalError(getOrigPatFragRecord()->getRecord()->getLoc(),
+                      "IsAtomicOrderingSequentiallyConsistent requires IsAtomic");
+    if (isAtomicOrderingAcquireOrStronger())
+      PrintFatalError(getOrigPatFragRecord()->getRecord()->getLoc(),
+                      "IsAtomicOrderingAcquireOrStronger requires IsAtomic");
+    if (isAtomicOrderingReleaseOrStronger())
+      PrintFatalError(getOrigPatFragRecord()->getRecord()->getLoc(),
+                      "IsAtomicOrderingReleaseOrStronger requires IsAtomic");
+    if (isAtomicOrderingWeakerThanAcquire())
+      PrintFatalError(getOrigPatFragRecord()->getRecord()->getLoc(),
+                      "IsAtomicOrderingWeakerThanAcquire requires IsAtomic");
+  }
+
+  if (isLoad() || isStore() || isAtomic()) {
+    StringRef SDNodeName =
+        isLoad() ? "LoadSDNode" : isStore() ? "StoreSDNode" : "AtomicSDNode";
+
+    Record *MemoryVT = getMemoryVT();
+
+    if (MemoryVT)
+      Code += ("if (cast<" + SDNodeName + ">(N)->getMemoryVT() != MVT::" +
+               MemoryVT->getName() + ") return false;\n")
+                  .str();
+  }
+
+  if (isAtomic() && isAtomicOrderingMonotonic())
+    Code += "if (cast<AtomicSDNode>(N)->getOrdering() != "
+            "AtomicOrdering::Monotonic) return false;\n";
+  if (isAtomic() && isAtomicOrderingAcquire())
+    Code += "if (cast<AtomicSDNode>(N)->getOrdering() != "
+            "AtomicOrdering::Acquire) return false;\n";
+  if (isAtomic() && isAtomicOrderingRelease())
+    Code += "if (cast<AtomicSDNode>(N)->getOrdering() != "
+            "AtomicOrdering::Release) return false;\n";
+  if (isAtomic() && isAtomicOrderingAcquireRelease())
+    Code += "if (cast<AtomicSDNode>(N)->getOrdering() != "
+            "AtomicOrdering::AcquireRelease) return false;\n";
+  if (isAtomic() && isAtomicOrderingSequentiallyConsistent())
+    Code += "if (cast<AtomicSDNode>(N)->getOrdering() != "
+            "AtomicOrdering::SequentiallyConsistent) return false;\n";
+
+  if (isAtomic() && isAtomicOrderingAcquireOrStronger())
+    Code += "if (!isAcquireOrStronger(cast<AtomicSDNode>(N)->getOrdering())) "
+            "return false;\n";
+  if (isAtomic() && isAtomicOrderingWeakerThanAcquire())
+    Code += "if (isAcquireOrStronger(cast<AtomicSDNode>(N)->getOrdering())) "
+            "return false;\n";
+
+  if (isAtomic() && isAtomicOrderingReleaseOrStronger())
+    Code += "if (!isReleaseOrStronger(cast<AtomicSDNode>(N)->getOrdering())) "
+            "return false;\n";
+  if (isAtomic() && isAtomicOrderingWeakerThanRelease())
+    Code += "if (isReleaseOrStronger(cast<AtomicSDNode>(N)->getOrdering())) "
+            "return false;\n";
+
+  if (isLoad() || isStore()) {
+    StringRef SDNodeName = isLoad() ? "LoadSDNode" : "StoreSDNode";
+
+    if (isUnindexed())
+      Code += ("if (cast<" + SDNodeName +
+               ">(N)->getAddressingMode() != ISD::UNINDEXED) "
+               "return false;\n")
+                  .str();
+
+    if (isLoad()) {
+      if ((isNonExtLoad() + isAnyExtLoad() + isSignExtLoad() +
+           isZeroExtLoad()) > 1)
+        PrintFatalError(getOrigPatFragRecord()->getRecord()->getLoc(),
+                        "IsNonExtLoad, IsAnyExtLoad, IsSignExtLoad, and "
+                        "IsZeroExtLoad are mutually exclusive");
+      if (isNonExtLoad())
+        Code += "if (cast<LoadSDNode>(N)->getExtensionType() != "
+                "ISD::NON_EXTLOAD) return false;\n";
+      if (isAnyExtLoad())
+        Code += "if (cast<LoadSDNode>(N)->getExtensionType() != ISD::EXTLOAD) "
+                "return false;\n";
+      if (isSignExtLoad())
+        Code += "if (cast<LoadSDNode>(N)->getExtensionType() != ISD::SEXTLOAD) "
+                "return false;\n";
+      if (isZeroExtLoad())
+        Code += "if (cast<LoadSDNode>(N)->getExtensionType() != ISD::ZEXTLOAD) "
+                "return false;\n";
+    } else {
+      if ((isNonTruncStore() + isTruncStore()) > 1)
+        PrintFatalError(
+            getOrigPatFragRecord()->getRecord()->getLoc(),
+            "IsNonTruncStore, and IsTruncStore are mutually exclusive");
+      if (isNonTruncStore())
+        Code +=
+            " if (cast<StoreSDNode>(N)->isTruncatingStore()) return false;\n";
+      if (isTruncStore())
+        Code +=
+            " if (!cast<StoreSDNode>(N)->isTruncatingStore()) return false;\n";
+    }
+
+    Record *ScalarMemoryVT = getScalarMemoryVT();
+
+    if (ScalarMemoryVT)
+      Code += ("if (cast<" + SDNodeName +
+               ">(N)->getMemoryVT().getScalarType() != MVT::" +
+               ScalarMemoryVT->getName() + ") return false;\n")
+                  .str();
+  }
+
+  std::string PredicateCode = PatFragRec->getRecord()->getValueAsString("PredicateCode");
+
+  Code += PredicateCode;
+
+  if (PredicateCode.empty() && !Code.empty())
+    Code += "return true;\n";
+
+  return Code;
+}
+
+bool TreePredicateFn::hasImmCode() const {
+  return !PatFragRec->getRecord()->getValueAsString("ImmediateCode").empty();
 }
 
 std::string TreePredicateFn::getImmCode() const {
   return PatFragRec->getRecord()->getValueAsString("ImmediateCode");
 }
 
+bool TreePredicateFn::immCodeUsesAPInt() const {
+  return getOrigPatFragRecord()->getRecord()->getValueAsBit("IsAPInt");
+}
+
+bool TreePredicateFn::immCodeUsesAPFloat() const {
+  bool Unset;
+  // The return value will be false when IsAPFloat is unset.
+  return getOrigPatFragRecord()->getRecord()->getValueAsBitOrUnset("IsAPFloat",
+                                                                   Unset);
+}
+
+bool TreePredicateFn::isPredefinedPredicateEqualTo(StringRef Field,
+                                                   bool Value) const {
+  bool Unset;
+  bool Result =
+      getOrigPatFragRecord()->getRecord()->getValueAsBitOrUnset(Field, Unset);
+  if (Unset)
+    return false;
+  return Result == Value;
+}
+bool TreePredicateFn::isLoad() const {
+  return isPredefinedPredicateEqualTo("IsLoad", true);
+}
+bool TreePredicateFn::isStore() const {
+  return isPredefinedPredicateEqualTo("IsStore", true);
+}
+bool TreePredicateFn::isAtomic() const {
+  return isPredefinedPredicateEqualTo("IsAtomic", true);
+}
+bool TreePredicateFn::isUnindexed() const {
+  return isPredefinedPredicateEqualTo("IsUnindexed", true);
+}
+bool TreePredicateFn::isNonExtLoad() const {
+  return isPredefinedPredicateEqualTo("IsNonExtLoad", true);
+}
+bool TreePredicateFn::isAnyExtLoad() const {
+  return isPredefinedPredicateEqualTo("IsAnyExtLoad", true);
+}
+bool TreePredicateFn::isSignExtLoad() const {
+  return isPredefinedPredicateEqualTo("IsSignExtLoad", true);
+}
+bool TreePredicateFn::isZeroExtLoad() const {
+  return isPredefinedPredicateEqualTo("IsZeroExtLoad", true);
+}
+bool TreePredicateFn::isNonTruncStore() const {
+  return isPredefinedPredicateEqualTo("IsTruncStore", false);
+}
+bool TreePredicateFn::isTruncStore() const {
+  return isPredefinedPredicateEqualTo("IsTruncStore", true);
+}
+bool TreePredicateFn::isAtomicOrderingMonotonic() const {
+  return isPredefinedPredicateEqualTo("IsAtomicOrderingMonotonic", true);
+}
+bool TreePredicateFn::isAtomicOrderingAcquire() const {
+  return isPredefinedPredicateEqualTo("IsAtomicOrderingAcquire", true);
+}
+bool TreePredicateFn::isAtomicOrderingRelease() const {
+  return isPredefinedPredicateEqualTo("IsAtomicOrderingRelease", true);
+}
+bool TreePredicateFn::isAtomicOrderingAcquireRelease() const {
+  return isPredefinedPredicateEqualTo("IsAtomicOrderingAcquireRelease", true);
+}
+bool TreePredicateFn::isAtomicOrderingSequentiallyConsistent() const {
+  return isPredefinedPredicateEqualTo("IsAtomicOrderingSequentiallyConsistent",
+                                      true);
+}
+bool TreePredicateFn::isAtomicOrderingAcquireOrStronger() const {
+  return isPredefinedPredicateEqualTo("IsAtomicOrderingAcquireOrStronger", true);
+}
+bool TreePredicateFn::isAtomicOrderingWeakerThanAcquire() const {
+  return isPredefinedPredicateEqualTo("IsAtomicOrderingAcquireOrStronger", false);
+}
+bool TreePredicateFn::isAtomicOrderingReleaseOrStronger() const {
+  return isPredefinedPredicateEqualTo("IsAtomicOrderingReleaseOrStronger", true);
+}
+bool TreePredicateFn::isAtomicOrderingWeakerThanRelease() const {
+  return isPredefinedPredicateEqualTo("IsAtomicOrderingReleaseOrStronger", false);
+}
+Record *TreePredicateFn::getMemoryVT() const {
+  Record *R = getOrigPatFragRecord()->getRecord();
+  if (R->isValueUnset("MemoryVT"))
+    return nullptr;
+  return R->getValueAsDef("MemoryVT");
+}
+Record *TreePredicateFn::getScalarMemoryVT() const {
+  Record *R = getOrigPatFragRecord()->getRecord();
+  if (R->isValueUnset("ScalarMemoryVT"))
+    return nullptr;
+  return R->getValueAsDef("ScalarMemoryVT");
+}
+
+StringRef TreePredicateFn::getImmType() const {
+  if (immCodeUsesAPInt())
+    return "const APInt &";
+  if (immCodeUsesAPFloat())
+    return "const APFloat &";
+  return "int64_t";
+}
+
+StringRef TreePredicateFn::getImmTypeIdentifier() const {
+  if (immCodeUsesAPInt())
+    return "APInt";
+  else if (immCodeUsesAPFloat())
+    return "APFloat";
+  return "I64";
+}
 
 /// isAlwaysTrue - Return true if this is a noop predicate.
 bool TreePredicateFn::isAlwaysTrue() const {
-  return getPredCode().empty() && getImmCode().empty();
+  return !hasPredCode() && !hasImmCode();
 }
 
 /// Return the name to use in the generated code to reference this, this is
@@ -882,14 +1170,61 @@ std::string TreePredicateFn::getCodeToRunOnSDNode() const {
   // Handle immediate predicates first.
   std::string ImmCode = getImmCode();
   if (!ImmCode.empty()) {
-    std::string Result =
-      "    int64_t Imm = cast<ConstantSDNode>(Node)->getSExtValue();\n";
+    if (isLoad())
+      PrintFatalError(getOrigPatFragRecord()->getRecord()->getLoc(),
+                      "IsLoad cannot be used with ImmLeaf or its subclasses");
+    if (isStore())
+      PrintFatalError(getOrigPatFragRecord()->getRecord()->getLoc(),
+                      "IsStore cannot be used with ImmLeaf or its subclasses");
+    if (isUnindexed())
+      PrintFatalError(
+          getOrigPatFragRecord()->getRecord()->getLoc(),
+          "IsUnindexed cannot be used with ImmLeaf or its subclasses");
+    if (isNonExtLoad())
+      PrintFatalError(
+          getOrigPatFragRecord()->getRecord()->getLoc(),
+          "IsNonExtLoad cannot be used with ImmLeaf or its subclasses");
+    if (isAnyExtLoad())
+      PrintFatalError(
+          getOrigPatFragRecord()->getRecord()->getLoc(),
+          "IsAnyExtLoad cannot be used with ImmLeaf or its subclasses");
+    if (isSignExtLoad())
+      PrintFatalError(
+          getOrigPatFragRecord()->getRecord()->getLoc(),
+          "IsSignExtLoad cannot be used with ImmLeaf or its subclasses");
+    if (isZeroExtLoad())
+      PrintFatalError(
+          getOrigPatFragRecord()->getRecord()->getLoc(),
+          "IsZeroExtLoad cannot be used with ImmLeaf or its subclasses");
+    if (isNonTruncStore())
+      PrintFatalError(
+          getOrigPatFragRecord()->getRecord()->getLoc(),
+          "IsNonTruncStore cannot be used with ImmLeaf or its subclasses");
+    if (isTruncStore())
+      PrintFatalError(
+          getOrigPatFragRecord()->getRecord()->getLoc(),
+          "IsTruncStore cannot be used with ImmLeaf or its subclasses");
+    if (getMemoryVT())
+      PrintFatalError(getOrigPatFragRecord()->getRecord()->getLoc(),
+                      "MemoryVT cannot be used with ImmLeaf or its subclasses");
+    if (getScalarMemoryVT())
+      PrintFatalError(
+          getOrigPatFragRecord()->getRecord()->getLoc(),
+          "ScalarMemoryVT cannot be used with ImmLeaf or its subclasses");
+
+    std::string Result = ("    " + getImmType() + " Imm = ").str();
+    if (immCodeUsesAPFloat())
+      Result += "cast<ConstantFPSDNode>(Node)->getValueAPF();\n";
+    else if (immCodeUsesAPInt())
+      Result += "cast<ConstantSDNode>(Node)->getAPIntValue();\n";
+    else
+      Result += "cast<ConstantSDNode>(Node)->getSExtValue();\n";
     return Result + ImmCode;
   }
 
   // Handle arbitrary node predicates.
-  assert(!getPredCode().empty() && "Don't have any predicate code!");
-  std::string ClassName;
+  assert(hasPredCode() && "Don't have any predicate code!");
+  StringRef ClassName;
   if (PatFragRec->getOnlyTree()->isLeaf())
     ClassName = "SDNode";
   else {
@@ -900,7 +1235,7 @@ std::string TreePredicateFn::getCodeToRunOnSDNode() const {
   if (ClassName == "SDNode")
     Result = "    SDNode *N = Node;\n";
   else
-    Result = "    auto *N = cast<" + ClassName + ">(Node);\n";
+    Result = "    auto *N = cast<" + ClassName.str() + ">(Node);\n";
 
   return Result + getPredCode();
 }
@@ -933,7 +1268,7 @@ static unsigned getPatternSize(const TreePatternNode *P,
 
   // Count children in the count if they are also nodes.
   for (unsigned i = 0, e = P->getNumChildren(); i != e; ++i) {
-    TreePatternNode *Child = P->getChild(i);
+    const TreePatternNode *Child = P->getChild(i);
     if (!Child->isLeaf() && Child->getNumTypes()) {
       const TypeSetByHwMode &T0 = Child->getType(0);
       // At this point, all variable type sets should be simple, i.e. only
@@ -1269,37 +1604,7 @@ SDNodeInfo::SDNodeInfo(Record *R, const CodeGenHwModes &CGH) : Def(R) {
   NumOperands = TypeProfile->getValueAsInt("NumOperands");
 
   // Parse the properties.
-  Properties = 0;
-  for (Record *Property : R->getValueAsListOfDefs("Properties")) {
-    if (Property->getName() == "SDNPCommutative") {
-      Properties |= 1 << SDNPCommutative;
-    } else if (Property->getName() == "SDNPAssociative") {
-      Properties |= 1 << SDNPAssociative;
-    } else if (Property->getName() == "SDNPHasChain") {
-      Properties |= 1 << SDNPHasChain;
-    } else if (Property->getName() == "SDNPOutGlue") {
-      Properties |= 1 << SDNPOutGlue;
-    } else if (Property->getName() == "SDNPInGlue") {
-      Properties |= 1 << SDNPInGlue;
-    } else if (Property->getName() == "SDNPOptInGlue") {
-      Properties |= 1 << SDNPOptInGlue;
-    } else if (Property->getName() == "SDNPMayStore") {
-      Properties |= 1 << SDNPMayStore;
-    } else if (Property->getName() == "SDNPMayLoad") {
-      Properties |= 1 << SDNPMayLoad;
-    } else if (Property->getName() == "SDNPSideEffect") {
-      Properties |= 1 << SDNPSideEffect;
-    } else if (Property->getName() == "SDNPMemOperand") {
-      Properties |= 1 << SDNPMemOperand;
-    } else if (Property->getName() == "SDNPVariadic") {
-      Properties |= 1 << SDNPVariadic;
-    } else {
-      PrintFatalError("Unknown SD Node property '" +
-                      Property->getName() + "' on node '" +
-                      R->getName() + "'!");
-    }
-  }
-
+  Properties = parseSDPatternOperatorProperties(R);
 
   // Parse the type constraints.
   std::vector<Record*> ConstraintList =
@@ -1568,7 +1873,7 @@ TreePatternNode *TreePatternNode::InlinePatternFragments(TreePattern &TP) {
   // Verify that we are passing the right number of operands.
   if (Frag->getNumArgs() != Children.size()) {
     TP.error("'" + Op->getName() + "' fragment requires " +
-             utostr(Frag->getNumArgs()) + " operands!");
+             Twine(Frag->getNumArgs()) + " operands!");
     return nullptr;
   }
 
@@ -1778,11 +2083,20 @@ bool TreePatternNode::NodeHasProperty(SDNP Property,
   if (isLeaf()) {
     if (const ComplexPattern *CP = getComplexPatternInfo(CGP))
       return CP->hasProperty(Property);
+
     return false;
   }
 
-  Record *Operator = getOperator();
-  if (!Operator->isSubClassOf("SDNode")) return false;
+  if (Property != SDNPHasChain) {
+    // The chain proprety is already present on the different intrinsic node
+    // types (intrinsic_w_chain, intrinsic_void), and is not explicitly listed
+    // on the intrinsic. Anything else is specific to the individual intrinsic.
+    if (const CodeGenIntrinsic *Int = getIntrinsicInfo(CGP))
+      return Int->hasProperty(Property);
+  }
+
+  if (!Operator->isSubClassOf("SDPatternOperator"))
+    return false;
 
   return CGP.getSDNodeInfo(Operator).hasProperty(Property);
 }
@@ -1881,7 +2195,7 @@ bool TreePatternNode::ApplyTypeConstraints(TreePattern &TP, bool NotRegisters) {
             SignBitAndAbove == 1)
           continue;
 
-        TP.error("Integer value '" + itostr(II->getValue()) +
+        TP.error("Integer value '" + Twine(II->getValue()) +
                  "' is out of range for type '" + getEnumName(VT) + "'!");
         break;
       }
@@ -1931,9 +2245,8 @@ bool TreePatternNode::ApplyTypeConstraints(TreePattern &TP, bool NotRegisters) {
       MadeChange |= UpdateNodeType(i, Int->IS.RetVTs[i], TP);
 
     if (getNumChildren() != NumParamVTs + 1) {
-      TP.error("Intrinsic '" + Int->Name + "' expects " +
-               utostr(NumParamVTs) + " operands, not " +
-               utostr(getNumChildren() - 1) + " operands!");
+      TP.error("Intrinsic '" + Int->Name + "' expects " + Twine(NumParamVTs) +
+               " operands, not " + Twine(getNumChildren() - 1) + " operands!");
       return false;
     }
 
@@ -1957,7 +2270,7 @@ bool TreePatternNode::ApplyTypeConstraints(TreePattern &TP, bool NotRegisters) {
     if (NI.getNumOperands() >= 0 &&
         getNumChildren() != (unsigned)NI.getNumOperands()) {
       TP.error(getOperator()->getName() + " node requires exactly " +
-               itostr(NI.getNumOperands()) + " operands!");
+               Twine(NI.getNumOperands()) + " operands!");
       return false;
     }
 
@@ -2026,7 +2339,7 @@ bool TreePatternNode::ApplyTypeConstraints(TreePattern &TP, bool NotRegisters) {
         TreePatternNode *SubIdxChild = getChild(I + 1);
         if (!isOperandClass(SubIdxChild, "SubRegIndex")) {
           TP.error("REG_SEQUENCE requires a SubRegIndex for operand " +
-                   itostr(I + 1) + "!");
+                   Twine(I + 1) + "!");
           return false;
         }
       }
@@ -2343,6 +2656,10 @@ TreePatternNode *TreePattern::ParseTreePattern(Init *TheInit, StringRef OpName){
   for (unsigned i = 0, e = Dag->getNumArgs(); i != e; ++i)
     Children.push_back(ParseTreePattern(Dag->getArg(i), Dag->getArgNameStr(i)));
 
+  // Get the actual number of results before Operator is converted to an intrinsic
+  // node (which is hard-coded to have either zero or one result).
+  unsigned NumResults = GetNumNodeResults(Operator, CDP);
+
   // If the operator is an intrinsic, then this is just syntactic sugar for for
   // (intrinsic_* <number>, ..children..).  Pick the right intrinsic node, and
   // convert the intrinsic name to a number.
@@ -2385,7 +2702,6 @@ TreePatternNode *TreePattern::ParseTreePattern(Init *TheInit, StringRef OpName){
     }
   }
 
-  unsigned NumResults = GetNumNodeResults(Operator, CDP);
   TreePatternNode *Result = new TreePatternNode(Operator, Children, NumResults);
   Result->setName(OpName);
 
@@ -2532,8 +2848,10 @@ void TreePattern::dump() const { print(errs()); }
 // CodeGenDAGPatterns implementation
 //
 
-CodeGenDAGPatterns::CodeGenDAGPatterns(RecordKeeper &R) :
-  Records(R), Target(R), LegalVTS(Target.getLegalValueTypes()) {
+CodeGenDAGPatterns::CodeGenDAGPatterns(RecordKeeper &R,
+                                       PatternRewriterFn PatternRewriter)
+    : Records(R), Target(R), LegalVTS(Target.getLegalValueTypes()),
+      PatternRewriter(PatternRewriter) {
 
   Intrinsics = CodeGenIntrinsicTable(Records, false);
   TgtIntrinsics = CodeGenIntrinsicTable(Records, true);
@@ -3198,7 +3516,7 @@ const DAGInstruction &CodeGenDAGPatterns::parseInstructionPattern(
     CGIOperandList::OperandInfo &Op = CGI.Operands[i];
     const std::string &OpName = Op.Name;
     if (OpName.empty())
-      I->error("Operand #" + utostr(i) + " in operands list has no name!");
+      I->error("Operand #" + Twine(i) + " in operands list has no name!");
 
     if (!InstInputsCheck.count(OpName)) {
       // If this is an operand with a DefaultOps set filled in, we can ignore
@@ -3324,6 +3642,8 @@ void CodeGenDAGPatterns::ParseInstructions() {
     TreePattern *I = TheInst.getPattern();
     if (!I) continue;  // No pattern.
 
+    if (PatternRewriter)
+      PatternRewriter(I);
     // FIXME: Assume only the first tree is the pattern. The others are clobber
     // nodes.
     TreePatternNode *Pattern = I->getTree(0);
@@ -3724,6 +4044,8 @@ void CodeGenDAGPatterns::ParsePatterns() {
         Temp.getOnlyTree()->hasPossibleType()) {
       ListInit *Preds = CurPattern->getValueAsListInit("Predicates");
       int Complexity = CurPattern->getValueAsInt("AddedComplexity");
+      if (PatternRewriter)
+        PatternRewriter(Pattern);
       AddPatternToMatch(
           Pattern,
           PatternToMatch(

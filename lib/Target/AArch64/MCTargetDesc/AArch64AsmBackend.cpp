@@ -432,7 +432,8 @@ public:
                           const MCRegisterInfo &MRI)
       : AArch64AsmBackend(T, TT, /*IsLittleEndian*/ true), MRI(MRI) {}
 
-  MCObjectWriter *createObjectWriter(raw_pwrite_stream &OS) const override {
+  std::unique_ptr<MCObjectWriter>
+  createObjectWriter(raw_pwrite_stream &OS) const override {
     return createAArch64MachObjectWriter(OS, MachO::CPU_TYPE_ARM64,
                                          MachO::CPU_SUBTYPE_ARM64_ALL);
   }
@@ -582,7 +583,8 @@ public:
       : AArch64AsmBackend(T, TT, IsLittleEndian), OSABI(OSABI),
         IsILP32(IsILP32) {}
 
-  MCObjectWriter *createObjectWriter(raw_pwrite_stream &OS) const override {
+  std::unique_ptr<MCObjectWriter>
+  createObjectWriter(raw_pwrite_stream &OS) const override {
     return createAArch64ELFObjectWriter(OS, OSABI, IsLittleEndian, IsILP32);
   }
 };
@@ -595,17 +597,18 @@ public:
   COFFAArch64AsmBackend(const Target &T, const Triple &TheTriple)
       : AArch64AsmBackend(T, TheTriple, /*IsLittleEndian*/ true) {}
 
-  MCObjectWriter *createObjectWriter(raw_pwrite_stream &OS) const override {
+  std::unique_ptr<MCObjectWriter>
+  createObjectWriter(raw_pwrite_stream &OS) const override {
     return createAArch64WinCOFFObjectWriter(OS);
   }
 };
 }
 
 MCAsmBackend *llvm::createAArch64leAsmBackend(const Target &T,
+                                              const MCSubtargetInfo &STI,
                                               const MCRegisterInfo &MRI,
-                                              const Triple &TheTriple,
-                                              StringRef CPU,
                                               const MCTargetOptions &Options) {
+  const Triple &TheTriple = STI.getTargetTriple();
   if (TheTriple.isOSBinFormatMachO())
     return new DarwinAArch64AsmBackend(T, TheTriple, MRI);
 
@@ -621,10 +624,10 @@ MCAsmBackend *llvm::createAArch64leAsmBackend(const Target &T,
 }
 
 MCAsmBackend *llvm::createAArch64beAsmBackend(const Target &T,
+                                              const MCSubtargetInfo &STI,
                                               const MCRegisterInfo &MRI,
-                                              const Triple &TheTriple,
-                                              StringRef CPU,
                                               const MCTargetOptions &Options) {
+  const Triple &TheTriple = STI.getTargetTriple();
   assert(TheTriple.isOSBinFormatELF() &&
          "Big endian is only supported for ELF targets!");
   uint8_t OSABI = MCELFObjectTargetWriter::getOSABI(TheTriple.getOS());

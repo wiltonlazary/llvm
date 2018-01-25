@@ -22,9 +22,11 @@ def ThunderX2T99Model : SchedMachineModel {
   let LoadLatency           =   4; // Optimistic load latency.
   let MispredictPenalty     =  12; // Extra cycles for mispredicted branch.
   // Determined via a mix of micro-arch details and experimentation.
-  let LoopMicroOpBufferSize =  32;
+  let LoopMicroOpBufferSize = 128;
   let PostRAScheduler       =   1; // Using PostRA sched.
   let CompleteModel         =   1;
+
+  list<Predicate> UnsupportedFeatures = [HasSVE];
 }
 
 // Define the issue ports.
@@ -389,7 +391,7 @@ def : WriteRes<WriteBarrier, []> { let Latency = 1; }
 def : WriteRes<WriteHint,    []> { let Latency = 1; }
 
 def : WriteRes<WriteAtomic,  []> {
-  let Unsupported = 1;
+  let Latency = 4;
   let NumMicroOps = 2;
 }
 

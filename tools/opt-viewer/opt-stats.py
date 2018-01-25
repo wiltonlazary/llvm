@@ -30,7 +30,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--jobs',
         '-j',
-        default=cpu_count(),
+        default=None,
         type=int,
         help='Max job count (defaults to %(default)s, the current CPU count)')
     parser.add_argument(
@@ -43,7 +43,7 @@ if __name__ == '__main__':
 
     print_progress = not args.no_progress_indicator
 
-    files = optrecord.find_opt_files(args.yaml_dirs_or_files)
+    files = optrecord.find_opt_files(*args.yaml_dirs_or_files)
     if not files:
         parser.error("No *.opt.yaml files found")
         sys.exit(1)

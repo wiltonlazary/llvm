@@ -15,6 +15,7 @@
 #include "InstPrinter/X86ATTInstPrinter.h"
 #include "InstPrinter/X86InstComments.h"
 #include "MCTargetDesc/X86BaseInfo.h"
+#include "MCTargetDesc/X86TargetStreamer.h"
 #include "Utils/X86ShuffleDecode.h"
 #include "X86AsmPrinter.h"
 #include "X86RegisterInfo.h"
@@ -22,12 +23,12 @@
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/iterator_range.h"
-#include "llvm/BinaryFormat/ELF.h"
 #include "llvm/CodeGen/MachineConstantPool.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineModuleInfoImpls.h"
 #include "llvm/CodeGen/MachineOperand.h"
 #include "llvm/CodeGen/StackMaps.h"
+#include "llvm/CodeGen/TargetLoweringObjectFile.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/Mangler.h"
@@ -40,12 +41,9 @@
 #include "llvm/MC/MCInstBuilder.h"
 #include "llvm/MC/MCSection.h"
 #include "llvm/MC/MCSectionELF.h"
-#include "llvm/MC/MCSectionMachO.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSymbol.h"
 #include "llvm/MC/MCSymbolELF.h"
-#include "llvm/Support/TargetRegistry.h"
-#include "llvm/Target/TargetLoweringObjectFile.h"
 
 using namespace llvm;
 
@@ -102,7 +100,9 @@ void X86AsmPrinter::StackMapShadowTracker::emitShadowPadding(
 }
 
 void X86AsmPrinter::EmitAndCountInstruction(MCInst &Inst) {
-  OutStreamer->EmitInstruction(Inst, getSubtargetInfo(), EnablePrintSchedInfo);
+  OutStreamer->EmitInstruction(Inst, getSubtargetInfo(),
+                               EnablePrintSchedInfo &&
+                                   !(Inst.getFlags() & X86::NO_SCHED_INFO));
   SMShadowTracker.count(Inst, getSubtargetInfo(), CodeEmitter.get());
 }
 
@@ -874,6 +874,10 @@ void X86AsmPrinter::LowerSTATEPOINT(const MachineInstr &MI,
       // address is to far away. (TODO: support non-relative addressing)
       break;
     case MachineOperand::MO_Register:
+      // FIXME: Add retpoline support and remove this.
+      if (Subtarget->useRetpoline())
+        report_fatal_error("Lowering register statepoints with retpoline not "
+                           "yet implemented.");
       CallTargetMCOp = MCOperand::createReg(CallTarget.getReg());
       CallOpcode = X86::CALL64r;
       break;
@@ -960,7 +964,7 @@ void X86AsmPrinter::LowerPATCHABLE_OP(const MachineInstr &MI,
       // This is an optimization that lets us get away without emitting a nop in
       // many cases.
       //
-      // NB! In some cases the encoding for PUSH64r (e.g. PUSH64r %R9) takes two
+      // NB! In some cases the encoding for PUSH64r (e.g. PUSH64r %r9) takes two
       // bytes too, so the check on MinSize is important.
       MCI.setOpcode(X86::PUSH64rmr);
     } else {
@@ -1028,6 +1032,10 @@ void X86AsmPrinter::LowerPATCHPOINT(const MachineInstr &MI,
 
     EmitAndCountInstruction(
         MCInstBuilder(X86::MOV64ri).addReg(ScratchReg).addOperand(CalleeMCOp));
+    // FIXME: Add retpoline support and remove this.
+    if (Subtarget->useRetpoline())
+      report_fatal_error(
+          "Lowering patchpoint with retpoline not yet implemented.");
     EmitAndCountInstruction(MCInstBuilder(X86::CALL64r).addReg(ScratchReg));
   }
 
@@ -1363,6 +1371,82 @@ static void printConstant(const Constant *COp, raw_ostream &CS) {
   }
 }
 
+void X86AsmPrinter::EmitSEHInstruction(const MachineInstr *MI) {
+  assert(MF->hasWinCFI() && "SEH_ instruction in function without WinCFI?");
+  assert(getSubtarget().isOSWindows() && "SEH_ instruction Windows only");
+  const X86RegisterInfo *RI =
+      MF->getSubtarget<X86Subtarget>().getRegisterInfo();
+
+  // Use the .cv_fpo directives if we're emitting CodeView on 32-bit x86.
+  if (EmitFPOData) {
+    X86TargetStreamer *XTS =
+        static_cast<X86TargetStreamer *>(OutStreamer->getTargetStreamer());
+    switch (MI->getOpcode()) {
+    case X86::SEH_PushReg:
+      XTS->emitFPOPushReg(MI->getOperand(0).getImm());
+      break;
+    case X86::SEH_StackAlloc:
+      XTS->emitFPOStackAlloc(MI->getOperand(0).getImm());
+      break;
+    case X86::SEH_SetFrame:
+      assert(MI->getOperand(1).getImm() == 0 &&
+             ".cv_fpo_setframe takes no offset");
+      XTS->emitFPOSetFrame(MI->getOperand(0).getImm());
+      break;
+    case X86::SEH_EndPrologue:
+      XTS->emitFPOEndPrologue();
+      break;
+    case X86::SEH_SaveReg:
+    case X86::SEH_SaveXMM:
+    case X86::SEH_PushFrame:
+      llvm_unreachable("SEH_ directive incompatible with FPO");
+      break;
+    default:
+      llvm_unreachable("expected SEH_ instruction");
+    }
+    return;
+  }
+
+  // Otherwise, use the .seh_ directives for all other Windows platforms.
+  switch (MI->getOpcode()) {
+  case X86::SEH_PushReg:
+    OutStreamer->EmitWinCFIPushReg(
+        RI->getSEHRegNum(MI->getOperand(0).getImm()));
+    break;
+
+  case X86::SEH_SaveReg:
+    OutStreamer->EmitWinCFISaveReg(RI->getSEHRegNum(MI->getOperand(0).getImm()),
+                                   MI->getOperand(1).getImm());
+    break;
+
+  case X86::SEH_SaveXMM:
+    OutStreamer->EmitWinCFISaveXMM(RI->getSEHRegNum(MI->getOperand(0).getImm()),
+                                   MI->getOperand(1).getImm());
+    break;
+
+  case X86::SEH_StackAlloc:
+    OutStreamer->EmitWinCFIAllocStack(MI->getOperand(0).getImm());
+    break;
+
+  case X86::SEH_SetFrame:
+    OutStreamer->EmitWinCFISetFrame(
+        RI->getSEHRegNum(MI->getOperand(0).getImm()),
+        MI->getOperand(1).getImm());
+    break;
+
+  case X86::SEH_PushFrame:
+    OutStreamer->EmitWinCFIPushFrame(MI->getOperand(0).getImm());
+    break;
+
+  case X86::SEH_EndPrologue:
+    OutStreamer->EmitWinCFIEndProlog();
+    break;
+
+  default:
+    llvm_unreachable("expected SEH_ instruction");
+  }
+}
+
 void X86AsmPrinter::EmitInstruction(const MachineInstr *MI) {
   X86MCInstLower MCInstLowering(*MF, *this);
   const X86RegisterInfo *RI = MF->getSubtarget<X86Subtarget>().getRegisterInfo();
@@ -1540,41 +1624,13 @@ void X86AsmPrinter::EmitInstruction(const MachineInstr *MI) {
     return;
 
   case X86::SEH_PushReg:
-    assert(MF->hasWinCFI() && "SEH_ instruction in function without WinCFI?");
-    OutStreamer->EmitWinCFIPushReg(RI->getSEHRegNum(MI->getOperand(0).getImm()));
-    return;
-
   case X86::SEH_SaveReg:
-    assert(MF->hasWinCFI() && "SEH_ instruction in function without WinCFI?");
-    OutStreamer->EmitWinCFISaveReg(RI->getSEHRegNum(MI->getOperand(0).getImm()),
-                                   MI->getOperand(1).getImm());
-    return;
-
   case X86::SEH_SaveXMM:
-    assert(MF->hasWinCFI() && "SEH_ instruction in function without WinCFI?");
-    OutStreamer->EmitWinCFISaveXMM(RI->getSEHRegNum(MI->getOperand(0).getImm()),
-                                   MI->getOperand(1).getImm());
-    return;
-
   case X86::SEH_StackAlloc:
-    assert(MF->hasWinCFI() && "SEH_ instruction in function without WinCFI?");
-    OutStreamer->EmitWinCFIAllocStack(MI->getOperand(0).getImm());
-    return;
-
   case X86::SEH_SetFrame:
-    assert(MF->hasWinCFI() && "SEH_ instruction in function without WinCFI?");
-    OutStreamer->EmitWinCFISetFrame(RI->getSEHRegNum(MI->getOperand(0).getImm()),
-                                    MI->getOperand(1).getImm());
-    return;
-
   case X86::SEH_PushFrame:
-    assert(MF->hasWinCFI() && "SEH_ instruction in function without WinCFI?");
-    OutStreamer->EmitWinCFIPushFrame(MI->getOperand(0).getImm());
-    return;
-
   case X86::SEH_EndPrologue:
-    assert(MF->hasWinCFI() && "SEH_ instruction in function without WinCFI?");
-    OutStreamer->EmitWinCFIEndProlog();
+    EmitSEHInstruction(MI);
     return;
 
   case X86::SEH_Epilogue: {
@@ -1954,6 +2010,8 @@ void X86AsmPrinter::EmitInstruction(const MachineInstr *MI) {
 
   MCInst TmpInst;
   MCInstLowering.Lower(MI, TmpInst);
+  if (MI->getAsmPrinterFlag(MachineInstr::NoSchedComment))
+    TmpInst.setFlags(TmpInst.getFlags() | X86::NO_SCHED_INFO);
 
   // Stackmap shadows cannot include branch targets, so we can count the bytes
   // in a call towards the shadow, but must ensure that the no thread returns

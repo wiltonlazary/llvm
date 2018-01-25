@@ -50,12 +50,16 @@ struct DWARFAddressRange {
       return LowPC <= RHS.HighPC && RHS.HighPC <= HighPC;
     return false;
   }
+
+  void dump(raw_ostream &OS, uint32_t AddressSize) const;
 };
 
 static inline bool operator<(const DWARFAddressRange &LHS,
                              const DWARFAddressRange &RHS) {
   return std::tie(LHS.LowPC, LHS.HighPC) < std::tie(RHS.LowPC, RHS.HighPC);
 }
+
+raw_ostream &operator<<(raw_ostream &OS, const DWARFAddressRange &R);
 
 /// DWARFAddressRangesVector - represents a set of absolute address ranges.
 using DWARFAddressRangesVector = std::vector<DWARFAddressRange>;

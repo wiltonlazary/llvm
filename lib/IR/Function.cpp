@@ -12,7 +12,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/IR/Function.h"
-#include "LLVMContextImpl.h"
 #include "SymbolTableListTraitsImpl.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseSet.h"
@@ -57,6 +56,7 @@
 #include <string>
 
 using namespace llvm;
+using ProfileCount = Function::ProfileCount;
 
 // Explicit instantiations of SymbolTableListTraits since some of the methods
 // are not in the public header file...
@@ -649,7 +649,10 @@ enum IIT_Info {
   IIT_VEC_OF_ANYPTRS_TO_ELT = 34,
   IIT_I128 = 35,
   IIT_V512 = 36,
-  IIT_V1024 = 37
+  IIT_V1024 = 37,
+  IIT_STRUCT6 = 38,
+  IIT_STRUCT7 = 39,
+  IIT_STRUCT8 = 40
 };
 
 static void DecodeIITType(unsigned &NextElt, ArrayRef<unsigned char> Infos,
@@ -798,6 +801,9 @@ static void DecodeIITType(unsigned &NextElt, ArrayRef<unsigned char> Infos,
   case IIT_EMPTYSTRUCT:
     OutputTable.push_back(IITDescriptor::get(IITDescriptor::Struct, 0));
     return;
+  case IIT_STRUCT8: ++StructElts; LLVM_FALLTHROUGH;
+  case IIT_STRUCT7: ++StructElts; LLVM_FALLTHROUGH;
+  case IIT_STRUCT6: ++StructElts; LLVM_FALLTHROUGH;
   case IIT_STRUCT5: ++StructElts; LLVM_FALLTHROUGH;
   case IIT_STRUCT4: ++StructElts; LLVM_FALLTHROUGH;
   case IIT_STRUCT3: ++StructElts; LLVM_FALLTHROUGH;
@@ -874,11 +880,10 @@ static Type *DecodeFixedType(ArrayRef<Intrinsic::IITDescriptor> &Infos,
     return PointerType::get(DecodeFixedType(Infos, Tys, Context),
                             D.Pointer_AddressSpace);
   case IITDescriptor::Struct: {
-    Type *Elts[5];
-    assert(D.Struct_NumElements <= 5 && "Can't handle this yet");
+    SmallVector<Type *, 8> Elts;
     for (unsigned i = 0, e = D.Struct_NumElements; i != e; ++i)
-      Elts[i] = DecodeFixedType(Infos, Tys, Context);
-    return StructType::get(Context, makeArrayRef(Elts,D.Struct_NumElements));
+      Elts.push_back(DecodeFixedType(Infos, Tys, Context));
+    return StructType::get(Context, Elts);
   }
   case IITDescriptor::Argument:
     return Tys[D.getArgumentNumber()];
@@ -1316,24 +1321,43 @@ void Function::setValueSubclassDataBit(unsigned Bit, bool On) {
     setValueSubclassData(getSubclassDataFromValue() & ~(1 << Bit));
 }
 
-void Function::setEntryCount(uint64_t Count,
+void Function::setEntryCount(ProfileCount Count,
                              const DenseSet<GlobalValue::GUID> *S) {
+  assert(Count.hasValue());
+#if !defined(NDEBUG)
+  auto PrevCount = getEntryCount();
+  assert(!PrevCount.hasValue() || PrevCount.getType() == Count.getType());
+#endif
   MDBuilder MDB(getContext());
-  setMetadata(LLVMContext::MD_prof, MDB.createFunctionEntryCount(Count, S));
+  setMetadata(
+      LLVMContext::MD_prof,
+      MDB.createFunctionEntryCount(Count.getCount(), Count.isSynthetic(), S));
 }
 
-Optional<uint64_t> Function::getEntryCount() const {
+void Function::setEntryCount(uint64_t Count, Function::ProfileCountType Type,
+                             const DenseSet<GlobalValue::GUID> *Imports) {
+  setEntryCount(ProfileCount(Count, Type), Imports);
+}
+
+ProfileCount Function::getEntryCount() const {
   MDNode *MD = getMetadata(LLVMContext::MD_prof);
   if (MD && MD->getOperand(0))
-    if (MDString *MDS = dyn_cast<MDString>(MD->getOperand(0)))
+    if (MDString *MDS = dyn_cast<MDString>(MD->getOperand(0))) {
       if (MDS->getString().equals("function_entry_count")) {
         ConstantInt *CI = mdconst::extract<ConstantInt>(MD->getOperand(1));
         uint64_t Count = CI->getValue().getZExtValue();
-        if (Count == 0)
-          return None;
-        return Count;
+        // A value of -1 is used for SamplePGO when there were no samples.
+        // Treat this the same as unknown.
+        if (Count == (uint64_t)-1)
+          return ProfileCount::getInvalid();
+        return ProfileCount(Count, PCT_Real);
+      } else if (MDS->getString().equals("synthetic_function_entry_count")) {
+        ConstantInt *CI = mdconst::extract<ConstantInt>(MD->getOperand(1));
+        uint64_t Count = CI->getValue().getZExtValue();
+        return ProfileCount(Count, PCT_Synthetic);
       }
-  return None;
+    }
+  return ProfileCount::getInvalid();
 }
 
 DenseSet<GlobalValue::GUID> Function::getImportGUIDs() const {

@@ -116,6 +116,12 @@ public:
   FunctionCoverageInfo(size_t Executed, size_t NumFunctions)
       : Executed(Executed), NumFunctions(NumFunctions) {}
 
+  FunctionCoverageInfo &operator+=(const FunctionCoverageInfo &RHS) {
+    Executed += RHS.Executed;
+    NumFunctions += RHS.NumFunctions;
+    return *this;
+  }
+
   void addFunction(bool Covered) {
     if (Covered)
       ++Executed;
@@ -134,20 +140,6 @@ public:
       return 0.0;
     return double(Executed) / double(NumFunctions) * 100.0;
   }
-};
-
-/// \brief Coverage statistics for a single line.
-struct LineCoverageStats {
-  uint64_t ExecutionCount;
-  bool HasMultipleRegions;
-  bool Mapped;
-
-  LineCoverageStats(ArrayRef<const coverage::CoverageSegment *> LineSegments,
-                    const coverage::CoverageSegment *WrappedSegment);
-
-  bool isMapped() const { return Mapped; }
-
-  bool hasMultipleRegions() const { return HasMultipleRegions; }
 };
 
 /// \brief A summary of function's code coverage.
@@ -189,6 +181,14 @@ struct FileCoverageSummary {
   FileCoverageSummary(StringRef Name)
       : Name(Name), RegionCoverage(), LineCoverage(), FunctionCoverage(),
         InstantiationCoverage() {}
+
+  FileCoverageSummary &operator+=(const FileCoverageSummary &RHS) {
+    RegionCoverage += RHS.RegionCoverage;
+    LineCoverage += RHS.LineCoverage;
+    FunctionCoverage += RHS.FunctionCoverage;
+    InstantiationCoverage += RHS.InstantiationCoverage;
+    return *this;
+  }
 
   void addFunction(const FunctionCoverageSummary &Function) {
     RegionCoverage += Function.RegionCoverage;

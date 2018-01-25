@@ -26,11 +26,13 @@ add_tablegen(llvm-tblgen LLVM
   GlobalISelEmitter.cpp
   InfoByHwMode.cpp
   InstrInfoEmitter.cpp
+  InstrDocsEmitter.cpp
   IntrinsicEmitter.cpp
   OptParserEmitter.cpp
   PseudoLoweringEmitter.cpp
   RegisterBankEmitter.cpp
   RegisterInfoEmitter.cpp
+  SDNodeProperties.cpp
   SearchableTableEmitter.cpp
   SubtargetEmitter.cpp
   SubtargetFeatureInfo.cpp
@@ -38,7 +40,9 @@ add_tablegen(llvm-tblgen LLVM
   Types.cpp
   X86DisassemblerTables.cpp
   X86EVEX2VEXTablesEmitter.cpp
+  X86FoldTablesEmitter.cpp
   X86ModRMFilters.cpp
   X86RecognizableInstr.cpp
   CTagsEmitter.cpp
   )
+set_target_properties(llvm-tblgen PROPERTIES FOLDER "Tablegenning")

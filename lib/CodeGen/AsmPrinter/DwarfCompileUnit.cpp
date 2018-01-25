@@ -27,21 +27,21 @@
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineOperand.h"
+#include "llvm/CodeGen/TargetFrameLowering.h"
+#include "llvm/CodeGen/TargetLoweringObjectFile.h"
+#include "llvm/CodeGen/TargetRegisterInfo.h"
+#include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/GlobalVariable.h"
-#include "llvm/MC/MachineLocation.h"
 #include "llvm/MC/MCSection.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSymbol.h"
+#include "llvm/MC/MachineLocation.h"
 #include "llvm/Support/Casting.h"
-#include "llvm/Target/TargetFrameLowering.h"
-#include "llvm/Target/TargetLoweringObjectFile.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
-#include "llvm/Target/TargetRegisterInfo.h"
-#include "llvm/Target/TargetSubtargetInfo.h"
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -94,16 +94,17 @@ void DwarfCompileUnit::addLocalLabelAddress(DIE &Die,
                  DIEInteger(0));
 }
 
-unsigned DwarfCompileUnit::getOrCreateSourceID(StringRef FileName,
-                                               StringRef DirName) {
+unsigned DwarfCompileUnit::getOrCreateSourceID(const DIFile *File) {
   // If we print assembly, we can't separate .file entries according to
   // compile units. Thus all files will belong to the default compile unit.
 
   // FIXME: add a better feature test than hasRawTextSupport. Even better,
   // extend .file to support this.
+  unsigned CUID = Asm->OutStreamer->hasRawTextSupport() ? 0 : getUniqueID();
+  if (!File)
+    return Asm->OutStreamer->EmitDwarfFileDirective(0, "", "", nullptr, CUID);
   return Asm->OutStreamer->EmitDwarfFileDirective(
-      0, DirName, FileName,
-      Asm->OutStreamer->hasRawTextSupport() ? 0 : getUniqueID());
+      0, File->getDirectory(), File->getFilename(), getMD5AsBytes(File), CUID);
 }
 
 DIE *DwarfCompileUnit::getOrCreateGlobalVariableDIE(
@@ -443,7 +444,7 @@ DIE *DwarfCompileUnit::constructInlinedScopeDIE(LexicalScope *Scope) {
   // Add the call site information to the DIE.
   const DILocation *IA = Scope->getInlinedAt();
   addUInt(*ScopeDIE, dwarf::DW_AT_call_file, None,
-          getOrCreateSourceID(IA->getFilename(), IA->getDirectory()));
+          getOrCreateSourceID(IA->getFile()));
   addUInt(*ScopeDIE, dwarf::DW_AT_call_line, None, IA->getLine());
   if (IA->getDiscriminator() && DD->getDwarfVersion() >= 4)
     addUInt(*ScopeDIE, dwarf::DW_AT_GNU_discriminator, None,
@@ -482,6 +483,7 @@ DIE *DwarfCompileUnit::constructVariableDIEImpl(const DbgVariable &DV,
                                                 bool Abstract) {
   // Define variable debug information entry.
   auto VariableDie = DIE::get(DIEValueAllocator, DV.getTag());
+  insertDIE(DV.getVariable(), VariableDie);
 
   if (Abstract) {
     applyVariableAttributes(DV, *VariableDie);
@@ -638,6 +640,7 @@ void DwarfCompileUnit::constructAbstractSubprogramScopeDIE(
   auto *SP = cast<DISubprogram>(Scope->getScopeNode());
 
   DIE *ContextDIE;
+  DwarfCompileUnit *ContextCU = this;
 
   if (includeMinimalInlineScopes())
     ContextDIE = &getUnitDie();
@@ -648,18 +651,23 @@ void DwarfCompileUnit::constructAbstractSubprogramScopeDIE(
   else if (auto *SPDecl = SP->getDeclaration()) {
     ContextDIE = &getUnitDie();
     getOrCreateSubprogramDIE(SPDecl);
-  } else
+  } else {
     ContextDIE = getOrCreateContextDIE(resolve(SP->getScope()));
+    // The scope may be shared with a subprogram that has already been
+    // constructed in another CU, in which case we need to construct this
+    // subprogram in the same CU.
+    ContextCU = DD->lookupCU(ContextDIE->getUnitDie());
+  }
 
   // Passing null as the associated node because the abstract definition
   // shouldn't be found by lookup.
-  AbsDef = &createAndAddDIE(dwarf::DW_TAG_subprogram, *ContextDIE, nullptr);
-  applySubprogramAttributesToDefinition(SP, *AbsDef);
+  AbsDef = &ContextCU->createAndAddDIE(dwarf::DW_TAG_subprogram, *ContextDIE, nullptr);
+  ContextCU->applySubprogramAttributesToDefinition(SP, *AbsDef);
 
-  if (!includeMinimalInlineScopes())
-    addUInt(*AbsDef, dwarf::DW_AT_inline, None, dwarf::DW_INL_inlined);
-  if (DIE *ObjectPointer = createAndAddScopeChildren(Scope, *AbsDef))
-    addDIEEntry(*AbsDef, dwarf::DW_AT_object_pointer, *ObjectPointer);
+  if (!ContextCU->includeMinimalInlineScopes())
+    ContextCU->addUInt(*AbsDef, dwarf::DW_AT_inline, None, dwarf::DW_INL_inlined);
+  if (DIE *ObjectPointer = ContextCU->createAndAddScopeChildren(Scope, *AbsDef))
+    ContextCU->addDIEEntry(*AbsDef, dwarf::DW_AT_object_pointer, *ObjectPointer);
 }
 
 DIE *DwarfCompileUnit::constructImportedEntityDIE(
@@ -681,9 +689,7 @@ DIE *DwarfCompileUnit::constructImportedEntityDIE(
   else
     EntityDie = getDIE(Entity);
   assert(EntityDie);
-  auto *File = Module->getFile();
-  addSourceLine(*IMDie, Module->getLine(), File ? File->getFilename() : "",
-                File ? File->getDirectory() : "");
+  addSourceLine(*IMDie, Module->getLine(), Module->getFile());
   addDIEEntry(*IMDie, dwarf::DW_AT_import, *EntityDie);
   StringRef Name = Module->getName();
   if (!Name.empty())
@@ -810,6 +816,12 @@ void DwarfCompileUnit::addGlobalTypeUnitType(const DIType *Ty,
 /// DbgVariable based on provided MachineLocation.
 void DwarfCompileUnit::addVariableAddress(const DbgVariable &DV, DIE &Die,
                                           MachineLocation Location) {
+  // addBlockByrefAddress is obsolete and will be removed soon.
+  // The clang frontend always generates block byref variables with a
+  // complex expression that encodes exactly what addBlockByrefAddress
+  // would do.
+  assert((!DV.isBlockByrefVariable() || DV.hasComplexAddress()) &&
+         "block byref variable without a complex expression");
   if (DV.hasComplexAddress())
     addComplexAddress(DV, Die, dwarf::DW_AT_location, Location);
   else if (DV.isBlockByrefVariable())

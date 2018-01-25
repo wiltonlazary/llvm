@@ -1,4 +1,6 @@
-; RUN: llc -mtriple wasm32-unknown-unknown-wasm -filetype=obj %s -o - | obj2yaml | FileCheck %s
+; RUN: llc -filetype=obj %s -o - | obj2yaml | FileCheck %s
+
+target triple = "wasm32-unknown-unknown-wasm"
 
 %struct.bd = type { i32, i8 }
 
@@ -9,22 +11,26 @@
 
 ; CHECK:        - Type:            GLOBAL
 ; CHECK-NEXT:     Globals:         
-; CHECK-NEXT:       - Type:            I32
+; CHECK-NEXT:       - Index:           0
+; CHECK-NEXT:         Type:            I32
 ; CHECK-NEXT:         Mutable:         false
 ; CHECK-NEXT:         InitExpr:        
 ; CHECK-NEXT:           Opcode:          I32_CONST
 ; CHECK-NEXT:           Value:           0
-; CHECK-NEXT:       - Type:            I32
+; CHECK-NEXT:       - Index:           1
+; CHECK-NEXT:         Type:            I32
 ; CHECK-NEXT:         Mutable:         false
 ; CHECK-NEXT:         InitExpr:        
 ; CHECK-NEXT:           Opcode:          I32_CONST
 ; CHECK-NEXT:           Value:           8
-; CHECK-NEXT:       - Type:            I32
+; CHECK-NEXT:       - Index:           2
+; CHECK-NEXT:         Type:            I32
 ; CHECK-NEXT:         Mutable:         false
 ; CHECK-NEXT:         InitExpr:        
 ; CHECK-NEXT:           Opcode:          I32_CONST
 ; CHECK-NEXT:           Value:           16
-; CHECK-NEXT:       - Type:            I32
+; CHECK-NEXT:       - Index:           3
+; CHECK-NEXT:         Type:            I32
 ; CHECK-NEXT:         Mutable:         false
 ; CHECK-NEXT:         InitExpr:        
 ; CHECK-NEXT:           Opcode:          I32_CONST
@@ -67,12 +73,17 @@
 ; CHECK:        - Type:            CUSTOM
 ; CHECK-NEXT:     Name:            linking
 ; CHECK-NEXT:     DataSize:        28
-; CHECK-NEXT:     DataAlignment:   8
-; CHECK-NEXT:     SegmentNames:    
+; CHECK-NEXT:     SegmentInfo:    
 ; CHECK-NEXT:       - Index:           0
 ; CHECK-NEXT:         Name:            .data.global0
+; CHECK-NEXT:         Alignment:       8
+; CHECK-NEXT:         Flags:           [ ]
 ; CHECK-NEXT:       - Index:           1
 ; CHECK-NEXT:         Name:            .sec1
+; CHECK-NEXT:         Alignment:       8
+; CHECK-NEXT:         Flags:           [ ]
 ; CHECK-NEXT:       - Index:           2
 ; CHECK-NEXT:         Name:            .sec2
+; CHECK-NEXT:         Alignment:       8
+; CHECK-NEXT:         Flags:           [ ]
 ; CHECK-NEXT: ...

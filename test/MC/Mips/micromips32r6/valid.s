@@ -1,4 +1,4 @@
-# RUN: llvm-mc %s -triple=mips-unknown-linux -show-encoding -mcpu=mips32r6 -mattr=micromips | FileCheck %s
+# RUN: llvm-mc %s -triple=mips-unknown-linux -show-encoding -show-inst -mcpu=mips32r6 -mattr=micromips | FileCheck %s
 
   .set noat
   add $3, $4, $5           # CHECK: add $3, $4, $5      # encoding: [0x00,0xa4,0x19,0x10]
@@ -37,6 +37,7 @@
   balc 7286128             # CHECK: balc 7286128        # encoding: [0xb4,0x37,0x96,0xb8]
   b 132                    # CHECK: bc16 132            # encoding: [0xcc,0x42]
   bc 7286128               # CHECK: bc 7286128          # encoding: [0x94,0x37,0x96,0xb8]
+                           # CHECK-NEXT:                # <MCInst #{{[0-9]+}} BC_MMR6
   bc16 132                 # CHECK: bc16 132            # encoding: [0xcc,0x42]
   beqzc16 $6, 20           # CHECK: beqzc16 $6, 20      # encoding: [0x8f,0x0a]
   bnezc16 $6, 20           # CHECK: bnezc16 $6, 20      # encoding: [0xaf,0x0a]
@@ -84,7 +85,7 @@
   lwm32 $16, $17, $18, $19, $20, $21, $22, $23, $fp, 8($4)      # CHECK: lwm32 $16, $17, $18, $19, $20, $21, $22, $23, $fp, 8($4)      # encoding: [0x21,0x24,0x50,0x08]
   lwm32 $16, $17, $18, $19, $20, $21, $22, $23, $fp, $ra, 8($4) # CHECK: lwm32 $16, $17, $18, $19, $20, $21, $22, $23, $fp, $ra, 8($4) # encoding: [0x23,0x24,0x50,0x08]
   lwm32 $16, $17, $18, $19, $20, $21, $22, $23, $fp, $ra, 8($4) # CHECK: lwm32 $16, $17, $18, $19, $20, $21, $22, $23, $fp, $ra, 8($4) # encoding: [0x23,0x24,0x50,0x08]
-  movep $5, $6, $2, $3            # CHECK: movep $5, $6, $2, $3            # encoding: [0x84,0x34]
+  movep $5, $6, $2, $3            # CHECK: movep $5, $6, $2, $3            # encoding: [0x44,0x36]
   rotr $2, 7                      # CHECK: rotr $2, $2, 7                  # encoding: [0x00,0x42,0x38,0xc0]
   rotr $9, $6, 7                  # CHECK: rotr $9, $6, 7                  # encoding: [0x01,0x26,0x38,0xc0]
   rotrv $9, $6, $7                # CHECK: rotrv $9, $6, $7                # encoding: [0x00,0xc7,0x48,0xd0]
@@ -214,8 +215,10 @@
   cvt.s.d $f2, $f4         # CHECK: cvt.s.d $f2, $f4         # encoding: [0x54,0x44,0x1b,0x7b]
   cvt.s.w $f3, $f4         # CHECK: cvt.s.w $f3, $f4         # encoding: [0x54,0x64,0x3b,0x7b]
   cvt.s.l $f3, $f4         # CHECK: cvt.s.l $f3, $f4         # encoding: [0x54,0x64,0x5b,0x7b]
-  abs.s $f3, $f5           # CHECK: abs.s $f3, $f5      # encoding: [0x54,0x65,0x03,0x7b]
-  abs.d $f2, $f4           # CHECK: abs.d $f2, $f4      # encoding: [0x54,0x44,0x23,0x7b]
+  abs.s $f0, $f12          # CHECK: abs.s  $f0, $f12         # encoding: [0x54,0x0c,0x03,0x7b]
+                           # CHECK-NEXT:                     # <MCInst #{{[0-9]+}} FABS_S_MM
+  abs.d $f0, $f12          # CHECK: abs.d  $f0, $f12         # encoding: [0x54,0x0c,0x23,0x7b]
+                           # CHECK-NEXT:                     # <MCInst #{{[0-9]+}} FABS_D64_MM
   floor.l.s $f3, $f5       # CHECK: floor.l.s $f3, $f5  # encoding: [0x54,0x65,0x03,0x3b]
   floor.l.d $f2, $f4       # CHECK: floor.l.d $f2, $f4  # encoding: [0x54,0x44,0x43,0x3b]
   floor.w.s $f3, $f5       # CHECK: floor.w.s $f3, $f5  # encoding: [0x54,0x65,0x0b,0x3b]
@@ -228,8 +231,10 @@
   trunc.l.d $f2, $f4       # CHECK: trunc.l.d $f2, $f4  # encoding: [0x54,0x44,0x63,0x3b]
   trunc.w.s $f3, $f5       # CHECK: trunc.w.s $f3, $f5  # encoding: [0x54,0x65,0x2b,0x3b]
   trunc.w.d $f2, $f4       # CHECK: trunc.w.d $f2, $f4  # encoding: [0x54,0x44,0x6b,0x3b]
-  sqrt.s $f3, $f5          # CHECK: sqrt.s $f3, $f5     # encoding: [0x54,0x65,0x0a,0x3b]
-  sqrt.d $f2, $f4          # CHECK: sqrt.d $f2, $f4     # encoding: [0x54,0x44,0x4a,0x3b]
+  sqrt.s $f0, $f12         # CHECK: sqrt.s  $f0, $f12   # encoding: [0x54,0x0c,0x0a,0x3b]
+                           # CHECK-NEXT:                # <MCInst #{{[0-9]+}} FSQRT_S_MM
+  sqrt.d $f0, $f12         # CHECK: sqrt.d  $f0, $f12   # encoding: [0x54,0x0c,0x4a,0x3b]
+                           # CHECK-NEXT:                # <MCInst #{{[0-9]+}} FSQRT_D64_MM
   rsqrt.s $f3, $f5         # CHECK: rsqrt.s $f3, $f5    # encoding: [0x54,0x65,0x02,0x3b]
   rsqrt.d $f2, $f4         # CHECK: rsqrt.d $f2, $f4    # encoding: [0x54,0x44,0x42,0x3b]
   lw $3, -260($gp)         # CHECK: lw $3, -260($gp)    # encoding: [0xfc,0x7c,0xfe,0xfc]

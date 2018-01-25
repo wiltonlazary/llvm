@@ -58,9 +58,10 @@ static void sectionMapping(IO &IO, WasmYAML::LinkingSection &Section) {
   commonSectionMapping(IO, Section);
   IO.mapRequired("Name", Section.Name);
   IO.mapRequired("DataSize", Section.DataSize);
-  IO.mapRequired("DataAlignment", Section.DataAlignment);
   IO.mapOptional("SymbolInfo", Section.SymbolInfos);
-  IO.mapOptional("SegmentNames", Section.SegmentNames);
+  IO.mapOptional("SegmentInfo", Section.SegmentInfos);
+  IO.mapOptional("InitFunctions", Section.InitFunctions);
+  IO.mapOptional("Comdats", Section.Comdats);
 }
 
 static void sectionMapping(IO &IO, WasmYAML::CustomSection &Section) {
@@ -236,7 +237,7 @@ void ScalarEnumerationTraits<WasmYAML::SectionType>::enumeration(
 
 void MappingTraits<WasmYAML::Signature>::mapping(
     IO &IO, WasmYAML::Signature &Signature) {
-  IO.mapOptional("Index", Signature.Index);
+  IO.mapRequired("Index", Signature.Index);
   IO.mapRequired("ReturnType", Signature.ReturnType);
   IO.mapRequired("ParamTypes", Signature.ParamTypes);
 }
@@ -248,6 +249,7 @@ void MappingTraits<WasmYAML::Table>::mapping(IO &IO, WasmYAML::Table &Table) {
 
 void MappingTraits<WasmYAML::Function>::mapping(IO &IO,
                                                 WasmYAML::Function &Function) {
+  IO.mapRequired("Index", Function.Index);
   IO.mapRequired("Locals", Function.Locals);
   IO.mapRequired("Body", Function.Body);
 }
@@ -264,6 +266,14 @@ void MappingTraits<WasmYAML::NameEntry>::mapping(
     IO &IO, WasmYAML::NameEntry &NameEntry) {
   IO.mapRequired("Index", NameEntry.Index);
   IO.mapRequired("Name", NameEntry.Name);
+}
+
+void MappingTraits<WasmYAML::SegmentInfo>::mapping(
+    IO &IO, WasmYAML::SegmentInfo &SegmentInfo) {
+  IO.mapRequired("Index", SegmentInfo.Index);
+  IO.mapRequired("Name", SegmentInfo.Name);
+  IO.mapRequired("Alignment", SegmentInfo.Alignment);
+  IO.mapRequired("Flags", SegmentInfo.Flags);
 }
 
 void MappingTraits<WasmYAML::LocalDecl>::mapping(
@@ -315,6 +325,7 @@ void MappingTraits<WasmYAML::Export>::mapping(IO &IO,
 
 void MappingTraits<WasmYAML::Global>::mapping(IO &IO,
                                               WasmYAML::Global &Global) {
+  IO.mapRequired("Index", Global.Index);
   IO.mapRequired("Type", Global.Type);
   IO.mapRequired("Mutable", Global.Mutable);
   IO.mapRequired("InitExpr", Global.InitExpr);
@@ -352,10 +363,58 @@ void MappingTraits<WasmYAML::DataSegment>::mapping(
   IO.mapRequired("Content", Segment.Content);
 }
 
+void MappingTraits<WasmYAML::InitFunction>::mapping(
+    IO &IO, WasmYAML::InitFunction &Init) {
+  IO.mapRequired("Priority", Init.Priority);
+  IO.mapRequired("FunctionIndex", Init.FunctionIndex);
+}
+
+void ScalarEnumerationTraits<WasmYAML::ComdatKind>::enumeration(
+    IO &IO, WasmYAML::ComdatKind &Kind) {
+#define ECase(X) IO.enumCase(Kind, #X, wasm::WASM_COMDAT_##X);
+  ECase(FUNCTION);
+  ECase(DATA);
+#undef ECase
+}
+
+void MappingTraits<WasmYAML::ComdatEntry>::mapping(
+    IO &IO, WasmYAML::ComdatEntry &ComdatEntry) {
+  IO.mapRequired("Kind", ComdatEntry.Kind);
+  IO.mapRequired("Index", ComdatEntry.Index);
+}
+
+void MappingTraits<WasmYAML::Comdat>::mapping(
+    IO &IO, WasmYAML::Comdat &Comdat) {
+  IO.mapRequired("Name", Comdat.Name);
+  IO.mapRequired("Entries", Comdat.Entries);
+}
+
 void MappingTraits<WasmYAML::SymbolInfo>::mapping(IO &IO,
                                                   WasmYAML::SymbolInfo &Info) {
   IO.mapRequired("Name", Info.Name);
   IO.mapRequired("Flags", Info.Flags);
+}
+
+void ScalarBitSetTraits<WasmYAML::LimitFlags>::bitset(
+    IO &IO, WasmYAML::LimitFlags &Value) {
+#define BCase(X) IO.bitSetCase(Value, #X, wasm::WASM_LIMITS_FLAG_##X)
+  BCase(HAS_MAX);
+#undef BCase
+}
+
+void ScalarBitSetTraits<WasmYAML::SegmentFlags>::bitset(
+    IO &IO, WasmYAML::SegmentFlags &Value) {
+}
+
+void ScalarBitSetTraits<WasmYAML::SymbolFlags>::bitset(
+    IO &IO, WasmYAML::SymbolFlags &Value) {
+#define BCaseMask(M, X) IO.maskedBitSetCase(Value, #X, wasm::WASM_SYMBOL_##X, wasm::WASM_SYMBOL_##M)
+  //BCaseMask(BINDING_MASK, BINDING_GLOBAL);
+  BCaseMask(BINDING_MASK, BINDING_WEAK);
+  BCaseMask(BINDING_MASK, BINDING_LOCAL);
+  //BCaseMask(VISIBILITY_MASK, VISIBILITY_DEFAULT);
+  BCaseMask(VISIBILITY_MASK, VISIBILITY_HIDDEN);
+#undef BCaseMask
 }
 
 void ScalarEnumerationTraits<WasmYAML::ValueType>::enumeration(
@@ -403,7 +462,7 @@ void ScalarEnumerationTraits<WasmYAML::TableType>::enumeration(
 void ScalarEnumerationTraits<WasmYAML::RelocType>::enumeration(
     IO &IO, WasmYAML::RelocType &Type) {
 #define WASM_RELOC(name, value) IO.enumCase(Type, #name, wasm::name);
-#include "llvm/BinaryFormat/WasmRelocs/WebAssembly.def"
+#include "llvm/BinaryFormat/WasmRelocs.def"
 #undef WASM_RELOC
 }
 

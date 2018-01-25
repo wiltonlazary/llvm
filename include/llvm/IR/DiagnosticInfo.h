@@ -415,6 +415,7 @@ public:
     Argument(StringRef Key, const Type *T);
     Argument(StringRef Key, StringRef S);
     Argument(StringRef Key, int N);
+    Argument(StringRef Key, float N);
     Argument(StringRef Key, long N);
     Argument(StringRef Key, long long N);
     Argument(StringRef Key, unsigned N);
@@ -986,6 +987,12 @@ public:
 
   void print(DiagnosticPrinter &DP) const override;
 };
+
+namespace yaml {
+template <> struct MappingTraits<DiagnosticInfoOptimizationBase *> {
+  static void mapping(IO &io, DiagnosticInfoOptimizationBase *&OptDiag);
+};
+} // namespace yaml
 
 } // end namespace llvm
 

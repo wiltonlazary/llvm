@@ -50,6 +50,7 @@
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/MD5.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SMLoc.h"
@@ -503,6 +504,7 @@ private:
     DK_CV_STRINGTABLE,
     DK_CV_FILECHECKSUMS,
     DK_CV_FILECHECKSUM_OFFSET,
+    DK_CV_FPO_DATA,
     DK_CFI_SECTIONS,
     DK_CFI_STARTPROC,
     DK_CFI_ENDPROC,
@@ -538,6 +540,7 @@ private:
     DK_ERR,
     DK_ERROR,
     DK_WARNING,
+    DK_PRINT,
     DK_END
   };
 
@@ -579,6 +582,7 @@ private:
   bool parseDirectiveCVStringTable();
   bool parseDirectiveCVFileChecksums();
   bool parseDirectiveCVFileChecksumOffset();
+  bool parseDirectiveCVFPOData();
 
   // .cfi directives
   bool parseDirectiveCFIRegister(SMLoc DirectiveLoc);
@@ -681,6 +685,9 @@ private:
 
   // ".warning"
   bool parseDirectiveWarning(SMLoc DirectiveLoc);
+
+  // .print <double-quotes-string>
+  bool parseDirectivePrint(SMLoc DirectiveLoc);
 
   void initializeDirectiveKindMap();
 };
@@ -2035,6 +2042,8 @@ bool AsmParser::parseStatement(ParseStatementInfo &Info,
       return parseDirectiveCVFileChecksums();
     case DK_CV_FILECHECKSUM_OFFSET:
       return parseDirectiveCVFileChecksumOffset();
+    case DK_CV_FPO_DATA:
+      return parseDirectiveCVFPOData();
     case DK_CFI_SECTIONS:
       return parseDirectiveCFISections();
     case DK_CFI_STARTPROC:
@@ -2130,6 +2139,8 @@ bool AsmParser::parseStatement(ParseStatementInfo &Info,
     case DK_DS_P:
     case DK_DS_X:
       return parseDirectiveDS(IDVal, 12);
+    case DK_PRINT:
+      return parseDirectivePrint(IDLoc);
     }
 
     return Error(IDLoc, "unknown directive");
@@ -3284,8 +3295,8 @@ bool AsmParser::parseDirectiveAlign(bool IsPow2, unsigned ValueSize) {
 }
 
 /// parseDirectiveFile
-/// ::= .file [number] filename
-/// ::= .file number directory filename
+/// ::= .file filename
+/// ::= .file number [directory] filename [md5 checksum]
 bool AsmParser::parseDirectiveFile(SMLoc DirectiveLoc) {
   // FIXME: I'm not sure what this is.
   int64_t FileNumber = -1;
@@ -3321,19 +3332,43 @@ bool AsmParser::parseDirectiveFile(SMLoc DirectiveLoc) {
     Filename = Path;
   }
 
-  if (parseToken(AsmToken::EndOfStatement,
-                 "unexpected token in '.file' directive"))
-    return true;
+  std::string Checksum;
+  if (!parseOptionalToken(AsmToken::EndOfStatement)) {
+    StringRef Keyword;
+    if (check(getTok().isNot(AsmToken::Identifier),
+              "unexpected token in '.file' directive") ||
+        parseIdentifier(Keyword) ||
+        check(Keyword != "md5", "unexpected token in '.file' directive"))
+      return true;
+    if (getLexer().is(AsmToken::String) &&
+        check(FileNumber == -1, "MD5 checksum specified, but no file number"))
+      return true;
+    if (check(getTok().isNot(AsmToken::String),
+              "unexpected token in '.file' directive") ||
+        parseEscapedString(Checksum) ||
+        check(Checksum.size() != 32, "invalid MD5 checksum specified") ||
+        parseToken(AsmToken::EndOfStatement,
+                   "unexpected token in '.file' directive"))
+      return true;
+  }
 
   if (FileNumber == -1)
     getStreamer().EmitFileDirective(Filename);
   else {
+    MD5::MD5Result *CKMem = nullptr;
+    if (!Checksum.empty()) {
+      Checksum = fromHex(Checksum);
+      if (check(Checksum.size() != 16, "invalid MD5 checksum specified"))
+        return true;
+      CKMem = (MD5::MD5Result *)Ctx.allocate(sizeof(MD5::MD5Result), 1);
+      memcpy(&CKMem->Bytes, Checksum.data(), 16);
+    }
     // If there is -g option as well as debug info from directive file,
     // we turn off -g option, directly use the existing debug info instead.
     if (getContext().getGenDwarfForAssembly())
       getContext().setGenDwarfForAssembly(false);
-    else if (getStreamer().EmitDwarfFileDirective(FileNumber, Directory, Filename) ==
-        0)
+    else if (getStreamer().EmitDwarfFileDirective(FileNumber, Directory,
+                                                  Filename, CKMem) == 0)
       return Error(FileNumberLoc, "file number already allocated");
   }
 
@@ -3611,7 +3646,6 @@ bool AsmParser::parseDirectiveCVInlineSiteId() {
 /// optional items are .loc sub-directives.
 bool AsmParser::parseDirectiveCVLoc() {
   SMLoc DirectiveLoc = getTok().getLoc();
-  SMLoc Loc;
   int64_t FunctionId, FileNumber;
   if (parseCVFunctionId(FunctionId, ".cv_loc") ||
       parseCVFileId(FileNumber, ".cv_loc"))
@@ -3783,6 +3817,20 @@ bool AsmParser::parseDirectiveCVFileChecksumOffset() {
   if (parseToken(AsmToken::EndOfStatement, "Expected End of Statement"))
     return true;
   getStreamer().EmitCVFileChecksumOffsetDirective(FileNo);
+  return false;
+}
+
+/// parseDirectiveCVFPOData
+/// ::= .cv_fpo_data procsym
+bool AsmParser::parseDirectiveCVFPOData() {
+  SMLoc DirLoc = getLexer().getLoc();
+  StringRef ProcName;
+  if (parseIdentifier(ProcName))
+    return TokError("expected symbol name");
+  if (parseEOL("unexpected tokens"))
+    return addErrorSuffix(" in '.cv_fpo_data' directive");
+  MCSymbol *ProcSym = getContext().getOrCreateSymbol(ProcName);
+  getStreamer().EmitCVFPOData(ProcSym, DirLoc);
   return false;
 }
 
@@ -5169,6 +5217,7 @@ void AsmParser::initializeDirectiveKindMap() {
   DirectiveKindMap[".cv_stringtable"] = DK_CV_STRINGTABLE;
   DirectiveKindMap[".cv_filechecksums"] = DK_CV_FILECHECKSUMS;
   DirectiveKindMap[".cv_filechecksumoffset"] = DK_CV_FILECHECKSUM_OFFSET;
+  DirectiveKindMap[".cv_fpo_data"] = DK_CV_FPO_DATA;
   DirectiveKindMap[".sleb128"] = DK_SLEB128;
   DirectiveKindMap[".uleb128"] = DK_ULEB128;
   DirectiveKindMap[".cfi_sections"] = DK_CFI_SECTIONS;
@@ -5228,6 +5277,7 @@ void AsmParser::initializeDirectiveKindMap() {
   DirectiveKindMap[".ds.s"] = DK_DS_S;
   DirectiveKindMap[".ds.w"] = DK_DS_W;
   DirectiveKindMap[".ds.x"] = DK_DS_X;
+  DirectiveKindMap[".print"] = DK_PRINT;
 }
 
 MCAsmMacro *AsmParser::parseMacroLikeBody(SMLoc DirectiveLoc) {
@@ -5453,6 +5503,17 @@ bool AsmParser::parseDirectiveMSAlign(SMLoc IDLoc, ParseStatementInfo &Info) {
     return Error(ExprLoc, "literal value not a power of two greater then zero");
 
   Info.AsmRewrites->emplace_back(AOK_Align, IDLoc, 5, Log2_64(IntValue));
+  return false;
+}
+
+bool AsmParser::parseDirectivePrint(SMLoc DirectiveLoc) {
+  const AsmToken StrTok = getTok();
+  Lex();
+  if (StrTok.isNot(AsmToken::String) || StrTok.getString().front() != '"')
+    return Error(DirectiveLoc, "expected double quoted string after .print");
+  if (parseToken(AsmToken::EndOfStatement, "expected end of statement"))
+    return true;
+  llvm::outs() << StrTok.getStringContents() << '\n';
   return false;
 }
 

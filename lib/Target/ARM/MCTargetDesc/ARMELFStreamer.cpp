@@ -440,9 +440,11 @@ class ARMELFStreamer : public MCELFStreamer {
 public:
   friend class ARMTargetELFStreamer;
 
-  ARMELFStreamer(MCContext &Context, MCAsmBackend &TAB, raw_pwrite_stream &OS,
-                 MCCodeEmitter *Emitter, bool IsThumb)
-      : MCELFStreamer(Context, TAB, OS, Emitter), IsThumb(IsThumb) {
+  ARMELFStreamer(MCContext &Context, std::unique_ptr<MCAsmBackend> TAB,
+                 raw_pwrite_stream &OS, std::unique_ptr<MCCodeEmitter> Emitter,
+                 bool IsThumb)
+      : MCELFStreamer(Context, std::move(TAB), OS, std::move(Emitter)),
+        IsThumb(IsThumb) {
     EHReset();
   }
 
@@ -510,9 +512,11 @@ public:
 
       assert(IsThumb);
       EmitThumbMappingSymbol();
+      // Thumb wide instructions are emitted as a pair of 16-bit words of the
+      // appropriate endianness.
       for (unsigned II = 0, IE = Size; II != IE; II = II + 2) {
-        const unsigned I0 = LittleEndian ? II + 0 : (Size - II - 1);
-        const unsigned I1 = LittleEndian ? II + 1 : (Size - II - 2);
+        const unsigned I0 = LittleEndian ? II + 0 : II + 1;
+        const unsigned I1 = LittleEndian ? II + 1 : II + 0;
         Buffer[Size - II - 2] = uint8_t(Inst >> I0 * CHAR_BIT);
         Buffer[Size - II - 1] = uint8_t(Inst >> I1 * CHAR_BIT);
       }
@@ -845,6 +849,7 @@ void ARMTargetELFStreamer::emitArchDefaultAttributes() {
     setAttributeItem(THUMB_ISA_use, AllowThumb32, false);
     break;
 
+  case ARM::ArchKind::ARMV7EM:
   case ARM::ArchKind::ARMV7M:
     setAttributeItem(CPU_arch_profile, MicroControllerProfile, false);
     setAttributeItem(THUMB_ISA_use, AllowThumb32, false);
@@ -1169,6 +1174,8 @@ void ARMELFStreamer::reset() {
   ATS.reset();
   MappingSymbolCounter = 0;
   MCELFStreamer::reset();
+  LastMappingSymbols.clear();
+  LastEMSInfo.reset();
   // MCELFStreamer clear's the assembler's e_flags. However, for
   // arm we manually set the ABI version on streamer creation, so
   // do the same here
@@ -1485,19 +1492,21 @@ MCTargetStreamer *createARMObjectTargetStreamer(MCStreamer &S,
   return new ARMTargetStreamer(S);
 }
 
-MCELFStreamer *createARMELFStreamer(MCContext &Context, MCAsmBackend &TAB,
+MCELFStreamer *createARMELFStreamer(MCContext &Context,
+                                    std::unique_ptr<MCAsmBackend> TAB,
                                     raw_pwrite_stream &OS,
-                                    MCCodeEmitter *Emitter, bool RelaxAll,
-                                    bool IsThumb) {
-    ARMELFStreamer *S = new ARMELFStreamer(Context, TAB, OS, Emitter, IsThumb);
-    // FIXME: This should eventually end up somewhere else where more
-    // intelligent flag decisions can be made. For now we are just maintaining
-    // the status quo for ARM and setting EF_ARM_EABI_VER5 as the default.
-    S->getAssembler().setELFHeaderEFlags(ELF::EF_ARM_EABI_VER5);
+                                    std::unique_ptr<MCCodeEmitter> Emitter,
+                                    bool RelaxAll, bool IsThumb) {
+  ARMELFStreamer *S = new ARMELFStreamer(Context, std::move(TAB), OS,
+                                         std::move(Emitter), IsThumb);
+  // FIXME: This should eventually end up somewhere else where more
+  // intelligent flag decisions can be made. For now we are just maintaining
+  // the status quo for ARM and setting EF_ARM_EABI_VER5 as the default.
+  S->getAssembler().setELFHeaderEFlags(ELF::EF_ARM_EABI_VER5);
 
-    if (RelaxAll)
-      S->getAssembler().setRelaxAll(true);
-    return S;
+  if (RelaxAll)
+    S->getAssembler().setRelaxAll(true);
+  return S;
 }
 
 } // end namespace llvm

@@ -210,7 +210,7 @@ static unsigned adjustFixupValue(const MCFixup &Fixup, uint64_t Value,
   return Value;
 }
 
-MCObjectWriter *
+std::unique_ptr<MCObjectWriter>
 MipsAsmBackend::createObjectWriter(raw_pwrite_stream &OS) const {
   return createMipsELFObjectWriter(OS, TheTriple, IsN32);
 }
@@ -476,8 +476,9 @@ bool MipsAsmBackend::writeNopData(uint64_t Count, MCObjectWriter *OW) const {
 }
 
 MCAsmBackend *llvm::createMipsAsmBackend(const Target &T,
+                                         const MCSubtargetInfo &STI,
                                          const MCRegisterInfo &MRI,
-                                         const Triple &TT, StringRef CPU,
                                          const MCTargetOptions &Options) {
-  return new MipsAsmBackend(T, MRI, TT, CPU, Options.ABIName == "n32");
+  return new MipsAsmBackend(T, MRI, STI.getTargetTriple(), STI.getCPU(),
+                            Options.ABIName == "n32");
 }

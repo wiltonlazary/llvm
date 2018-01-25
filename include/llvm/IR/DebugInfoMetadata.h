@@ -18,11 +18,13 @@
 #include "llvm/ADT/BitmaskEnum.h"
 #include "llvm/ADT/None.h"
 #include "llvm/ADT/Optional.h"
+#include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/iterator_range.h"
 #include "llvm/BinaryFormat/Dwarf.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/Support/Casting.h"
 #include <cassert>
@@ -332,31 +334,53 @@ class DISubrange : public DINode {
   friend class LLVMContextImpl;
   friend class MDNode;
 
-  int64_t Count;
   int64_t LowerBound;
 
-  DISubrange(LLVMContext &C, StorageType Storage, int64_t Count,
-             int64_t LowerBound)
-      : DINode(C, DISubrangeKind, Storage, dwarf::DW_TAG_subrange_type, None),
-        Count(Count), LowerBound(LowerBound) {}
+  DISubrange(LLVMContext &C, StorageType Storage, Metadata *Node,
+             int64_t LowerBound, ArrayRef<Metadata *> Ops)
+      : DINode(C, DISubrangeKind, Storage, dwarf::DW_TAG_subrange_type, Ops),
+        LowerBound(LowerBound) {}
+
   ~DISubrange() = default;
 
   static DISubrange *getImpl(LLVMContext &Context, int64_t Count,
                              int64_t LowerBound, StorageType Storage,
                              bool ShouldCreate = true);
 
+  static DISubrange *getImpl(LLVMContext &Context, Metadata *CountNode,
+                             int64_t LowerBound, StorageType Storage,
+                             bool ShouldCreate = true);
+
   TempDISubrange cloneImpl() const {
-    return getTemporary(getContext(), getCount(), getLowerBound());
+    return getTemporary(getContext(), getRawCountNode(), getLowerBound());
   }
 
 public:
   DEFINE_MDNODE_GET(DISubrange, (int64_t Count, int64_t LowerBound = 0),
                     (Count, LowerBound))
 
+  DEFINE_MDNODE_GET(DISubrange, (Metadata *CountNode, int64_t LowerBound = 0),
+                    (CountNode, LowerBound))
+
   TempDISubrange clone() const { return cloneImpl(); }
 
   int64_t getLowerBound() const { return LowerBound; }
-  int64_t getCount() const { return Count; }
+
+  Metadata *getRawCountNode() const {
+    return getOperand(0).get();
+  }
+
+  typedef PointerUnion<ConstantInt*, DIVariable*> CountType;
+
+  CountType getCount() const {
+    if (auto *MD = dyn_cast<ConstantAsMetadata>(getRawCountNode()))
+      return CountType(cast<ConstantInt>(MD->getValue()));
+
+    if (auto *DV = dyn_cast<DIVariable>(getRawCountNode()))
+      return CountType(DV);
+
+    return CountType();
+  }
 
   static bool classof(const Metadata *MD) {
     return MD->getMetadataID() == DISubrangeKind;
@@ -633,6 +657,10 @@ public:
   bool isStaticMember() const { return getFlags() & FlagStaticMember; }
   bool isLValueReference() const { return getFlags() & FlagLValueReference; }
   bool isRValueReference() const { return getFlags() & FlagRValueReference; }
+  bool isTypePassByValue() const { return getFlags() & FlagTypePassByValue; }
+  bool isTypePassByReference() const {
+    return getFlags() & FlagTypePassByReference;
+  }
 
   static bool classof(const Metadata *MD) {
     switch (MD->getMetadataID()) {
@@ -1380,7 +1408,7 @@ public:
   ///
   /// The above 3 components are encoded into a 32bit unsigned integer in
   /// order. If the lowest bit is 1, the current component is empty, and the
-  /// next component will start in the next bit. Otherwise, the the current
+  /// next component will start in the next bit. Otherwise, the current
   /// component is non-empty, and its content starts in the next bit. The
   /// length of each components is either 5 bit or 12 bit: if the 7th bit
   /// is 0, the bit 2~6 (5 bits) are used to represent the component; if the
@@ -1417,17 +1445,17 @@ public:
   /// could create a location with a new discriminator. If they are from
   /// different files/lines the location is ambiguous and can't be
   /// represented in a single line entry.  In this case, no location
-  /// should be set.
+  /// should be set, unless the merged instruction is a call, which we will
+  /// set the merged debug location as line 0 of the nearest common scope
+  /// where 2 locations are inlined from. This only applies to Instruction;
+  /// for MachineInstruction, as it is post-inline, we will treat the call
+  /// instruction the same way as other instructions.
   ///
-  /// Currently the function does not create a new location. If the locations
-  /// are the same, or cannot be discriminated, the first location is returned.
-  /// Otherwise an empty location will be used.
-  static const DILocation *getMergedLocation(const DILocation *LocA,
-                                             const DILocation *LocB) {
-    if (LocA && LocB && (LocA == LocB || !LocA->canDiscriminate(*LocB)))
-      return LocA;
-    return nullptr;
-  }
+  /// \p ForInst: The Instruction the merged DILocation is for. If the
+  /// Instruction is unavailable or non-existent, use nullptr.
+  static const DILocation *
+  getMergedLocation(const DILocation *LocA, const DILocation *LocB,
+                    const Instruction *ForInst = nullptr);
 
   /// Returns the base discriminator for a given encoded discriminator \p D.
   static unsigned getBaseDiscriminatorFromDiscriminator(unsigned D) {
@@ -2091,6 +2119,8 @@ public:
   DITypeRef getType() const { return DITypeRef(getRawType()); }
   uint32_t getAlignInBits() const { return AlignInBits; }
   uint32_t getAlignInBytes() const { return getAlignInBits() / CHAR_BIT; }
+  /// Determines the size of the variable's type.
+  Optional<uint64_t> getSizeInBits() const;
 
   StringRef getFilename() const {
     if (auto *F = getFile())
@@ -2295,8 +2325,9 @@ public:
 
   /// Prepend \p DIExpr with a deref and offset operation and optionally turn it
   /// into a stack value.
-  static DIExpression *prepend(const DIExpression *DIExpr, bool Deref,
-                               int64_t Offset = 0, bool StackValue = false);
+  static DIExpression *prepend(const DIExpression *DIExpr, bool DerefBefore,
+                               int64_t Offset = 0, bool DerefAfter = false,
+                               bool StackValue = false);
 
   /// Create a DIExpression to describe one part of an aggregate variable that
   /// is fragmented across multiple Values. The DW_OP_LLVM_fragment operation
@@ -2306,9 +2337,11 @@ public:
   ///
   /// \param OffsetInBits Offset of the piece in bits.
   /// \param SizeInBits   Size of the piece in bits.
-  static DIExpression *createFragmentExpression(const DIExpression *Exp,
-                                                unsigned OffsetInBits,
-                                                unsigned SizeInBits);
+  /// \return             Creating a fragment expression may fail if \c Expr
+  ///                     contains arithmetic operations that would be truncated.
+  static Optional<DIExpression *>
+  createFragmentExpression(const DIExpression *Expr, unsigned OffsetInBits,
+                           unsigned SizeInBits);
 };
 
 /// Global variables.

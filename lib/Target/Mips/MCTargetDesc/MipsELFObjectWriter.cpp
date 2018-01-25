@@ -13,6 +13,7 @@
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/MC/MCELFObjectWriter.h"
 #include "llvm/MC/MCFixup.h"
+#include "llvm/MC/MCObjectWriter.h"
 #include "llvm/MC/MCSymbolELF.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Compiler.h"
@@ -224,6 +225,8 @@ unsigned MipsELFObjectWriter::getRelocType(MCContext &Ctx,
   switch (Kind) {
   case Mips::fixup_Mips_NONE:
     return ELF::R_MIPS_NONE;
+  case FK_Data_1:
+    report_fatal_error("MIPS does not support one byte relocations");
   case Mips::fixup_Mips_16:
   case FK_Data_2:
     return IsPCRel ? ELF::R_MIPS_PC16 : ELF::R_MIPS_16;
@@ -655,12 +658,13 @@ bool MipsELFObjectWriter::needsRelocateWithSymbol(const MCSymbol &Sym,
   }
 }
 
-MCObjectWriter *llvm::createMipsELFObjectWriter(raw_pwrite_stream &OS,
-                                                const Triple &TT, bool IsN32) {
+std::unique_ptr<MCObjectWriter>
+llvm::createMipsELFObjectWriter(raw_pwrite_stream &OS, const Triple &TT,
+                                bool IsN32) {
   uint8_t OSABI = MCELFObjectTargetWriter::getOSABI(TT.getOS());
   bool IsN64 = TT.isArch64Bit() && !IsN32;
   bool HasRelocationAddend = TT.isArch64Bit();
-  auto *MOTW = new MipsELFObjectWriter(OSABI, HasRelocationAddend, IsN64,
-                                       TT.isLittleEndian());
-  return createELFObjectWriter(MOTW, OS, TT.isLittleEndian());
+  auto MOTW = llvm::make_unique<MipsELFObjectWriter>(
+      OSABI, HasRelocationAddend, IsN64, TT.isLittleEndian());
+  return createELFObjectWriter(std::move(MOTW), OS, TT.isLittleEndian());
 }

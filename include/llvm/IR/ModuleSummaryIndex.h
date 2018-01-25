@@ -69,9 +69,27 @@ class GlobalValueSummary;
 using GlobalValueSummaryList = std::vector<std::unique_ptr<GlobalValueSummary>>;
 
 struct GlobalValueSummaryInfo {
-  /// The GlobalValue corresponding to this summary. This is only used in
-  /// per-module summaries.
-  const GlobalValue *GV = nullptr;
+  union NameOrGV {
+    NameOrGV(bool IsAnalysis) {
+      if (IsAnalysis)
+        GV = nullptr;
+      else
+        Name = "";
+    }
+
+    /// The GlobalValue corresponding to this summary. This is only used in
+    /// per-module summaries, when module analysis is being run.
+    const GlobalValue *GV;
+
+    /// Summary string representation. This StringRef points to BC module
+    /// string table and is valid until module data is stored in memory.
+    /// This is guaranteed to happen until runThinLTOBackend function is
+    /// called, so it is safe to use this field during thin link. This field
+    /// is only valid if summary index was loaded from BC file.
+    StringRef Name;
+  } U;
+
+  GlobalValueSummaryInfo(bool IsAnalysis) : U(IsAnalysis) {}
 
   /// List of global value summary structures for a particular value held
   /// in the GlobalValueMap. Requires a vector in the case of multiple
@@ -91,32 +109,60 @@ using GlobalValueSummaryMapTy =
 /// Struct that holds a reference to a particular GUID in a global value
 /// summary.
 struct ValueInfo {
-  const GlobalValueSummaryMapTy::value_type *Ref = nullptr;
+  PointerIntPair<const GlobalValueSummaryMapTy::value_type *, 1, bool>
+      RefAndFlag;
 
   ValueInfo() = default;
-  ValueInfo(const GlobalValueSummaryMapTy::value_type *Ref) : Ref(Ref) {}
+  ValueInfo(bool IsAnalysis, const GlobalValueSummaryMapTy::value_type *R) {
+    RefAndFlag.setPointer(R);
+    RefAndFlag.setInt(IsAnalysis);
+  }
 
-  operator bool() const { return Ref; }
+  operator bool() const { return getRef(); }
 
-  GlobalValue::GUID getGUID() const { return Ref->first; }
-  const GlobalValue *getValue() const { return Ref->second.GV; }
+  GlobalValue::GUID getGUID() const { return getRef()->first; }
+  const GlobalValue *getValue() const {
+    assert(isFromAnalysis());
+    return getRef()->second.U.GV;
+  }
 
   ArrayRef<std::unique_ptr<GlobalValueSummary>> getSummaryList() const {
-    return Ref->second.SummaryList;
+    return getRef()->second.SummaryList;
+  }
+
+  StringRef name() const {
+    return isFromAnalysis() ? getRef()->second.U.GV->getName()
+                            : getRef()->second.U.Name;
+  }
+
+  bool isFromAnalysis() const { return RefAndFlag.getInt(); }
+
+  const GlobalValueSummaryMapTy::value_type *getRef() const {
+    return RefAndFlag.getPointer();
   }
 };
 
 template <> struct DenseMapInfo<ValueInfo> {
   static inline ValueInfo getEmptyKey() {
-    return ValueInfo((GlobalValueSummaryMapTy::value_type *)-1);
+    return ValueInfo(false, (GlobalValueSummaryMapTy::value_type *)-8);
   }
 
   static inline ValueInfo getTombstoneKey() {
-    return ValueInfo((GlobalValueSummaryMapTy::value_type *)-2);
+    return ValueInfo(false, (GlobalValueSummaryMapTy::value_type *)-16);
   }
 
-  static bool isEqual(ValueInfo L, ValueInfo R) { return L.Ref == R.Ref; }
-  static unsigned getHashValue(ValueInfo I) { return (uintptr_t)I.Ref; }
+  static inline bool isSpecialKey(ValueInfo V) {
+    return V == getTombstoneKey() || V == getEmptyKey();
+  }
+
+  static bool isEqual(ValueInfo L, ValueInfo R) {
+    // We are not supposed to mix ValueInfo(s) with different analysis flag
+    // in a same container.
+    assert(isSpecialKey(L) || isSpecialKey(R) ||
+           (L.isFromAnalysis() == R.isFromAnalysis()));
+    return L.getRef() == R.getRef();
+  }
+  static unsigned getHashValue(ValueInfo I) { return (uintptr_t)I.getRef(); }
 };
 
 /// \brief Function and variable summary information to aid decisions and
@@ -148,11 +194,15 @@ public:
     /// In combined summary, indicate that the global value is live.
     unsigned Live : 1;
 
+    /// Indicates that the linker resolved the symbol to a definition from
+    /// within the same linkage unit.
+    unsigned DSOLocal : 1;
+
     /// Convenience Constructors
     explicit GVFlags(GlobalValue::LinkageTypes Linkage,
-                     bool NotEligibleToImport, bool Live)
+                     bool NotEligibleToImport, bool Live, bool IsLocal)
         : Linkage(Linkage), NotEligibleToImport(NotEligibleToImport),
-          Live(Live) {}
+          Live(Live), DSOLocal(IsLocal) {}
   };
 
 private:
@@ -180,8 +230,6 @@ private:
   /// from within a function). This does not include functions called, which
   /// are listed in the derived FunctionSummary object.
   std::vector<ValueInfo> RefEdgeList;
-
-  bool isLive() const { return Flags.Live; }
 
 protected:
   GlobalValueSummary(SummaryKind K, GVFlags Flags, std::vector<ValueInfo> Refs)
@@ -227,7 +275,13 @@ public:
   /// Return true if this global value can't be imported.
   bool notEligibleToImport() const { return Flags.NotEligibleToImport; }
 
+  bool isLive() const { return Flags.Live; }
+
   void setLive(bool Live) { Flags.Live = Live; }
+
+  void setDSOLocal(bool Local) { Flags.DSOLocal = Local; }
+
+  bool isDSOLocal() const { return Flags.DSOLocal; }
 
   /// Flag that this global value cannot be imported.
   void setNotEligibleToImport() { Flags.NotEligibleToImport = true; }
@@ -238,19 +292,22 @@ public:
   /// If this is an alias summary, returns the summary of the aliased object (a
   /// global variable or function), otherwise returns itself.
   GlobalValueSummary *getBaseObject();
+  const GlobalValueSummary *getBaseObject() const;
 
   friend class ModuleSummaryIndex;
-  friend void computeDeadSymbols(class ModuleSummaryIndex &,
-                                 const DenseSet<GlobalValue::GUID> &);
 };
 
 /// \brief Alias summary information.
 class AliasSummary : public GlobalValueSummary {
   GlobalValueSummary *AliaseeSummary;
+  // AliaseeGUID is only set and accessed when we are building a combined index
+  // via the BitcodeReader.
+  GlobalValue::GUID AliaseeGUID;
 
 public:
   AliasSummary(GVFlags Flags)
-      : GlobalValueSummary(AliasKind, Flags, ArrayRef<ValueInfo>{}) {}
+      : GlobalValueSummary(AliasKind, Flags, ArrayRef<ValueInfo>{}),
+        AliaseeSummary(nullptr), AliaseeGUID(0) {}
 
   /// Check if this is an alias summary.
   static bool classof(const GlobalValueSummary *GVS) {
@@ -258,6 +315,7 @@ public:
   }
 
   void setAliasee(GlobalValueSummary *Aliasee) { AliaseeSummary = Aliasee; }
+  void setAliaseeGUID(GlobalValue::GUID GUID) { AliaseeGUID = GUID; }
 
   const GlobalValueSummary &getAliasee() const {
     assert(AliaseeSummary && "Unexpected missing aliasee summary");
@@ -268,7 +326,17 @@ public:
     return const_cast<GlobalValueSummary &>(
                          static_cast<const AliasSummary *>(this)->getAliasee());
   }
+  const GlobalValue::GUID &getAliaseeGUID() const {
+    assert(AliaseeGUID && "Unexpected missing aliasee GUID");
+    return AliaseeGUID;
+  }
 };
+
+const inline GlobalValueSummary *GlobalValueSummary::getBaseObject() const {
+  if (auto *AS = dyn_cast<AliasSummary>(this))
+    return &AS->getAliasee();
+  return this;
+}
 
 inline GlobalValueSummary *GlobalValueSummary::getBaseObject() {
   if (auto *AS = dyn_cast<AliasSummary>(this))
@@ -595,6 +663,11 @@ private:
   /// considered live.
   bool WithGlobalValueDeadStripping = false;
 
+  /// If true then we're performing analysis of IR module, filling summary
+  /// accordingly. The value of 'false' means we're reading summary from
+  /// BC or YAML source. Affects the type of value stored in NameOrGV union
+  bool IsAnalysis;
+
   std::set<std::string> CfiFunctionDefs;
   std::set<std::string> CfiFunctionDecls;
 
@@ -603,10 +676,16 @@ private:
 
   GlobalValueSummaryMapTy::value_type *
   getOrInsertValuePtr(GlobalValue::GUID GUID) {
-    return &*GlobalValueMap.emplace(GUID, GlobalValueSummaryInfo{}).first;
+    return &*GlobalValueMap.emplace(GUID, GlobalValueSummaryInfo(IsAnalysis)).first;
   }
 
 public:
+  // See IsAnalysis variable comment.
+  ModuleSummaryIndex(bool IsPerformingAnalysis)
+      : IsAnalysis(IsPerformingAnalysis) {}
+
+  bool isPerformingAnalysis() const { return IsAnalysis; }
+
   gvsummary_iterator begin() { return GlobalValueMap.begin(); }
   const_gvsummary_iterator begin() const { return GlobalValueMap.begin(); }
   gvsummary_iterator end() { return GlobalValueMap.end(); }
@@ -628,19 +707,28 @@ public:
   /// Return a ValueInfo for GUID if it exists, otherwise return ValueInfo().
   ValueInfo getValueInfo(GlobalValue::GUID GUID) const {
     auto I = GlobalValueMap.find(GUID);
-    return ValueInfo(I == GlobalValueMap.end() ? nullptr : &*I);
+    return ValueInfo(IsAnalysis, I == GlobalValueMap.end() ? nullptr : &*I);
   }
 
   /// Return a ValueInfo for \p GUID.
   ValueInfo getOrInsertValueInfo(GlobalValue::GUID GUID) {
-    return ValueInfo(getOrInsertValuePtr(GUID));
+    return ValueInfo(IsAnalysis, getOrInsertValuePtr(GUID));
+  }
+
+  /// Return a ValueInfo for \p GUID setting value \p Name. 
+  ValueInfo getOrInsertValueInfo(GlobalValue::GUID GUID, StringRef Name) {
+    assert(!IsAnalysis);
+    auto VP = getOrInsertValuePtr(GUID);
+    VP->second.U.Name = Name;
+    return ValueInfo(IsAnalysis, VP);
   }
 
   /// Return a ValueInfo for \p GV and mark it as belonging to GV.
   ValueInfo getOrInsertValueInfo(const GlobalValue *GV) {
+    assert(IsAnalysis);
     auto VP = getOrInsertValuePtr(GV->getGUID());
-    VP->second.GV = GV;
-    return ValueInfo(VP);
+    VP->second.U.GV = GV;
+    return ValueInfo(IsAnalysis, VP);
   }
 
   /// Return the GUID for \p OriginalId in the OidGuidMap.
@@ -668,7 +756,7 @@ public:
     addOriginalName(VI.getGUID(), Summary->getOriginalName());
     // Here we have a notionally const VI, but the value it points to is owned
     // by the non-const *this.
-    const_cast<GlobalValueSummaryMapTy::value_type *>(VI.Ref)
+    const_cast<GlobalValueSummaryMapTy::value_type *>(VI.getRef())
         ->second.SummaryList.push_back(std::move(Summary));
   }
 
@@ -743,7 +831,8 @@ public:
   static std::string getGlobalNameForLocal(StringRef Name, ModuleHash ModHash) {
     SmallString<256> NewName(Name);
     NewName += ".llvm.";
-    NewName += utohexstr(ModHash[0]); // Take the first 32 bits
+    NewName += utostr((uint64_t(ModHash[0]) << 32) |
+                      ModHash[1]); // Take the first 64 bits
     return NewName.str();
   }
 
@@ -798,6 +887,9 @@ public:
   /// Summary).
   void collectDefinedGVSummariesPerModule(
       StringMap<GVSummaryMapTy> &ModuleToDefinedGVSummaries) const;
+
+  /// Export summary to dot file for GraphViz.
+  void exportToDot(raw_ostream& OS) const;
 };
 
 } // end namespace llvm

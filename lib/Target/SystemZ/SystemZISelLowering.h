@@ -18,7 +18,7 @@
 #include "SystemZ.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/SelectionDAG.h"
-#include "llvm/Target/TargetLowering.h"
+#include "llvm/CodeGen/TargetLowering.h"
 
 namespace llvm {
 namespace SystemZISD {
@@ -308,6 +308,10 @@ enum NodeType : unsigned {
   // Operand 5: the width of the field in bits (8 or 16)
   ATOMIC_CMP_SWAPW,
 
+  // Atomic compare-and-swap returning glue (condition code).
+  // Val, OUTCHAIN, glue = ATOMIC_CMP_SWAP(INCHAIN, ptr, cmp, swap)
+  ATOMIC_CMP_SWAP,
+
   // 128-bit atomic load.
   // Val, OUTCHAIN = ATOMIC_LOAD_128(INCHAIN, ptr)
   ATOMIC_LOAD_128,
@@ -317,7 +321,7 @@ enum NodeType : unsigned {
   ATOMIC_STORE_128,
 
   // 128-bit atomic compare-and-swap.
-  // Val, OUTCHAIN = ATOMIC_CMP_SWAP(INCHAIN, ptr, cmp, swap)
+  // Val, OUTCHAIN, glue = ATOMIC_CMP_SWAP(INCHAIN, ptr, cmp, swap)
   ATOMIC_CMP_SWAP_128,
 
   // Byte swapping load.
@@ -422,6 +426,8 @@ public:
       switch(ConstraintCode[0]) {
       default:
         break;
+      case 'o':
+        return InlineAsm::Constraint_o;
       case 'Q':
         return InlineAsm::Constraint_Q;
       case 'R':
@@ -483,6 +489,14 @@ public:
                       const SmallVectorImpl<SDValue> &OutVals, const SDLoc &DL,
                       SelectionDAG &DAG) const override;
   SDValue PerformDAGCombine(SDNode *N, DAGCombinerInfo &DCI) const override;
+
+  /// Determine which of the bits specified in Mask are known to be either
+  /// zero or one and return them in the KnownZero/KnownOne bitsets.
+  void computeKnownBitsForTargetNode(const SDValue Op,
+                                     KnownBits &Known,
+                                     const APInt &DemandedElts,
+                                     const SelectionDAG &DAG,
+                                     unsigned Depth = 0) const override;
 
   ISD::NodeType getExtendForAtomicOps() const override {
     return ISD::ANY_EXTEND;
@@ -557,7 +571,9 @@ private:
                          bool Force) const;
   SDValue combineTruncateExtract(const SDLoc &DL, EVT TruncVT, SDValue Op,
                                  DAGCombinerInfo &DCI) const;
+  SDValue combineZERO_EXTEND(SDNode *N, DAGCombinerInfo &DCI) const;
   SDValue combineSIGN_EXTEND(SDNode *N, DAGCombinerInfo &DCI) const;
+  SDValue combineSIGN_EXTEND_INREG(SDNode *N, DAGCombinerInfo &DCI) const;
   SDValue combineMERGE(SDNode *N, DAGCombinerInfo &DCI) const;
   SDValue combineSTORE(SDNode *N, DAGCombinerInfo &DCI) const;
   SDValue combineEXTRACT_VECTOR_ELT(SDNode *N, DAGCombinerInfo &DCI) const;
@@ -565,6 +581,8 @@ private:
   SDValue combineFP_ROUND(SDNode *N, DAGCombinerInfo &DCI) const;
   SDValue combineBSWAP(SDNode *N, DAGCombinerInfo &DCI) const;
   SDValue combineSHIFTROT(SDNode *N, DAGCombinerInfo &DCI) const;
+  SDValue combineBR_CCMASK(SDNode *N, DAGCombinerInfo &DCI) const;
+  SDValue combineSELECT_CCMASK(SDNode *N, DAGCombinerInfo &DCI) const;
 
   // If the last instruction before MBBI in MBB was some form of COMPARE,
   // try to replace it with a COMPARE AND BRANCH just before MBBI.

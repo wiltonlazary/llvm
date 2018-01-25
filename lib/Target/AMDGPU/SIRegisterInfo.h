@@ -22,6 +22,7 @@
 
 namespace llvm {
 
+class LiveIntervals;
 class MachineRegisterInfo;
 class SISubtarget;
 class SIMachineFunctionInfo;
@@ -35,7 +36,6 @@ private:
   bool SpillSGPRToVGPR;
   bool SpillSGPRToSMEM;
 
-  void reserveRegisterTuples(BitVector &, unsigned Reg) const;
   void classifyPressureSet(unsigned PSetID, unsigned Reg,
                            BitVector &PressureSets) const;
 public:
@@ -212,7 +212,8 @@ public:
                       unsigned SubReg,
                       const TargetRegisterClass *DstRC,
                       unsigned DstSubReg,
-                      const TargetRegisterClass *NewRC) const override;
+                      const TargetRegisterClass *NewRC,
+                      LiveIntervals &LIS) const override;
 
   unsigned getRegPressureLimit(const TargetRegisterClass *RC,
                                MachineFunction &MF) const override;

@@ -41,6 +41,8 @@ protected:
   StringRef getFeatureString(const Function &F) const;
 
 public:
+  static bool EnableLateStructurizeCFG;
+
   AMDGPUTargetMachine(const Target &T, const Triple &TT, StringRef CPU,
                       StringRef FS, TargetOptions Options,
                       Optional<Reloc::Model> RM, Optional<CodeModel::Model> CM,
@@ -53,7 +55,7 @@ public:
   const AMDGPUIntrinsicInfo *getIntrinsicInfo() const override {
     return &IntrinsicInfo;
   }
-  TargetIRAnalysis getTargetIRAnalysis() override;
+  TargetTransformInfo getTargetTransformInfo(const Function &F) override;
 
   TargetLoweringObjectFile *getObjFileLowering() const override {
     return TLOF.get();
@@ -111,6 +113,10 @@ public:
   TargetPassConfig *createPassConfig(PassManagerBase &PM) override;
 
   const SISubtarget *getSubtargetImpl(const Function &) const override;
+
+  bool useIPRA() const override {
+    return true;
+  }
 };
 
 } // end namespace llvm

@@ -1,4 +1,6 @@
-; RUN: llc -mtriple wasm32-unknown-unknown-wasm -filetype=obj %s -o - | obj2yaml | FileCheck %s
+; RUN: llc -filetype=obj %s -o - | obj2yaml | FileCheck %s
+
+target triple = "wasm32-unknown-unknown-wasm"
 
 @.str1 = private unnamed_addr constant [6 x i8] c"hello\00", align 1
 @.str2 = private unnamed_addr constant [6 x i8] c"world\00", align 1
@@ -9,22 +11,26 @@
 
 ; CHECK:        - Type:            GLOBAL
 ; CHECK-NEXT:     Globals:         
-; CHECK-NEXT:       - Type:            I32
+; CHECK-NEXT:       - Index:           0
+; CHECK-NEXT:         Type:            I32
 ; CHECK-NEXT:         Mutable:         false
 ; CHECK-NEXT:         InitExpr:        
 ; CHECK-NEXT:           Opcode:          I32_CONST
 ; CHECK-NEXT:           Value:           0
-; CHECK-NEXT:       - Type:            I32
+; CHECK-NEXT:       - Index:           1
+; CHECK-NEXT:         Type:            I32
 ; CHECK-NEXT:         Mutable:         false
 ; CHECK-NEXT:         InitExpr:        
 ; CHECK-NEXT:           Opcode:          I32_CONST
 ; CHECK-NEXT:           Value:           6
-; CHECK-NEXT:       - Type:            I32
+; CHECK-NEXT:       - Index:           2
+; CHECK-NEXT:         Type:            I32
 ; CHECK-NEXT:         Mutable:         false
 ; CHECK-NEXT:         InitExpr:        
 ; CHECK-NEXT:           Opcode:          I32_CONST
 ; CHECK-NEXT:           Value:           16
-; CHECK-NEXT:       - Type:            I32
+; CHECK-NEXT:       - Index:           3
+; CHECK-NEXT:         Type:            I32
 ; CHECK-NEXT:         Mutable:         false
 ; CHECK-NEXT:         InitExpr:
 ; CHECK-NEXT:           Opcode:          I32_CONST
@@ -79,19 +85,26 @@
 ; CHECK-NEXT:   - Type:            CUSTOM
 ; CHECK-NEXT:     Name:            linking
 ; CHECK-NEXT:     DataSize:        28
-; CHECK-NEXT:     DataAlignment:   8
 ; CHECK-NEXT:     SymbolInfo:      
 ; CHECK-NEXT:       - Name:            .L.str1
-; CHECK-NEXT:         Flags:           2
+; CHECK-NEXT:         Flags:           [ BINDING_LOCAL ]
 ; CHECK-NEXT:       - Name:            .L.str2
-; CHECK-NEXT:         Flags:           2
-; CHECK-NEXT:     SegmentNames:    
+; CHECK-NEXT:         Flags:           [ BINDING_LOCAL ]
+; CHECK-NEXT:     SegmentInfo:    
 ; CHECK-NEXT:       - Index:       0
 ; CHECK-NEXT:         Name:        .rodata..L.str1
+; CHECK-NEXT:         Alignment:   1
+; CHECK-NEXT:         Flags:       [ ]
 ; CHECK-NEXT:       - Index:       1
 ; CHECK-NEXT:         Name:        .rodata..L.str2
+; CHECK-NEXT:         Alignment:   1
+; CHECK-NEXT:         Flags:       [ ]
 ; CHECK-NEXT:       - Index:       2
 ; CHECK-NEXT:         Name:        .data.a
+; CHECK-NEXT:         Alignment:   8
+; CHECK-NEXT:         Flags:       [ ]
 ; CHECK-NEXT:       - Index:       3
 ; CHECK-NEXT:         Name:        .data.b
+; CHECK-NEXT:         Alignment:   8
+; CHECK-NEXT:         Flags:       [ ]
 ; CHECK_NEXT:   ...

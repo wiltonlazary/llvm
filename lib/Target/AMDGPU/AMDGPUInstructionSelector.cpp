@@ -17,6 +17,7 @@
 #include "AMDGPURegisterBankInfo.h"
 #include "AMDGPURegisterInfo.h"
 #include "AMDGPUSubtarget.h"
+#include "llvm/CodeGen/GlobalISel/Utils.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstr.h"
@@ -402,7 +403,8 @@ bool AMDGPUInstructionSelector::selectG_LOAD(MachineInstr &I) const {
   return Ret;
 }
 
-bool AMDGPUInstructionSelector::select(MachineInstr &I) const {
+bool AMDGPUInstructionSelector::select(MachineInstr &I,
+                                       CodeGenCoverage &CoverageInfo) const {
 
   if (!isPreISelGenericOpcode(I.getOpcode()))
     return true;

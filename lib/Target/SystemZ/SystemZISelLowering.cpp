@@ -31,17 +31,6 @@ using namespace llvm;
 #define DEBUG_TYPE "systemz-lower"
 
 namespace {
-// Represents a sequence for extracting a 0/1 value from an IPM result:
-// (((X ^ XORValue) + AddValue) >> Bit)
-struct IPMConversion {
-  IPMConversion(unsigned xorValue, int64_t addValue, unsigned bit)
-    : XORValue(xorValue), AddValue(addValue), Bit(bit) {}
-
-  int64_t XORValue;
-  int64_t AddValue;
-  unsigned Bit;
-};
-
 // Represents information about a comparison.
 struct Comparison {
   Comparison(SDValue Op0In, SDValue Op1In)
@@ -221,13 +210,17 @@ SystemZTargetLowering::SystemZTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::ATOMIC_LOAD_MAX,  MVT::i32, Custom);
   setOperationAction(ISD::ATOMIC_LOAD_UMIN, MVT::i32, Custom);
   setOperationAction(ISD::ATOMIC_LOAD_UMAX, MVT::i32, Custom);
-  setOperationAction(ISD::ATOMIC_CMP_SWAP,  MVT::i32, Custom);
 
   // Even though i128 is not a legal type, we still need to custom lower
   // the atomic operations in order to exploit SystemZ instructions.
   setOperationAction(ISD::ATOMIC_LOAD,     MVT::i128, Custom);
   setOperationAction(ISD::ATOMIC_STORE,    MVT::i128, Custom);
-  setOperationAction(ISD::ATOMIC_CMP_SWAP, MVT::i128, Custom);
+
+  // We can use the CC result of compare-and-swap to implement
+  // the "success" result of ATOMIC_CMP_SWAP_WITH_SUCCESS.
+  setOperationAction(ISD::ATOMIC_CMP_SWAP_WITH_SUCCESS, MVT::i32, Custom);
+  setOperationAction(ISD::ATOMIC_CMP_SWAP_WITH_SUCCESS, MVT::i64, Custom);
+  setOperationAction(ISD::ATOMIC_CMP_SWAP_WITH_SUCCESS, MVT::i128, Custom);
 
   setOperationAction(ISD::ATOMIC_FENCE, MVT::Other, Custom);
 
@@ -513,7 +506,9 @@ SystemZTargetLowering::SystemZTargetLowering(const TargetMachine &TM,
   setOperationAction(ISD::VAEND,   MVT::Other, Expand);
 
   // Codes for which we want to perform some z-specific combinations.
+  setTargetDAGCombine(ISD::ZERO_EXTEND);
   setTargetDAGCombine(ISD::SIGN_EXTEND);
+  setTargetDAGCombine(ISD::SIGN_EXTEND_INREG);
   setTargetDAGCombine(ISD::STORE);
   setTargetDAGCombine(ISD::EXTRACT_VECTOR_ELT);
   setTargetDAGCombine(ISD::FP_ROUND);
@@ -1695,73 +1690,6 @@ static unsigned CCMaskForCondCode(ISD::CondCode CC) {
 #undef CONV
 }
 
-// Return a sequence for getting a 1 from an IPM result when CC has a
-// value in CCMask and a 0 when CC has a value in CCValid & ~CCMask.
-// The handling of CC values outside CCValid doesn't matter.
-static IPMConversion getIPMConversion(unsigned CCValid, unsigned CCMask) {
-  // Deal with cases where the result can be taken directly from a bit
-  // of the IPM result.
-  if (CCMask == (CCValid & (SystemZ::CCMASK_1 | SystemZ::CCMASK_3)))
-    return IPMConversion(0, 0, SystemZ::IPM_CC);
-  if (CCMask == (CCValid & (SystemZ::CCMASK_2 | SystemZ::CCMASK_3)))
-    return IPMConversion(0, 0, SystemZ::IPM_CC + 1);
-
-  // Deal with cases where we can add a value to force the sign bit
-  // to contain the right value.  Putting the bit in 31 means we can
-  // use SRL rather than RISBG(L), and also makes it easier to get a
-  // 0/-1 value, so it has priority over the other tests below.
-  //
-  // These sequences rely on the fact that the upper two bits of the
-  // IPM result are zero.
-  uint64_t TopBit = uint64_t(1) << 31;
-  if (CCMask == (CCValid & SystemZ::CCMASK_0))
-    return IPMConversion(0, -(1 << SystemZ::IPM_CC), 31);
-  if (CCMask == (CCValid & (SystemZ::CCMASK_0 | SystemZ::CCMASK_1)))
-    return IPMConversion(0, -(2 << SystemZ::IPM_CC), 31);
-  if (CCMask == (CCValid & (SystemZ::CCMASK_0
-                            | SystemZ::CCMASK_1
-                            | SystemZ::CCMASK_2)))
-    return IPMConversion(0, -(3 << SystemZ::IPM_CC), 31);
-  if (CCMask == (CCValid & SystemZ::CCMASK_3))
-    return IPMConversion(0, TopBit - (3 << SystemZ::IPM_CC), 31);
-  if (CCMask == (CCValid & (SystemZ::CCMASK_1
-                            | SystemZ::CCMASK_2
-                            | SystemZ::CCMASK_3)))
-    return IPMConversion(0, TopBit - (1 << SystemZ::IPM_CC), 31);
-
-  // Next try inverting the value and testing a bit.  0/1 could be
-  // handled this way too, but we dealt with that case above.
-  if (CCMask == (CCValid & (SystemZ::CCMASK_0 | SystemZ::CCMASK_2)))
-    return IPMConversion(-1, 0, SystemZ::IPM_CC);
-
-  // Handle cases where adding a value forces a non-sign bit to contain
-  // the right value.
-  if (CCMask == (CCValid & (SystemZ::CCMASK_1 | SystemZ::CCMASK_2)))
-    return IPMConversion(0, 1 << SystemZ::IPM_CC, SystemZ::IPM_CC + 1);
-  if (CCMask == (CCValid & (SystemZ::CCMASK_0 | SystemZ::CCMASK_3)))
-    return IPMConversion(0, -(1 << SystemZ::IPM_CC), SystemZ::IPM_CC + 1);
-
-  // The remaining cases are 1, 2, 0/1/3 and 0/2/3.  All these are
-  // can be done by inverting the low CC bit and applying one of the
-  // sign-based extractions above.
-  if (CCMask == (CCValid & SystemZ::CCMASK_1))
-    return IPMConversion(1 << SystemZ::IPM_CC, -(1 << SystemZ::IPM_CC), 31);
-  if (CCMask == (CCValid & SystemZ::CCMASK_2))
-    return IPMConversion(1 << SystemZ::IPM_CC,
-                         TopBit - (3 << SystemZ::IPM_CC), 31);
-  if (CCMask == (CCValid & (SystemZ::CCMASK_0
-                            | SystemZ::CCMASK_1
-                            | SystemZ::CCMASK_3)))
-    return IPMConversion(1 << SystemZ::IPM_CC, -(3 << SystemZ::IPM_CC), 31);
-  if (CCMask == (CCValid & (SystemZ::CCMASK_0
-                            | SystemZ::CCMASK_2
-                            | SystemZ::CCMASK_3)))
-    return IPMConversion(1 << SystemZ::IPM_CC,
-                         TopBit - (1 << SystemZ::IPM_CC), 31);
-
-  llvm_unreachable("Unexpected CC combination");
-}
-
 // If C can be converted to a comparison against zero, adjust the operands
 // as necessary.
 static void adjustZeroCmp(SelectionDAG &DAG, const SDLoc &DL, Comparison &C) {
@@ -1840,11 +1768,14 @@ static void adjustSubwordCmp(SelectionDAG &DAG, const SDLoc &DL,
                               ISD::SEXTLOAD :
                               ISD::ZEXTLOAD);
   if (C.Op0.getValueType() != MVT::i32 ||
-      Load->getExtensionType() != ExtType)
+      Load->getExtensionType() != ExtType) {
     C.Op0 = DAG.getExtLoad(ExtType, SDLoc(Load), MVT::i32, Load->getChain(),
                            Load->getBasePtr(), Load->getPointerInfo(),
                            Load->getMemoryVT(), Load->getAlignment(),
                            Load->getMemOperand()->getFlags());
+    // Update the chain uses.
+    DAG.ReplaceAllUsesOfValueWith(SDValue(Load, 1), C.Op0.getValue(1));
+  }
 
   // Make sure that the second operand is an i32 with the right value.
   if (C.Op1.getValueType() != MVT::i32 ||
@@ -2194,6 +2125,7 @@ static void adjustForTestUnderMask(SelectionDAG &DAG, const SDLoc &DL,
       NewC.Op0.getOpcode() == ISD::SHL &&
       isSimpleShift(NewC.Op0, ShiftVal) &&
       (MaskVal >> ShiftVal != 0) &&
+      ((CmpVal >> ShiftVal) << ShiftVal) == CmpVal &&
       (NewCCMask = getTestUnderMaskCond(BitSize, NewC.CCMask,
                                         MaskVal >> ShiftVal,
                                         CmpVal >> ShiftVal,
@@ -2204,6 +2136,7 @@ static void adjustForTestUnderMask(SelectionDAG &DAG, const SDLoc &DL,
              NewC.Op0.getOpcode() == ISD::SRL &&
              isSimpleShift(NewC.Op0, ShiftVal) &&
              (MaskVal << ShiftVal != 0) &&
+             ((CmpVal << ShiftVal) >> ShiftVal) == CmpVal &&
              (NewCCMask = getTestUnderMaskCond(BitSize, NewC.CCMask,
                                                MaskVal << ShiftVal,
                                                CmpVal << ShiftVal,
@@ -2226,6 +2159,24 @@ static void adjustForTestUnderMask(SelectionDAG &DAG, const SDLoc &DL,
     C.Op1 = DAG.getConstant(MaskVal, DL, C.Op0.getValueType());
   C.CCValid = SystemZ::CCMASK_TM;
   C.CCMask = NewCCMask;
+}
+
+// See whether the comparison argument contains a redundant AND
+// and remove it if so.  This sometimes happens due to the generic
+// BRCOND expansion.
+static void adjustForRedundantAnd(SelectionDAG &DAG, const SDLoc &DL,
+                                  Comparison &C) {
+  if (C.Op0.getOpcode() != ISD::AND)
+    return;
+  auto *Mask = dyn_cast<ConstantSDNode>(C.Op0.getOperand(1));
+  if (!Mask)
+    return;
+  KnownBits Known;
+  DAG.computeKnownBits(C.Op0.getOperand(0), Known);
+  if ((~Known.Zero).getZExtValue() & ~Mask->getZExtValue())
+    return;
+
+  C.Op0 = C.Op0.getOperand(0);
 }
 
 // Return a Comparison that tests the condition-code result of intrinsic
@@ -2302,6 +2253,7 @@ static Comparison getCmp(SelectionDAG &DAG, SDValue CmpOp0, SDValue CmpOp1,
     else
       C.ICmpType = SystemZICMP::SignedOnly;
     C.CCMask &= ~SystemZ::CCMASK_CMP_UO;
+    adjustForRedundantAnd(DAG, DL, C);
     adjustZeroCmp(DAG, DL, C);
     adjustSubwordCmp(DAG, DL, C);
     adjustForSubtraction(DAG, DL, C);
@@ -2379,24 +2331,11 @@ static void lowerGR128Binary(SelectionDAG &DAG, const SDLoc &DL, EVT VT,
 // in CCValid, so other values can be ignored.
 static SDValue emitSETCC(SelectionDAG &DAG, const SDLoc &DL, SDValue Glue,
                          unsigned CCValid, unsigned CCMask) {
-  IPMConversion Conversion = getIPMConversion(CCValid, CCMask);
-  SDValue Result = DAG.getNode(SystemZISD::IPM, DL, MVT::i32, Glue);
-
-  if (Conversion.XORValue)
-    Result = DAG.getNode(ISD::XOR, DL, MVT::i32, Result,
-                         DAG.getConstant(Conversion.XORValue, DL, MVT::i32));
-
-  if (Conversion.AddValue)
-    Result = DAG.getNode(ISD::ADD, DL, MVT::i32, Result,
-                         DAG.getConstant(Conversion.AddValue, DL, MVT::i32));
-
-  // The SHR/AND sequence should get optimized to an RISBG.
-  Result = DAG.getNode(ISD::SRL, DL, MVT::i32, Result,
-                       DAG.getConstant(Conversion.Bit, DL, MVT::i32));
-  if (Conversion.Bit != 31)
-    Result = DAG.getNode(ISD::AND, DL, MVT::i32, Result,
-                         DAG.getConstant(1, DL, MVT::i32));
-  return Result;
+  SDValue Ops[] = { DAG.getConstant(1, DL, MVT::i32),
+                    DAG.getConstant(0, DL, MVT::i32),
+                    DAG.getConstant(CCValid, DL, MVT::i32),
+                    DAG.getConstant(CCMask, DL, MVT::i32), Glue };
+  return DAG.getNode(SystemZISD::SELECT_CCMASK, DL, MVT::i32, Ops);
 }
 
 // Return the SystemISD vector comparison operation for CC, or 0 if it cannot
@@ -2611,35 +2550,10 @@ SDValue SystemZTargetLowering::lowerSELECT_CC(SDValue Op,
   }
 
   SDValue Glue = emitCmp(DAG, DL, C);
-
-  // Special case for handling -1/0 results.  The shifts we use here
-  // should get optimized with the IPM conversion sequence.
-  auto *TrueC = dyn_cast<ConstantSDNode>(TrueOp);
-  auto *FalseC = dyn_cast<ConstantSDNode>(FalseOp);
-  if (TrueC && FalseC) {
-    int64_t TrueVal = TrueC->getSExtValue();
-    int64_t FalseVal = FalseC->getSExtValue();
-    if ((TrueVal == -1 && FalseVal == 0) || (TrueVal == 0 && FalseVal == -1)) {
-      // Invert the condition if we want -1 on false.
-      if (TrueVal == 0)
-        C.CCMask ^= C.CCValid;
-      SDValue Result = emitSETCC(DAG, DL, Glue, C.CCValid, C.CCMask);
-      EVT VT = Op.getValueType();
-      // Extend the result to VT.  Upper bits are ignored.
-      if (!is32Bit(VT))
-        Result = DAG.getNode(ISD::ANY_EXTEND, DL, VT, Result);
-      // Sign-extend from the low bit.
-      SDValue ShAmt = DAG.getConstant(VT.getSizeInBits() - 1, DL, MVT::i32);
-      SDValue Shl = DAG.getNode(ISD::SHL, DL, VT, Result, ShAmt);
-      return DAG.getNode(ISD::SRA, DL, VT, Shl, ShAmt);
-    }
-  }
-
   SDValue Ops[] = {TrueOp, FalseOp, DAG.getConstant(C.CCValid, DL, MVT::i32),
                    DAG.getConstant(C.CCMask, DL, MVT::i32), Glue};
 
-  SDVTList VTs = DAG.getVTList(Op.getValueType(), MVT::Glue);
-  return DAG.getNode(SystemZISD::SELECT_CCMASK, DL, VTs, Ops);
+  return DAG.getNode(SystemZISD::SELECT_CCMASK, DL, Op.getValueType(), Ops);
 }
 
 SDValue SystemZTargetLowering::lowerGlobalAddress(GlobalAddressSDNode *Node,
@@ -2936,9 +2850,13 @@ SDValue SystemZTargetLowering::lowerBITCAST(SDValue Op,
   // but we need this case for bitcasts that are created during lowering
   // and which are then lowered themselves.
   if (auto *LoadN = dyn_cast<LoadSDNode>(In))
-    if (ISD::isNormalLoad(LoadN))
-      return DAG.getLoad(ResVT, DL, LoadN->getChain(), LoadN->getBasePtr(),
-                         LoadN->getMemOperand());
+    if (ISD::isNormalLoad(LoadN)) {
+      SDValue NewLoad = DAG.getLoad(ResVT, DL, LoadN->getChain(),
+                                    LoadN->getBasePtr(), LoadN->getMemOperand());
+      // Update the chain uses.
+      DAG.ReplaceAllUsesOfValueWith(SDValue(LoadN, 1), NewLoad.getValue(1));
+      return NewLoad;
+    }
 
   if (InVT == MVT::i32 && ResVT == MVT::f32) {
     SDValue In64;
@@ -3026,8 +2944,8 @@ SDValue SystemZTargetLowering::
 lowerDYNAMIC_STACKALLOC(SDValue Op, SelectionDAG &DAG) const {
   const TargetFrameLowering *TFI = Subtarget.getFrameLowering();
   MachineFunction &MF = DAG.getMachineFunction();
-  bool RealignOpt = !MF.getFunction()-> hasFnAttribute("no-realign-stack");
-  bool StoreBackchain = MF.getFunction()->hasFnAttribute("backchain");
+  bool RealignOpt = !MF.getFunction().hasFnAttribute("no-realign-stack");
+  bool StoreBackchain = MF.getFunction().hasFnAttribute("backchain");
 
   SDValue Chain = Op.getOperand(0);
   SDValue Size  = Op.getOperand(1);
@@ -3483,25 +3401,38 @@ SDValue SystemZTargetLowering::lowerATOMIC_LOAD_SUB(SDValue Op,
   return lowerATOMIC_LOAD_OP(Op, DAG, SystemZISD::ATOMIC_LOADW_SUB);
 }
 
-// Node is an 8- or 16-bit ATOMIC_CMP_SWAP operation.  Lower the first two
-// into a fullword ATOMIC_CMP_SWAPW operation.
+// Lower 8/16/32/64-bit ATOMIC_CMP_SWAP_WITH_SUCCESS node.
 SDValue SystemZTargetLowering::lowerATOMIC_CMP_SWAP(SDValue Op,
                                                     SelectionDAG &DAG) const {
   auto *Node = cast<AtomicSDNode>(Op.getNode());
-
-  // We have native support for 32-bit compare and swap.
-  EVT NarrowVT = Node->getMemoryVT();
-  EVT WideVT = MVT::i32;
-  if (NarrowVT == WideVT)
-    return Op;
-
-  int64_t BitSize = NarrowVT.getSizeInBits();
   SDValue ChainIn = Node->getOperand(0);
   SDValue Addr = Node->getOperand(1);
   SDValue CmpVal = Node->getOperand(2);
   SDValue SwapVal = Node->getOperand(3);
   MachineMemOperand *MMO = Node->getMemOperand();
   SDLoc DL(Node);
+
+  // We have native support for 32-bit and 64-bit compare and swap, but we
+  // still need to expand extracting the "success" result from the CC.
+  EVT NarrowVT = Node->getMemoryVT();
+  EVT WideVT = NarrowVT == MVT::i64 ? MVT::i64 : MVT::i32;
+  if (NarrowVT == WideVT) {
+    SDVTList Tys = DAG.getVTList(WideVT, MVT::Other, MVT::Glue);
+    SDValue Ops[] = { ChainIn, Addr, CmpVal, SwapVal };
+    SDValue AtomicOp = DAG.getMemIntrinsicNode(SystemZISD::ATOMIC_CMP_SWAP,
+                                               DL, Tys, Ops, NarrowVT, MMO);
+    SDValue Success = emitSETCC(DAG, DL, AtomicOp.getValue(2),
+                                SystemZ::CCMASK_CS, SystemZ::CCMASK_CS_EQ);
+
+    DAG.ReplaceAllUsesOfValueWith(Op.getValue(0), AtomicOp.getValue(0));
+    DAG.ReplaceAllUsesOfValueWith(Op.getValue(1), Success);
+    DAG.ReplaceAllUsesOfValueWith(Op.getValue(2), AtomicOp.getValue(1));
+    return SDValue();
+  }
+
+  // Convert 8-bit and 16-bit compare and swap to a loop, implemented
+  // via a fullword ATOMIC_CMP_SWAPW operation.
+  int64_t BitSize = NarrowVT.getSizeInBits();
   EVT PtrVT = Addr.getValueType();
 
   // Get the address of the containing word.
@@ -3520,12 +3451,18 @@ SDValue SystemZTargetLowering::lowerATOMIC_CMP_SWAP(SDValue Op,
                                     DAG.getConstant(0, DL, WideVT), BitShift);
 
   // Construct the ATOMIC_CMP_SWAPW node.
-  SDVTList VTList = DAG.getVTList(WideVT, MVT::Other);
+  SDVTList VTList = DAG.getVTList(WideVT, MVT::Other, MVT::Glue);
   SDValue Ops[] = { ChainIn, AlignedAddr, CmpVal, SwapVal, BitShift,
                     NegBitShift, DAG.getConstant(BitSize, DL, WideVT) };
   SDValue AtomicOp = DAG.getMemIntrinsicNode(SystemZISD::ATOMIC_CMP_SWAPW, DL,
                                              VTList, Ops, NarrowVT, MMO);
-  return AtomicOp;
+  SDValue Success = emitSETCC(DAG, DL, AtomicOp.getValue(2),
+                              SystemZ::CCMASK_ICMP, SystemZ::CCMASK_CMP_EQ);
+
+  DAG.ReplaceAllUsesOfValueWith(Op.getValue(0), AtomicOp.getValue(0));
+  DAG.ReplaceAllUsesOfValueWith(Op.getValue(1), Success);
+  DAG.ReplaceAllUsesOfValueWith(Op.getValue(2), AtomicOp.getValue(1));
+  return SDValue();
 }
 
 SDValue SystemZTargetLowering::lowerSTACKSAVE(SDValue Op,
@@ -3540,7 +3477,7 @@ SDValue SystemZTargetLowering::lowerSTACKRESTORE(SDValue Op,
                                                  SelectionDAG &DAG) const {
   MachineFunction &MF = DAG.getMachineFunction();
   MF.getInfo<SystemZMachineFunctionInfo>()->setManipulatesSP(true);
-  bool StoreBackchain = MF.getFunction()->hasFnAttribute("backchain");
+  bool StoreBackchain = MF.getFunction().hasFnAttribute("backchain");
 
   SDValue Chain = Op.getOperand(0);
   SDValue NewSP = Op.getOperand(1);
@@ -4753,7 +4690,7 @@ SDValue SystemZTargetLowering::LowerOperation(SDValue Op,
     return lowerATOMIC_LOAD_OP(Op, DAG, SystemZISD::ATOMIC_LOADW_UMIN);
   case ISD::ATOMIC_LOAD_UMAX:
     return lowerATOMIC_LOAD_OP(Op, DAG, SystemZISD::ATOMIC_LOADW_UMAX);
-  case ISD::ATOMIC_CMP_SWAP:
+  case ISD::ATOMIC_CMP_SWAP_WITH_SUCCESS:
     return lowerATOMIC_CMP_SWAP(Op, DAG);
   case ISD::STACKSAVE:
     return lowerSTACKSAVE(Op, DAG);
@@ -4847,16 +4784,20 @@ SystemZTargetLowering::LowerOperationWrapper(SDNode *N,
     Results.push_back(Res);
     break;
   }
-  case ISD::ATOMIC_CMP_SWAP: {
+  case ISD::ATOMIC_CMP_SWAP_WITH_SUCCESS: {
     SDLoc DL(N);
-    SDVTList Tys = DAG.getVTList(MVT::Untyped, MVT::Other);
+    SDVTList Tys = DAG.getVTList(MVT::Untyped, MVT::Other, MVT::Glue);
     SDValue Ops[] = { N->getOperand(0), N->getOperand(1),
                       lowerI128ToGR128(DAG, N->getOperand(2)),
                       lowerI128ToGR128(DAG, N->getOperand(3)) };
     MachineMemOperand *MMO = cast<AtomicSDNode>(N)->getMemOperand();
     SDValue Res = DAG.getMemIntrinsicNode(SystemZISD::ATOMIC_CMP_SWAP_128,
                                           DL, Tys, Ops, MVT::i128, MMO);
+    SDValue Success = emitSETCC(DAG, DL, Res.getValue(2),
+                                SystemZ::CCMASK_CS, SystemZ::CCMASK_CS_EQ);
+    Success = DAG.getZExtOrTrunc(Success, DL, N->getValueType(1));
     Results.push_back(lowerGR128ToI128(DAG, Res));
+    Results.push_back(Success);
     Results.push_back(Res.getValue(1));
     break;
   }
@@ -4972,6 +4913,7 @@ const char *SystemZTargetLowering::getTargetNodeName(unsigned Opcode) const {
     OPCODE(ATOMIC_LOADW_UMIN);
     OPCODE(ATOMIC_LOADW_UMAX);
     OPCODE(ATOMIC_CMP_SWAPW);
+    OPCODE(ATOMIC_CMP_SWAP);
     OPCODE(ATOMIC_LOAD_128);
     OPCODE(ATOMIC_STORE_128);
     OPCODE(ATOMIC_CMP_SWAP_128);
@@ -5133,6 +5075,54 @@ SDValue SystemZTargetLowering::combineTruncateExtract(
         }
       }
     }
+  }
+  return SDValue();
+}
+
+SDValue SystemZTargetLowering::combineZERO_EXTEND(
+    SDNode *N, DAGCombinerInfo &DCI) const {
+  // Convert (zext (select_ccmask C1, C2)) into (select_ccmask C1', C2')
+  SelectionDAG &DAG = DCI.DAG;
+  SDValue N0 = N->getOperand(0);
+  EVT VT = N->getValueType(0);
+  if (N0.getOpcode() == SystemZISD::SELECT_CCMASK) {
+    auto *TrueOp = dyn_cast<ConstantSDNode>(N0.getOperand(0));
+    auto *FalseOp = dyn_cast<ConstantSDNode>(N0.getOperand(1));
+    if (TrueOp && FalseOp) {
+      SDLoc DL(N0);
+      SDValue Ops[] = { DAG.getConstant(TrueOp->getZExtValue(), DL, VT),
+                        DAG.getConstant(FalseOp->getZExtValue(), DL, VT),
+                        N0.getOperand(2), N0.getOperand(3), N0.getOperand(4) };
+      SDValue NewSelect = DAG.getNode(SystemZISD::SELECT_CCMASK, DL, VT, Ops);
+      // If N0 has multiple uses, change other uses as well.
+      if (!N0.hasOneUse()) {
+        SDValue TruncSelect =
+          DAG.getNode(ISD::TRUNCATE, DL, N0.getValueType(), NewSelect);
+        DCI.CombineTo(N0.getNode(), TruncSelect);
+      }
+      return NewSelect;
+    }
+  }
+  return SDValue();
+}
+
+SDValue SystemZTargetLowering::combineSIGN_EXTEND_INREG(
+    SDNode *N, DAGCombinerInfo &DCI) const {
+  // Convert (sext_in_reg (setcc LHS, RHS, COND), i1)
+  // and (sext_in_reg (any_extend (setcc LHS, RHS, COND)), i1)
+  // into (select_cc LHS, RHS, -1, 0, COND)
+  SelectionDAG &DAG = DCI.DAG;
+  SDValue N0 = N->getOperand(0);
+  EVT VT = N->getValueType(0);
+  EVT EVT = cast<VTSDNode>(N->getOperand(1))->getVT();
+  if (N0.hasOneUse() && N0.getOpcode() == ISD::ANY_EXTEND)
+    N0 = N0.getOperand(0);
+  if (EVT == MVT::i1 && N0.hasOneUse() && N0.getOpcode() == ISD::SETCC) {
+    SDLoc DL(N0);
+    SDValue Ops[] = { N0.getOperand(0), N0.getOperand(1),
+                      DAG.getConstant(-1, DL, VT), DAG.getConstant(0, DL, VT),
+                      N0.getOperand(2) };
+    return DAG.getNode(ISD::SELECT_CC, DL, VT, Ops);
   }
   return SDValue();
 }
@@ -5438,11 +5428,135 @@ SDValue SystemZTargetLowering::combineSHIFTROT(
   return SDValue();
 }
 
+static bool combineCCMask(SDValue &Glue, int &CCValid, int &CCMask) {
+  // We have a SELECT_CCMASK or BR_CCMASK comparing the condition code
+  // set by the glued instruction using the CCValid / CCMask masks,
+  // If the glued instruction is itself a (ICMP (SELECT_CCMASK)) testing
+  // the condition code set by some other instruction, see whether we
+  // can directly use that condition code.
+  bool Invert = false;
+
+  // Verify that we have an appropriate mask for a EQ or NE comparison.
+  if (CCValid != SystemZ::CCMASK_ICMP)
+    return false;
+  if (CCMask == SystemZ::CCMASK_CMP_NE)
+    Invert = !Invert;
+  else if (CCMask != SystemZ::CCMASK_CMP_EQ)
+    return false;
+
+  // Verify that we have an ICMP that is the single user of a SELECT_CCMASK.
+  SDNode *ICmp = Glue.getNode();
+  if (ICmp->getOpcode() != SystemZISD::ICMP)
+    return false;
+  SDNode *Select = ICmp->getOperand(0).getNode();
+  if (Select->getOpcode() != SystemZISD::SELECT_CCMASK)
+    return false;
+  if (!Select->hasOneUse())
+    return false;
+
+  // Verify that the ICMP compares against one of select values.
+  auto *CompareVal = dyn_cast<ConstantSDNode>(ICmp->getOperand(1));
+  if (!CompareVal)
+    return false;
+  auto *TrueVal = dyn_cast<ConstantSDNode>(Select->getOperand(0));
+  if (!TrueVal)
+    return false;
+  auto *FalseVal = dyn_cast<ConstantSDNode>(Select->getOperand(1));
+  if (!FalseVal)
+    return false;
+  if (CompareVal->getZExtValue() == FalseVal->getZExtValue())
+    Invert = !Invert;
+  else if (CompareVal->getZExtValue() != TrueVal->getZExtValue())
+    return false;
+
+  // Compute the effective CC mask for the new branch or select.
+  auto *NewCCValid = dyn_cast<ConstantSDNode>(Select->getOperand(2));
+  auto *NewCCMask = dyn_cast<ConstantSDNode>(Select->getOperand(3));
+  if (!NewCCValid || !NewCCMask)
+    return false;
+  CCValid = NewCCValid->getZExtValue();
+  CCMask = NewCCMask->getZExtValue();
+  if (Invert)
+    CCMask ^= CCValid;
+
+  // Return the updated Glue link.
+  Glue = Select->getOperand(4);
+  return true;
+}
+
+static bool combineMergeChains(SDValue &Chain, SDValue Glue) {
+  // We are about to glue an instruction with input chain Chain to the
+  // instruction Glue.  Verify that this would not create an invalid
+  // topological sort due to intervening chain nodes.
+
+  SDNode *Node = Glue.getNode();
+  for (int ResNo = Node->getNumValues() - 1; ResNo >= 0; --ResNo)
+    if (Node->getValueType(ResNo) == MVT::Other) {
+      SDValue OutChain = SDValue(Node, ResNo);
+      // FIXME: We should be able to at least handle an intervening
+      // TokenFactor node by swapping chains around a bit ...
+      return Chain == OutChain;
+    }
+
+  return true;
+}
+
+SDValue SystemZTargetLowering::combineBR_CCMASK(
+    SDNode *N, DAGCombinerInfo &DCI) const {
+  SelectionDAG &DAG = DCI.DAG;
+
+  // Combine BR_CCMASK (ICMP (SELECT_CCMASK)) into a single BR_CCMASK.
+  auto *CCValid = dyn_cast<ConstantSDNode>(N->getOperand(1));
+  auto *CCMask = dyn_cast<ConstantSDNode>(N->getOperand(2));
+  if (!CCValid || !CCMask)
+    return SDValue();
+
+  int CCValidVal = CCValid->getZExtValue();
+  int CCMaskVal = CCMask->getZExtValue();
+  SDValue Chain = N->getOperand(0);
+  SDValue Glue = N->getOperand(4);
+
+  if (combineCCMask(Glue, CCValidVal, CCMaskVal)
+      && combineMergeChains(Chain, Glue))
+    return DAG.getNode(SystemZISD::BR_CCMASK, SDLoc(N), N->getValueType(0),
+                       Chain,
+                       DAG.getConstant(CCValidVal, SDLoc(N), MVT::i32),
+                       DAG.getConstant(CCMaskVal, SDLoc(N), MVT::i32),
+                       N->getOperand(3), Glue);
+  return SDValue();
+}
+
+SDValue SystemZTargetLowering::combineSELECT_CCMASK(
+    SDNode *N, DAGCombinerInfo &DCI) const {
+  SelectionDAG &DAG = DCI.DAG;
+
+  // Combine SELECT_CCMASK (ICMP (SELECT_CCMASK)) into a single SELECT_CCMASK.
+  auto *CCValid = dyn_cast<ConstantSDNode>(N->getOperand(2));
+  auto *CCMask = dyn_cast<ConstantSDNode>(N->getOperand(3));
+  if (!CCValid || !CCMask)
+    return SDValue();
+
+  int CCValidVal = CCValid->getZExtValue();
+  int CCMaskVal = CCMask->getZExtValue();
+  SDValue Glue = N->getOperand(4);
+
+  if (combineCCMask(Glue, CCValidVal, CCMaskVal))
+    return DAG.getNode(SystemZISD::SELECT_CCMASK, SDLoc(N), N->getValueType(0),
+                       N->getOperand(0),
+                       N->getOperand(1),
+                       DAG.getConstant(CCValidVal, SDLoc(N), MVT::i32),
+                       DAG.getConstant(CCMaskVal, SDLoc(N), MVT::i32),
+                       Glue);
+  return SDValue();
+}
+
 SDValue SystemZTargetLowering::PerformDAGCombine(SDNode *N,
                                                  DAGCombinerInfo &DCI) const {
   switch(N->getOpcode()) {
   default: break;
+  case ISD::ZERO_EXTEND:        return combineZERO_EXTEND(N, DCI);
   case ISD::SIGN_EXTEND:        return combineSIGN_EXTEND(N, DCI);
+  case ISD::SIGN_EXTEND_INREG:  return combineSIGN_EXTEND_INREG(N, DCI);
   case SystemZISD::MERGE_HIGH:
   case SystemZISD::MERGE_LOW:   return combineMERGE(N, DCI);
   case ISD::STORE:              return combineSTORE(N, DCI);
@@ -5454,9 +5568,35 @@ SDValue SystemZTargetLowering::PerformDAGCombine(SDNode *N,
   case ISD::SRA:
   case ISD::SRL:
   case ISD::ROTL:               return combineSHIFTROT(N, DCI);
+  case SystemZISD::BR_CCMASK:   return combineBR_CCMASK(N, DCI);
+  case SystemZISD::SELECT_CCMASK: return combineSELECT_CCMASK(N, DCI);
   }
 
   return SDValue();
+}
+
+void
+SystemZTargetLowering::computeKnownBitsForTargetNode(const SDValue Op,
+                                                     KnownBits &Known,
+                                                     const APInt &DemandedElts,
+                                                     const SelectionDAG &DAG,
+                                                     unsigned Depth) const {
+  unsigned BitWidth = Known.getBitWidth();
+
+  Known.resetAll();
+  switch (Op.getOpcode()) {
+  case SystemZISD::SELECT_CCMASK: {
+    KnownBits TrueKnown(BitWidth), FalseKnown(BitWidth);
+    DAG.computeKnownBits(Op.getOperand(0), TrueKnown, Depth + 1);
+    DAG.computeKnownBits(Op.getOperand(1), FalseKnown, Depth + 1);
+    Known.Zero = TrueKnown.Zero & FalseKnown.Zero;
+    Known.One = TrueKnown.One & FalseKnown.One;
+    break;
+  }
+
+  default:
+    break;
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -5998,6 +6138,12 @@ SystemZTargetLowering::emitAtomicCmpSwapW(MachineInstr &MI,
     .addImm(SystemZ::CCMASK_CS).addImm(SystemZ::CCMASK_CS_NE).addMBB(LoopMBB);
   MBB->addSuccessor(LoopMBB);
   MBB->addSuccessor(DoneMBB);
+
+  // If the CC def wasn't dead in the ATOMIC_CMP_SWAPW, mark CC as live-in
+  // to the block after the loop.  At this point, CC may have been defined
+  // either by the CR in LoopMBB or by the CS in SetMBB.
+  if (!MI.registerDefIsDead(SystemZ::CC))
+    DoneMBB->addLiveIn(SystemZ::CC);
 
   MI.eraseFromParent();
   return DoneMBB;

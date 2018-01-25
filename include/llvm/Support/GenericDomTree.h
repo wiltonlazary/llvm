@@ -234,7 +234,7 @@ void ApplyUpdates(DomTreeT &DT,
                   ArrayRef<typename DomTreeT::UpdateType> Updates);
 
 template <typename DomTreeT>
-bool Verify(const DomTreeT &DT);
+bool Verify(const DomTreeT &DT, typename DomTreeT::VerificationLevel VL);
 }  // namespace DomTreeBuilder
 
 /// \brief Core dominator tree base class.
@@ -259,7 +259,9 @@ class DominatorTreeBase {
   static constexpr UpdateKind Insert = UpdateKind::Insert;
   static constexpr UpdateKind Delete = UpdateKind::Delete;
 
- protected:
+  enum class VerificationLevel { Fast, Basic, Full };
+
+protected:
   // Dominators always have a single root, postdominators can have more.
   SmallVector<NodeT *, IsPostDom ? 4 : 1> Roots;
 
@@ -315,6 +317,12 @@ class DominatorTreeBase {
   /// dominator tree base. Otherwise return true.
   bool compare(const DominatorTreeBase &Other) const {
     if (Parent != Other.Parent) return true;
+
+    if (Roots.size() != Other.Roots.size())
+      return false;
+
+    if (!std::is_permutation(Roots.begin(), Roots.end(), Other.Roots.begin()))
+      return false;
 
     const DomTreeNodeMapType &OtherDomTreeNodes = Other.DomTreeNodes;
     if (DomTreeNodes.size() != OtherDomTreeNodes.size())
@@ -522,7 +530,9 @@ class DominatorTreeBase {
   ///
   /// Batch updates should be generally faster when performing longer sequences
   /// of updates than calling insertEdge/deleteEdge manually multiple times, as
-  /// they can reorder the updates and remove redundant ones internally.
+  /// it can reorder the updates and remove redundant ones internally.
+  /// The batch updater is also able to detect sequences of zero and exactly one
+  /// update -- it's optimized to do less work in these cases.
   ///
   /// Note that for postdominators it automatically takes care of applying
   /// updates on reverse edges internally (so there's no need to swap the
@@ -637,11 +647,12 @@ class DominatorTreeBase {
     assert(Node && "Removing node that isn't in dominator tree.");
     assert(Node->getChildren().empty() && "Node is not a leaf node.");
 
+    DFSInfoValid = false;
+
     // Remove node from immediate dominator's children list.
     DomTreeNodeBase<NodeT> *IDom = Node->getIDom();
     if (IDom) {
-      typename std::vector<DomTreeNodeBase<NodeT> *>::iterator I =
-          find(IDom->Children, Node);
+      const auto I = find(IDom->Children, Node);
       assert(I != IDom->Children.end() &&
              "Not in immediate dominator children set!");
       // I am no longer your child...
@@ -702,28 +713,25 @@ public:
       return;
     }
 
-    unsigned DFSNum = 0;
-
     SmallVector<std::pair<const DomTreeNodeBase<NodeT> *,
                           typename DomTreeNodeBase<NodeT>::const_iterator>,
                 32> WorkStack;
 
     const DomTreeNodeBase<NodeT> *ThisRoot = getRootNode();
-
+    assert((!Parent || ThisRoot) && "Empty constructed DomTree");
     if (!ThisRoot)
       return;
 
-    // Even in the case of multiple exits that form the post dominator root
-    // nodes, do not iterate over all exits, but start from the virtual root
-    // node. Otherwise bbs, that are not post dominated by any exit but by the
-    // virtual root node, will never be assigned a DFS number.
-    WorkStack.push_back(std::make_pair(ThisRoot, ThisRoot->begin()));
+    // Both dominators and postdominators have a single root node. In the case
+    // case of PostDominatorTree, this node is a virtual root.
+    WorkStack.push_back({ThisRoot, ThisRoot->begin()});
+
+    unsigned DFSNum = 0;
     ThisRoot->DFSNumIn = DFSNum++;
 
     while (!WorkStack.empty()) {
       const DomTreeNodeBase<NodeT> *Node = WorkStack.back().first;
-      typename DomTreeNodeBase<NodeT>::const_iterator ChildIt =
-          WorkStack.back().second;
+      const auto ChildIt = WorkStack.back().second;
 
       // If we visited all of the children of this node, "recurse" back up the
       // stack setting the DFOutNum.
@@ -735,7 +743,7 @@ public:
         const DomTreeNodeBase<NodeT> *Child = *ChildIt;
         ++WorkStack.back().second;
 
-        WorkStack.push_back(std::make_pair(Child, Child->begin()));
+        WorkStack.push_back({Child, Child->begin()});
         Child->DFSNumIn = DFSNum++;
       }
     }
@@ -750,10 +758,25 @@ public:
     DomTreeBuilder::Calculate(*this);
   }
 
-  /// verify - check parent and sibling property
-  bool verify() const { return DomTreeBuilder::Verify(*this); }
+  /// verify - checks if the tree is correct. There are 3 level of verification:
+  ///  - Full --  verifies if the tree is correct by making sure all the
+  ///             properties (including the parent and the sibling property)
+  ///             hold.
+  ///             Takes O(N^3) time.
+  ///
+  ///  - Basic -- checks if the tree is correct, but compares it to a freshly
+  ///             constructed tree instead of checking the sibling property.
+  ///             Takes O(N^2) time.
+  ///
+  ///  - Fast  -- checks basic tree structure and compares it with a freshly
+  ///             constructed tree.
+  ///             Takes O(N^2) time worst case, but is faster in practise (same
+  ///             as tree construction).
+  bool verify(VerificationLevel VL = VerificationLevel::Full) const {
+    return DomTreeBuilder::Verify(*this, VL);
+  }
 
- protected:
+protected:
   void addRoot(NodeT *BB) { this->Roots.push_back(BB); }
 
   void reset() {

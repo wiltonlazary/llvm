@@ -16,32 +16,55 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Scalar/DeadStoreElimination.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/CaptureTracking.h"
 #include "llvm/Analysis/GlobalsModRef.h"
 #include "llvm/Analysis/MemoryBuiltins.h"
 #include "llvm/Analysis/MemoryDependenceAnalysis.h"
+#include "llvm/Analysis/MemoryLocation.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/Argument.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/CallSite.h"
+#include "llvm/IR/Constant.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
-#include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/InstrTypes.h"
+#include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/PassManager.h"
+#include "llvm/IR/Value.h"
 #include "llvm/Pass.h"
+#include "llvm/Support/Casting.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include <algorithm>
+#include <cassert>
+#include <cstdint>
+#include <cstddef>
+#include <iterator>
 #include <map>
+#include <utility>
+
 using namespace llvm;
 
 #define DEBUG_TYPE "dse"
@@ -62,12 +85,11 @@ EnablePartialStoreMerging("enable-dse-partial-store-merging",
   cl::init(true), cl::Hidden,
   cl::desc("Enable partial store merging in DSE"));
 
-
 //===----------------------------------------------------------------------===//
 // Helper functions
 //===----------------------------------------------------------------------===//
-typedef std::map<int64_t, int64_t> OverlapIntervalsTy;
-typedef DenseMap<Instruction *, OverlapIntervalsTy> InstOverlapIntervalsTy;
+using OverlapIntervalsTy = std::map<int64_t, int64_t>;
+using InstOverlapIntervalsTy = DenseMap<Instruction *, OverlapIntervalsTy>;
 
 /// Delete this instruction.  Before we do, go through and zero out all the
 /// operands of this instruction.  If any of them become dead, delete them and
@@ -124,7 +146,8 @@ deleteDeadInstruction(Instruction *I, BasicBlock::iterator *BBI,
 
 /// Does this instruction write some memory?  This only returns true for things
 /// that we can analyze with other helpers below.
-static bool hasMemoryWrite(Instruction *I, const TargetLibraryInfo &TLI) {
+static bool hasAnalyzableMemoryWrite(Instruction *I,
+                                     const TargetLibraryInfo &TLI) {
   if (isa<StoreInst>(I))
     return true;
   if (IntrinsicInst *II = dyn_cast<IntrinsicInst>(I)) {
@@ -158,7 +181,8 @@ static bool hasMemoryWrite(Instruction *I, const TargetLibraryInfo &TLI) {
 /// Return a Location stored to by the specified instruction. If isRemovable
 /// returns true, this function and getLocForRead completely describe the memory
 /// operations for this instruction.
-static MemoryLocation getLocForWrite(Instruction *Inst, AliasAnalysis &AA) {
+static MemoryLocation getLocForWrite(Instruction *Inst) {
+  
   if (StoreInst *SI = dyn_cast<StoreInst>(Inst))
     return MemoryLocation::get(SI);
 
@@ -168,29 +192,30 @@ static MemoryLocation getLocForWrite(Instruction *Inst, AliasAnalysis &AA) {
     return Loc;
   }
 
-  IntrinsicInst *II = dyn_cast<IntrinsicInst>(Inst);
-  if (!II)
-    return MemoryLocation();
-
-  switch (II->getIntrinsicID()) {
-  default:
-    return MemoryLocation(); // Unhandled intrinsic.
-  case Intrinsic::init_trampoline:
-    // FIXME: We don't know the size of the trampoline, so we can't really
-    // handle it here.
-    return MemoryLocation(II->getArgOperand(0));
-  case Intrinsic::lifetime_end: {
-    uint64_t Len = cast<ConstantInt>(II->getArgOperand(0))->getZExtValue();
-    return MemoryLocation(II->getArgOperand(1), Len);
+  if (IntrinsicInst *II = dyn_cast<IntrinsicInst>(Inst)) {
+    switch (II->getIntrinsicID()) {
+    default:
+      return MemoryLocation(); // Unhandled intrinsic.
+    case Intrinsic::init_trampoline:
+      return MemoryLocation(II->getArgOperand(0));
+    case Intrinsic::lifetime_end: {
+      uint64_t Len = cast<ConstantInt>(II->getArgOperand(0))->getZExtValue();
+      return MemoryLocation(II->getArgOperand(1), Len);
+    }
+    }
   }
-  }
+  if (auto CS = CallSite(Inst))
+    // All the supported TLI functions so far happen to have dest as their
+    // first argument.
+    return MemoryLocation(CS.getArgument(0));
+  return MemoryLocation();
 }
 
-/// Return the location read by the specified "hasMemoryWrite" instruction if
-/// any.
+/// Return the location read by the specified "hasAnalyzableMemoryWrite"
+/// instruction if any.
 static MemoryLocation getLocForRead(Instruction *Inst,
                                     const TargetLibraryInfo &TLI) {
-  assert(hasMemoryWrite(Inst, TLI) && "Unknown instruction case");
+  assert(hasAnalyzableMemoryWrite(Inst, TLI) && "Unknown instruction case");
 
   // The only instructions that both read and write are the mem transfer
   // instructions (memcpy/memmove).
@@ -208,7 +233,7 @@ static bool isRemovable(Instruction *I) {
 
   if (IntrinsicInst *II = dyn_cast<IntrinsicInst>(I)) {
     switch (II->getIntrinsicID()) {
-    default: llvm_unreachable("doesn't pass 'hasMemoryWrite' predicate");
+    default: llvm_unreachable("doesn't pass 'hasAnalyzableMemoryWrite' predicate");
     case Intrinsic::lifetime_end:
       // Never remove dead lifetime_end's, e.g. because it is followed by a
       // free.
@@ -216,7 +241,6 @@ static bool isRemovable(Instruction *I) {
     case Intrinsic::init_trampoline:
       // Always safe to remove init_trampoline.
       return true;
-
     case Intrinsic::memset:
     case Intrinsic::memmove:
     case Intrinsic::memcpy:
@@ -225,12 +249,12 @@ static bool isRemovable(Instruction *I) {
     }
   }
 
+  // note: only get here for calls with analyzable writes - i.e. libcalls
   if (auto CS = CallSite(I))
     return CS.getInstruction()->use_empty();
 
   return false;
 }
-
 
 /// Returns true if the end of this instruction can be safely shortened in
 /// length.
@@ -266,23 +290,12 @@ static bool isShortenableAtTheBeginning(Instruction *I) {
 
 /// Return the pointer that is being written to.
 static Value *getStoredPointerOperand(Instruction *I) {
-  if (StoreInst *SI = dyn_cast<StoreInst>(I))
-    return SI->getPointerOperand();
-  if (MemIntrinsic *MI = dyn_cast<MemIntrinsic>(I))
-    return MI->getDest();
-
-  if (IntrinsicInst *II = dyn_cast<IntrinsicInst>(I)) {
-    switch (II->getIntrinsicID()) {
-    default: llvm_unreachable("Unexpected intrinsic!");
-    case Intrinsic::init_trampoline:
-      return II->getArgOperand(0);
-    }
-  }
-
-  CallSite CS(I);
-  // All the supported functions so far happen to have dest as their first
-  // argument.
-  return CS.getArgument(0);
+  //TODO: factor this to reuse getLocForWrite
+  MemoryLocation Loc = getLocForWrite(I);
+  assert(Loc.Ptr &&
+         "unable to find pointer writen for analyzable instruction?");
+  // TODO: most APIs don't expect const Value *
+  return const_cast<Value*>(Loc.Ptr);
 }
 
 static uint64_t getPointerSize(const Value *V, const DataLayout &DL,
@@ -294,6 +307,7 @@ static uint64_t getPointerSize(const Value *V, const DataLayout &DL,
 }
 
 namespace {
+
 enum OverwriteResult {
   OW_Begin,
   OW_Complete,
@@ -301,7 +315,8 @@ enum OverwriteResult {
   OW_PartialEarlierWithFullLater,
   OW_Unknown
 };
-}
+
+} // end anonymous namespace
 
 /// Return 'OW_Complete' if a store to the 'Later' location completely
 /// overwrites a store to the 'Earlier' location, 'OW_End' if the end of the
@@ -572,11 +587,9 @@ static bool memoryIsNotModifiedBetween(Instruction *FirstI,
     }
     for (; BI != EI; ++BI) {
       Instruction *I = &*BI;
-      if (I->mayWriteToMemory() && I != SecondI) {
-        auto Res = AA->getModRefInfo(I, MemLoc);
-        if (Res & MRI_Mod)
+      if (I->mayWriteToMemory() && I != SecondI)
+        if (isModSet(AA->getModRefInfo(I, MemLoc)))
           return false;
-      }
     }
     if (B != FirstBB) {
       assert(B != &FirstBB->getParent()->getEntryBlock() &&
@@ -630,7 +643,8 @@ static bool handleFree(CallInst *F, AliasAnalysis *AA,
         MD->getPointerDependencyFrom(Loc, false, InstPt->getIterator(), BB);
     while (Dep.isDef() || Dep.isClobber()) {
       Instruction *Dependency = Dep.getInst();
-      if (!hasMemoryWrite(Dependency, *TLI) || !isRemovable(Dependency))
+      if (!hasAnalyzableMemoryWrite(Dependency, *TLI) ||
+          !isRemovable(Dependency))
         break;
 
       Value *DepPointer =
@@ -734,7 +748,7 @@ static bool handleEndBlock(BasicBlock &BB, AliasAnalysis *AA,
     --BBI;
 
     // If we find a store, check to see if it points into a dead stack value.
-    if (hasMemoryWrite(&*BBI, *TLI) && isRemovable(&*BBI)) {
+    if (hasAnalyzableMemoryWrite(&*BBI, *TLI) && isRemovable(&*BBI)) {
       // See through pointer-to-pointer bitcasts
       SmallVector<Value *, 4> Pointers;
       GetUnderlyingObjects(getStoredPointerOperand(&*BBI), Pointers, DL);
@@ -800,9 +814,7 @@ static bool handleEndBlock(BasicBlock &BB, AliasAnalysis *AA,
       // the call is live.
       DeadStackObjects.remove_if([&](Value *I) {
         // See if the call site touches the value.
-        ModRefInfo A = AA->getModRefInfo(CS, I, getPointerSize(I, DL, *TLI));
-
-        return A == MRI_ModRef || A == MRI_Ref;
+        return isRefSet(AA->getModRefInfo(CS, I, getPointerSize(I, DL, *TLI)));
       });
 
       // If all of the allocas were clobbered by the call then we're not going
@@ -868,7 +880,7 @@ static bool tryToShorten(Instruction *EarlierWrite, int64_t &EarlierOffset,
   if (!IsOverwriteEnd)
     LaterOffset = int64_t(LaterOffset + LaterSize);
 
-  if (!(llvm::isPowerOf2_64(LaterOffset) && EarlierWriteAlign <= LaterOffset) &&
+  if (!(isPowerOf2_64(LaterOffset) && EarlierWriteAlign <= LaterOffset) &&
       !((EarlierWriteAlign != 0) && LaterOffset % EarlierWriteAlign == 0))
     return false;
 
@@ -948,7 +960,7 @@ static bool removePartiallyOverlappedStores(AliasAnalysis *AA,
   bool Changed = false;
   for (auto OI : IOL) {
     Instruction *EarlierWrite = OI.first;
-    MemoryLocation Loc = getLocForWrite(EarlierWrite, *AA);
+    MemoryLocation Loc = getLocForWrite(EarlierWrite);
     assert(isRemovable(EarlierWrite) && "Expect only removable instruction");
     assert(Loc.Size != MemoryLocation::UnknownSize && "Unexpected mem loc");
 
@@ -1049,7 +1061,7 @@ static bool eliminateDeadStores(BasicBlock &BB, AliasAnalysis *AA,
     }
 
     // Check to see if Inst writes to memory.  If not, continue.
-    if (!hasMemoryWrite(Inst, *TLI))
+    if (!hasAnalyzableMemoryWrite(Inst, *TLI))
       continue;
 
     // eliminateNoopStore will update in iterator, if necessary.
@@ -1067,7 +1079,7 @@ static bool eliminateDeadStores(BasicBlock &BB, AliasAnalysis *AA,
       continue;
 
     // Figure out what location is being stored to.
-    MemoryLocation Loc = getLocForWrite(Inst, *AA);
+    MemoryLocation Loc = getLocForWrite(Inst);
 
     // If we didn't get a useful location, fail.
     if (!Loc.Ptr)
@@ -1089,7 +1101,9 @@ static bool eliminateDeadStores(BasicBlock &BB, AliasAnalysis *AA,
       //
       // Find out what memory location the dependent instruction stores.
       Instruction *DepWrite = InstDep.getInst();
-      MemoryLocation DepLoc = getLocForWrite(DepWrite, *AA);
+      if (!hasAnalyzableMemoryWrite(DepWrite, *TLI))
+        break;
+      MemoryLocation DepLoc = getLocForWrite(DepWrite);
       // If we didn't get a useful location, or if it isn't a size, bail out.
       if (!DepLoc.Ptr)
         break;
@@ -1233,7 +1247,7 @@ static bool eliminateDeadStores(BasicBlock &BB, AliasAnalysis *AA,
       if (DepWrite == &BB.front()) break;
 
       // Can't look past this instruction if it might read 'Loc'.
-      if (AA->getModRefInfo(DepWrite, Loc) & MRI_Ref)
+      if (isRefSet(AA->getModRefInfo(DepWrite, Loc)))
         break;
 
       InstDep = MD->getPointerDependencyFrom(Loc, /*isLoad=*/ false,
@@ -1286,9 +1300,12 @@ PreservedAnalyses DSEPass::run(Function &F, FunctionAnalysisManager &AM) {
 }
 
 namespace {
+
 /// A legacy pass for the legacy pass manager that wraps \c DSEPass.
 class DSELegacyPass : public FunctionPass {
 public:
+  static char ID; // Pass identification, replacement for typeid
+
   DSELegacyPass() : FunctionPass(ID) {
     initializeDSELegacyPassPass(*PassRegistry::getPassRegistry());
   }
@@ -1317,12 +1334,12 @@ public:
     AU.addPreserved<GlobalsAAWrapperPass>();
     AU.addPreserved<MemoryDependenceWrapperPass>();
   }
-
-  static char ID; // Pass identification, replacement for typeid
 };
+
 } // end anonymous namespace
 
 char DSELegacyPass::ID = 0;
+
 INITIALIZE_PASS_BEGIN(DSELegacyPass, "dse", "Dead Store Elimination", false,
                       false)
 INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)

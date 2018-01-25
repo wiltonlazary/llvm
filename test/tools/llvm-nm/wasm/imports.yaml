@@ -6,7 +6,8 @@ FileHeader:
 Sections:
   - Type:            TYPE
     Signatures:
-      - ReturnType:      I32
+      - Index:           0
+        ReturnType:      I32
         ParamTypes:
           - I32
   - Type:            IMPORT
@@ -23,7 +24,6 @@ Sections:
   - Type:            CUSTOM
     Name:            "linking"
     DataSize:        0
-    DataAlignment:   0
 
 # CHECK:    U bar
 # CHECK:    U foo

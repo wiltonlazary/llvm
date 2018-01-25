@@ -13,6 +13,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "CoverageExporterJson.h"
 #include "CoverageFilters.h"
 #include "CoverageReport.h"
 #include "CoverageSummaryInfo.h"
@@ -32,10 +33,12 @@
 #include "llvm/Support/Process.h"
 #include "llvm/Support/Program.h"
 #include "llvm/Support/ScopedPrinter.h"
-#include "llvm/Support/Threading.h"
 #include "llvm/Support/ThreadPool.h"
+#include "llvm/Support/Threading.h"
 #include "llvm/Support/ToolOutputFile.h"
+
 #include <functional>
+#include <map>
 #include <system_error>
 
 using namespace llvm;
@@ -111,14 +114,14 @@ private:
 
   typedef llvm::function_ref<int(int, const char **)> CommandLineParserType;
 
-  int show(int argc, const char **argv,
-           CommandLineParserType commandLineParser);
-
-  int report(int argc, const char **argv,
+  int doShow(int argc, const char **argv,
              CommandLineParserType commandLineParser);
 
-  int export_(int argc, const char **argv,
-              CommandLineParserType commandLineParser);
+  int doReport(int argc, const char **argv,
+               CommandLineParserType commandLineParser);
+
+  int doExport(int argc, const char **argv,
+               CommandLineParserType commandLineParser);
 
   std::vector<StringRef> ObjectFilenames;
   CoverageViewOptions ViewOpts;
@@ -351,13 +354,14 @@ std::unique_ptr<CoverageMapping> CodeCoverageTool::load() {
   auto Coverage = std::move(CoverageOrErr.get());
   unsigned Mismatched = Coverage->getMismatchedCount();
   if (Mismatched) {
-    warning(utostr(Mismatched) + " functions have mismatched data");
+    warning(Twine(Mismatched) + " functions have mismatched data");
 
     if (ViewOpts.Debug) {
       for (const auto &HashMismatch : Coverage->getHashMismatches())
         errs() << "hash-mismatch: "
                << "No profile record found for '" << HashMismatch.first << "'"
-               << " with hash = 0x" << utohexstr(HashMismatch.second) << "\n";
+               << " with hash = 0x" << Twine::utohexstr(HashMismatch.second)
+               << '\n';
 
       for (const auto &CounterMismatch : Coverage->getCounterMismatches())
         errs() << "counter-mismatch: "
@@ -526,7 +530,8 @@ void CodeCoverageTool::writeSourceFileView(StringRef SourceFile,
   auto OS = std::move(OSOrErr.get());
 
   View->print(*OS.get(), /*Wholefile=*/true,
-              /*ShowSourceName=*/ShowFilenames);
+              /*ShowSourceName=*/ShowFilenames,
+              /*ShowTitle=*/ViewOpts.hasOutputDirectory());
   Printer->closeViewFile(std::move(OS));
 }
 
@@ -627,6 +632,16 @@ int CodeCoverageTool::run(Command Cmd, int argc, const char **argv) {
   cl::opt<bool> InstantiationSummary(
       "show-instantiation-summary", cl::Optional,
       cl::desc("Show instantiation statistics in summary table"));
+
+  cl::opt<bool> SummaryOnly(
+      "summary-only", cl::Optional,
+      cl::desc("Export only summary information for each source file"));
+
+  cl::opt<unsigned> NumThreads(
+      "num-threads", cl::init(0),
+      cl::desc("Number of merge threads to use (default: autodetect)"));
+  cl::alias NumThreadsA("j", cl::desc("Alias for --num-threads"),
+                        cl::aliasopt(NumThreads));
 
   auto commandLineParser = [&, this](int argc, const char **argv) -> int {
     cl::ParseCommandLineOptions(argc, argv, "LLVM code coverage tool\n");
@@ -740,23 +755,25 @@ int CodeCoverageTool::run(Command Cmd, int argc, const char **argv) {
 
     ViewOpts.ShowRegionSummary = RegionSummary;
     ViewOpts.ShowInstantiationSummary = InstantiationSummary;
+    ViewOpts.ExportSummaryOnly = SummaryOnly;
+    ViewOpts.NumThreads = NumThreads;
 
     return 0;
   };
 
   switch (Cmd) {
   case Show:
-    return show(argc, argv, commandLineParser);
+    return doShow(argc, argv, commandLineParser);
   case Report:
-    return report(argc, argv, commandLineParser);
+    return doReport(argc, argv, commandLineParser);
   case Export:
-    return export_(argc, argv, commandLineParser);
+    return doExport(argc, argv, commandLineParser);
   }
   return 0;
 }
 
-int CodeCoverageTool::show(int argc, const char **argv,
-                           CommandLineParserType commandLineParser) {
+int CodeCoverageTool::doShow(int argc, const char **argv,
+                             CommandLineParserType commandLineParser) {
 
   cl::OptionCategory ViewCategory("Viewing options");
 
@@ -799,12 +816,6 @@ int CodeCoverageTool::show(int argc, const char **argv,
       "project-title", cl::Optional,
       cl::desc("Set project title for the coverage report"));
 
-  cl::opt<unsigned> NumThreads(
-      "num-threads", cl::init(0),
-      cl::desc("Number of merge threads to use (default: autodetect)"));
-  cl::alias NumThreadsA("j", cl::desc("Alias for --num-threads"),
-                        cl::aliasopt(NumThreads));
-
   auto Err = commandLineParser(argc, argv);
   if (Err)
     return Err;
@@ -845,29 +856,54 @@ int CodeCoverageTool::show(int argc, const char **argv,
 
   auto Printer = CoveragePrinter::create(ViewOpts);
 
-  if (!Filters.empty()) {
-    auto OSOrErr = Printer->createViewFile("functions", /*InToplevel=*/true);
-    if (Error E = OSOrErr.takeError()) {
-      error("Could not create view file!", toString(std::move(E)));
+  if (SourceFiles.empty())
+    // Get the source files from the function coverage mapping.
+    for (StringRef Filename : Coverage->getUniqueSourceFiles())
+      SourceFiles.push_back(Filename);
+
+  // Create an index out of the source files.
+  if (ViewOpts.hasOutputDirectory()) {
+    if (Error E = Printer->createIndexFile(SourceFiles, *Coverage, Filters)) {
+      error("Could not create index file!", toString(std::move(E)));
       return 1;
     }
-    auto OS = std::move(OSOrErr.get());
+  }
 
-    // Show functions.
-    for (const auto &Function : Coverage->getCoveredFunctions()) {
-      if (!Filters.matches(*Coverage.get(), Function))
-        continue;
+  if (!Filters.empty()) {
+    // Build the map of filenames to functions.
+    std::map<llvm::StringRef, std::vector<const FunctionRecord *>>
+        FilenameFunctionMap;
+    for (const auto &SourceFile : SourceFiles)
+      for (const auto &Function : Coverage->getCoveredFunctions(SourceFile))
+        if (Filters.matches(*Coverage.get(), Function))
+          FilenameFunctionMap[SourceFile].push_back(&Function);
 
-      auto mainView = createFunctionView(Function, *Coverage);
-      if (!mainView) {
-        warning("Could not read coverage for '" + Function.Name + "'.");
-        continue;
+    // Only print filter matching functions for each file.
+    for (const auto &FileFunc : FilenameFunctionMap) {
+      StringRef File = FileFunc.first;
+      const auto &Functions = FileFunc.second;
+
+      auto OSOrErr = Printer->createViewFile(File, /*InToplevel=*/false);
+      if (Error E = OSOrErr.takeError()) {
+        error("Could not create view file!", toString(std::move(E)));
+        return 1;
+      }
+      auto OS = std::move(OSOrErr.get());
+
+      bool ShowTitle = ViewOpts.hasOutputDirectory();
+      for (const auto *Function : Functions) {
+        auto FunctionView = createFunctionView(*Function, *Coverage);
+        if (!FunctionView) {
+          warning("Could not read coverage for '" + Function->Name + "'.");
+          continue;
+        }
+        FunctionView->print(*OS.get(), /*WholeFile=*/false,
+                            /*ShowSourceName=*/true, ShowTitle);
+        ShowTitle = false;
       }
 
-      mainView->print(*OS.get(), /*WholeFile=*/false, /*ShowSourceName=*/true);
+      Printer->closeViewFile(std::move(OS));
     }
-
-    Printer->closeViewFile(std::move(OS));
     return 0;
   }
 
@@ -876,18 +912,7 @@ int CodeCoverageTool::show(int argc, const char **argv,
       (SourceFiles.size() != 1) || ViewOpts.hasOutputDirectory() ||
       (ViewOpts.Format == CoverageViewOptions::OutputFormat::HTML);
 
-  if (SourceFiles.empty())
-    // Get the source files from the function coverage mapping.
-    for (StringRef Filename : Coverage->getUniqueSourceFiles())
-      SourceFiles.push_back(Filename);
-
-  // Create an index out of the source files.
-  if (ViewOpts.hasOutputDirectory()) {
-    if (Error E = Printer->createIndexFile(SourceFiles, *Coverage)) {
-      error("Could not create index file!", toString(std::move(E)));
-      return 1;
-    }
-  }
+  auto NumThreads = ViewOpts.NumThreads;
 
   // If NumThreads is not specified, auto-detect a good default.
   if (NumThreads == 0)
@@ -911,8 +936,8 @@ int CodeCoverageTool::show(int argc, const char **argv,
   return 0;
 }
 
-int CodeCoverageTool::report(int argc, const char **argv,
-                             CommandLineParserType commandLineParser) {
+int CodeCoverageTool::doReport(int argc, const char **argv,
+                               CommandLineParserType commandLineParser) {
   cl::opt<bool> ShowFunctionSummaries(
       "show-functions", cl::Optional, cl::init(false),
       cl::desc("Show coverage summaries for each function"));
@@ -932,7 +957,10 @@ int CodeCoverageTool::report(int argc, const char **argv,
 
   CoverageReport Report(ViewOpts, *Coverage.get());
   if (!ShowFunctionSummaries) {
-    Report.renderFileReports(llvm::outs());
+    if (SourceFiles.empty())
+      Report.renderFileReports(llvm::outs());
+    else
+      Report.renderFileReports(llvm::outs(), SourceFiles);
   } else {
     if (SourceFiles.empty()) {
       error("Source files must be specified when -show-functions=true is "
@@ -945,8 +973,8 @@ int CodeCoverageTool::report(int argc, const char **argv,
   return 0;
 }
 
-int CodeCoverageTool::export_(int argc, const char **argv,
-                              CommandLineParserType commandLineParser) {
+int CodeCoverageTool::doExport(int argc, const char **argv,
+                               CommandLineParserType commandLineParser) {
 
   auto Err = commandLineParser(argc, argv);
   if (Err)
@@ -963,7 +991,12 @@ int CodeCoverageTool::export_(int argc, const char **argv,
     return 1;
   }
 
-  exportCoverageDataToJson(*Coverage.get(), ViewOpts, outs());
+  auto Exporter = CoverageExporterJson(*Coverage.get(), ViewOpts, outs());
+
+  if (SourceFiles.empty())
+    Exporter.renderRoot();
+  else
+    Exporter.renderRoot(SourceFiles);
 
   return 0;
 }

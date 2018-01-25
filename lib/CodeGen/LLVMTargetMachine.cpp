@@ -16,11 +16,12 @@
 #include "llvm/CodeGen/BasicTTIImpl.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/CodeGen/Passes.h"
+#include "llvm/CodeGen/TargetLoweringObjectFile.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
-#include "llvm/IR/IRPrintingPasses.h"
 #include "llvm/IR/LegacyPassManager.h"
-#include "llvm/IR/Verifier.h"
+#include "llvm/MC/MCAsmBackend.h"
 #include "llvm/MC/MCAsmInfo.h"
+#include "llvm/MC/MCCodeEmitter.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCInstrInfo.h"
 #include "llvm/MC/MCStreamer.h"
@@ -29,10 +30,8 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FormattedStream.h"
 #include "llvm/Support/TargetRegistry.h"
-#include "llvm/Target/TargetLoweringObjectFile.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
-#include "llvm/Transforms/Scalar.h"
 using namespace llvm;
 
 void LLVMTargetMachine::initAsmInfo() {
@@ -82,10 +81,9 @@ LLVMTargetMachine::LLVMTargetMachine(const Target &T,
   this->OptLevel = OL;
 }
 
-TargetIRAnalysis LLVMTargetMachine::getTargetIRAnalysis() {
-  return TargetIRAnalysis([this](const Function &F) {
-    return TargetTransformInfo(BasicTTIImpl(this, F));
-  });
+TargetTransformInfo
+LLVMTargetMachine::getTargetTransformInfo(const Function &F) {
+  return TargetTransformInfo(BasicTTIImpl(this, F));
 }
 
 /// addPassesToX helper drives creation and initialization of TargetPassConfig.
@@ -138,8 +136,7 @@ bool LLVMTargetMachine::addAsmPrinter(PassManagerBase &PM,
       MCE = getTarget().createMCCodeEmitter(MII, MRI, Context);
 
     MCAsmBackend *MAB =
-        getTarget().createMCAsmBackend(MRI, getTargetTriple().str(), TargetCPU,
-                                       Options.MCOptions);
+        getTarget().createMCAsmBackend(STI, MRI, Options.MCOptions);
     auto FOut = llvm::make_unique<formatted_raw_ostream>(Out);
     MCStreamer *S = getTarget().createAsmStreamer(
         Context, std::move(FOut), Options.MCOptions.AsmVerbose,
@@ -153,8 +150,7 @@ bool LLVMTargetMachine::addAsmPrinter(PassManagerBase &PM,
     // emission fails.
     MCCodeEmitter *MCE = getTarget().createMCCodeEmitter(MII, MRI, Context);
     MCAsmBackend *MAB =
-        getTarget().createMCAsmBackend(MRI, getTargetTriple().str(), TargetCPU,
-                                       Options.MCOptions);
+        getTarget().createMCAsmBackend(STI, MRI, Options.MCOptions);
     if (!MCE || !MAB)
       return true;
 
@@ -163,7 +159,8 @@ bool LLVMTargetMachine::addAsmPrinter(PassManagerBase &PM,
 
     Triple T(getTargetTriple().str());
     AsmStreamer.reset(getTarget().createMCObjectStreamer(
-        T, Context, *MAB, Out, MCE, STI, Options.MCOptions.MCRelaxAll,
+        T, Context, std::unique_ptr<MCAsmBackend>(MAB), Out,
+        std::unique_ptr<MCCodeEmitter>(MCE), STI, Options.MCOptions.MCRelaxAll,
         Options.MCOptions.MCIncrementalLinkerCompatible,
         /*DWARFMustBeAtTheEnd*/ true));
     break;
@@ -226,19 +223,19 @@ bool LLVMTargetMachine::addPassesToEmitMC(PassManagerBase &PM, MCContext *&Ctx,
 
   // Create the code emitter for the target if it exists.  If not, .o file
   // emission fails.
+  const MCSubtargetInfo &STI = *getMCSubtargetInfo();
   const MCRegisterInfo &MRI = *getMCRegisterInfo();
   MCCodeEmitter *MCE =
       getTarget().createMCCodeEmitter(*getMCInstrInfo(), MRI, *Ctx);
   MCAsmBackend *MAB =
-      getTarget().createMCAsmBackend(MRI, getTargetTriple().str(), TargetCPU,
-                                     Options.MCOptions);
+      getTarget().createMCAsmBackend(STI, MRI, Options.MCOptions);
   if (!MCE || !MAB)
     return true;
 
   const Triple &T = getTargetTriple();
-  const MCSubtargetInfo &STI = *getMCSubtargetInfo();
   std::unique_ptr<MCStreamer> AsmStreamer(getTarget().createMCObjectStreamer(
-      T, *Ctx, *MAB, Out, MCE, STI, Options.MCOptions.MCRelaxAll,
+      T, *Ctx, std::unique_ptr<MCAsmBackend>(MAB), Out,
+      std::unique_ptr<MCCodeEmitter>(MCE), STI, Options.MCOptions.MCRelaxAll,
       Options.MCOptions.MCIncrementalLinkerCompatible,
       /*DWARFMustBeAtTheEnd*/ true));
 

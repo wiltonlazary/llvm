@@ -20,6 +20,7 @@
 #include "AArch64TargetMachine.h"
 #include "MCTargetDesc/AArch64AddressingModes.h"
 #include "llvm/CodeGen/GlobalISel/InstructionSelector.h"
+#include "llvm/CodeGen/GlobalISel/InstructionSelectorImpl.h"
 #include "llvm/CodeGen/GlobalISel/Utils.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineFunction.h"
@@ -32,8 +33,6 @@
 #include "llvm/Support/raw_ostream.h"
 
 #define DEBUG_TYPE "aarch64-isel"
-
-#include "llvm/CodeGen/GlobalISel/InstructionSelectorImpl.h"
 
 using namespace llvm;
 
@@ -49,12 +48,13 @@ public:
                              const AArch64Subtarget &STI,
                              const AArch64RegisterBankInfo &RBI);
 
-  bool select(MachineInstr &I) const override;
+  bool select(MachineInstr &I, CodeGenCoverage &CoverageInfo) const override;
+  static const char *getName() { return DEBUG_TYPE; }
 
 private:
   /// tblgen-erated 'select' implementation, used as the initial selector for
   /// the patterns that don't require complex C++.
-  bool selectImpl(MachineInstr &I) const;
+  bool selectImpl(MachineInstr &I, CodeGenCoverage &CoverageInfo) const;
 
   bool selectVaStartAAPCS(MachineInstr &I, MachineFunction &MF,
                           MachineRegisterInfo &MRI) const;
@@ -64,7 +64,35 @@ private:
   bool selectCompareBranch(MachineInstr &I, MachineFunction &MF,
                            MachineRegisterInfo &MRI) const;
 
-  ComplexRendererFn selectArithImmed(MachineOperand &Root) const;
+  ComplexRendererFns selectArithImmed(MachineOperand &Root) const;
+
+  ComplexRendererFns selectAddrModeUnscaled(MachineOperand &Root,
+                                            unsigned Size) const;
+
+  ComplexRendererFns selectAddrModeUnscaled8(MachineOperand &Root) const {
+    return selectAddrModeUnscaled(Root, 1);
+  }
+  ComplexRendererFns selectAddrModeUnscaled16(MachineOperand &Root) const {
+    return selectAddrModeUnscaled(Root, 2);
+  }
+  ComplexRendererFns selectAddrModeUnscaled32(MachineOperand &Root) const {
+    return selectAddrModeUnscaled(Root, 4);
+  }
+  ComplexRendererFns selectAddrModeUnscaled64(MachineOperand &Root) const {
+    return selectAddrModeUnscaled(Root, 8);
+  }
+  ComplexRendererFns selectAddrModeUnscaled128(MachineOperand &Root) const {
+    return selectAddrModeUnscaled(Root, 16);
+  }
+
+  ComplexRendererFns selectAddrModeIndexed(MachineOperand &Root,
+                                           unsigned Size) const;
+  template <int Width>
+  ComplexRendererFns selectAddrModeIndexed(MachineOperand &Root) const {
+    return selectAddrModeIndexed(Root, Width / 8);
+  }
+
+  void renderTruncImm(MachineInstrBuilder &MIB, const MachineInstr &MI) const;
 
   const AArch64TargetMachine &TM;
   const AArch64Subtarget &STI;
@@ -542,11 +570,11 @@ bool AArch64InstructionSelector::selectCompareBranch(
   else
     return false;
 
-  auto MIB = BuildMI(*I.getParent(), I, I.getDebugLoc(), TII.get(CBOpc))
-                 .addUse(LHS)
-                 .addMBB(DestMBB);
+  BuildMI(*I.getParent(), I, I.getDebugLoc(), TII.get(CBOpc))
+      .addUse(LHS)
+      .addMBB(DestMBB)
+      .constrainAllUses(TII, TRI, RBI);
 
-  constrainSelectedInstRegOperands(*MIB.getInstr(), TII, TRI, RBI);
   I.eraseFromParent();
   return true;
 }
@@ -583,7 +611,8 @@ bool AArch64InstructionSelector::selectVaStartDarwin(
   return true;
 }
 
-bool AArch64InstructionSelector::select(MachineInstr &I) const {
+bool AArch64InstructionSelector::select(MachineInstr &I,
+                                        CodeGenCoverage &CoverageInfo) const {
   assert(I.getParent() && "Instruction should be in a basic block!");
   assert(I.getParent()->getParent() && "Instruction should be in a function!");
 
@@ -641,7 +670,7 @@ bool AArch64InstructionSelector::select(MachineInstr &I) const {
     return false;
   }
 
-  if (selectImpl(I))
+  if (selectImpl(I, CoverageInfo))
     return true;
 
   LLT Ty =
@@ -705,6 +734,11 @@ bool AArch64InstructionSelector::select(MachineInstr &I) const {
                      << " constant on bank: " << RB << ", expected: FPR\n");
         return false;
       }
+
+      // The case when we have 0.0 is covered by tablegen. Reject it here so we
+      // can be sure tablegen works correctly and isn't rescued by this code.
+      if (I.getOperand(1).getFPImm()->getValueAPF().isExactlyValue(0.0))
+        return false;
     } else {
       // s32 and s64 are covered by tablegen.
       if (Ty != p0) {
@@ -836,6 +870,40 @@ bool AArch64InstructionSelector::select(MachineInstr &I) const {
     if (OpFlags & AArch64II::MO_GOT) {
       I.setDesc(TII.get(AArch64::LOADgot));
       I.getOperand(1).setTargetFlags(OpFlags);
+    } else if (TM.getCodeModel() == CodeModel::Large) {
+      // Materialize the global using movz/movk instructions.
+      unsigned MovZDstReg = MRI.createVirtualRegister(&AArch64::GPR64RegClass);
+      auto InsertPt = std::next(I.getIterator());
+      auto MovZ =
+          BuildMI(MBB, InsertPt, I.getDebugLoc(), TII.get(AArch64::MOVZXi))
+              .addDef(MovZDstReg);
+      MovZ->addOperand(MF, I.getOperand(1));
+      MovZ->getOperand(1).setTargetFlags(OpFlags | AArch64II::MO_G0 |
+                                         AArch64II::MO_NC);
+      MovZ->addOperand(MF, MachineOperand::CreateImm(0));
+      constrainSelectedInstRegOperands(*MovZ, TII, TRI, RBI);
+
+      auto BuildMovK = [&](unsigned SrcReg, unsigned char Flags,
+                           unsigned Offset, unsigned ForceDstReg) {
+        unsigned DstReg =
+            ForceDstReg ? ForceDstReg
+                        : MRI.createVirtualRegister(&AArch64::GPR64RegClass);
+        auto MovI = BuildMI(MBB, InsertPt, MovZ->getDebugLoc(),
+                            TII.get(AArch64::MOVKXi))
+                        .addDef(DstReg)
+                        .addReg(SrcReg);
+        MovI->addOperand(MF, MachineOperand::CreateGA(
+                                 GV, MovZ->getOperand(1).getOffset(), Flags));
+        MovI->addOperand(MF, MachineOperand::CreateImm(Offset));
+        constrainSelectedInstRegOperands(*MovI, TII, TRI, RBI);
+        return DstReg;
+      };
+      unsigned DstReg = BuildMovK(MovZ->getOperand(0).getReg(),
+                                  AArch64II::MO_G1 | AArch64II::MO_NC, 16, 0);
+      DstReg = BuildMovK(DstReg, AArch64II::MO_G2 | AArch64II::MO_NC, 32, 0);
+      BuildMovK(DstReg, AArch64II::MO_G3, 48, I.getOperand(0).getReg());
+      I.eraseFromParent();
+      return true;
     } else {
       I.setDesc(TII.get(AArch64::MOVaddr));
       I.getOperand(1).setTargetFlags(OpFlags | AArch64II::MO_PAGE);
@@ -862,6 +930,12 @@ bool AArch64InstructionSelector::select(MachineInstr &I) const {
       DEBUG(dbgs() << "Atomic load/store not supported yet\n");
       return false;
     }
+
+    // FIXME: PR36018: Volatile loads in some cases are incorrectly selected by
+    // folding with an extend. Until we have a G_SEXTLOAD solution bail out if
+    // we hit one.
+    if (Opcode == TargetOpcode::G_LOAD && MemOp.isVolatile())
+      return false;
 
     const unsigned PtrReg = I.getOperand(1).getReg();
 #ifndef NDEBUG
@@ -1342,7 +1416,7 @@ bool AArch64InstructionSelector::select(MachineInstr &I) const {
 /// SelectArithImmed - Select an immediate value that can be represented as
 /// a 12-bit value shifted left by either 0 or 12.  If so, return true with
 /// Val set to the 12-bit value and Shift set to the shifter operand.
-InstructionSelector::ComplexRendererFn
+InstructionSelector::ComplexRendererFns
 AArch64InstructionSelector::selectArithImmed(MachineOperand &Root) const {
   MachineInstr &MI = *Root.getParent();
   MachineBasicBlock &MBB = *MI.getParent();
@@ -1362,13 +1436,13 @@ AArch64InstructionSelector::selectArithImmed(MachineOperand &Root) const {
   else if (Root.isReg()) {
     MachineInstr *Def = MRI.getVRegDef(Root.getReg());
     if (Def->getOpcode() != TargetOpcode::G_CONSTANT)
-      return nullptr;
+      return None;
     MachineOperand &Op1 = Def->getOperand(1);
     if (!Op1.isCImm() || Op1.getCImm()->getBitWidth() > 64)
-      return nullptr;
+      return None;
     Immed = Op1.getCImm()->getZExtValue();
   } else
-    return nullptr;
+    return None;
 
   unsigned ShiftAmt;
 
@@ -1378,10 +1452,125 @@ AArch64InstructionSelector::selectArithImmed(MachineOperand &Root) const {
     ShiftAmt = 12;
     Immed = Immed >> 12;
   } else
-    return nullptr;
+    return None;
 
   unsigned ShVal = AArch64_AM::getShifterImm(AArch64_AM::LSL, ShiftAmt);
-  return [=](MachineInstrBuilder &MIB) { MIB.addImm(Immed).addImm(ShVal); };
+  return {{
+      [=](MachineInstrBuilder &MIB) { MIB.addImm(Immed); },
+      [=](MachineInstrBuilder &MIB) { MIB.addImm(ShVal); },
+  }};
+}
+
+/// Select a "register plus unscaled signed 9-bit immediate" address.  This
+/// should only match when there is an offset that is not valid for a scaled
+/// immediate addressing mode.  The "Size" argument is the size in bytes of the
+/// memory reference, which is needed here to know what is valid for a scaled
+/// immediate.
+InstructionSelector::ComplexRendererFns
+AArch64InstructionSelector::selectAddrModeUnscaled(MachineOperand &Root,
+                                                   unsigned Size) const {
+  MachineRegisterInfo &MRI =
+      Root.getParent()->getParent()->getParent()->getRegInfo();
+
+  if (!Root.isReg())
+    return None;
+
+  if (!isBaseWithConstantOffset(Root, MRI))
+    return None;
+
+  MachineInstr *RootDef = MRI.getVRegDef(Root.getReg());
+  if (!RootDef)
+    return None;
+
+  MachineOperand &OffImm = RootDef->getOperand(2);
+  if (!OffImm.isReg())
+    return None;
+  MachineInstr *RHS = MRI.getVRegDef(OffImm.getReg());
+  if (!RHS || RHS->getOpcode() != TargetOpcode::G_CONSTANT)
+    return None;
+  int64_t RHSC;
+  MachineOperand &RHSOp1 = RHS->getOperand(1);
+  if (!RHSOp1.isCImm() || RHSOp1.getCImm()->getBitWidth() > 64)
+    return None;
+  RHSC = RHSOp1.getCImm()->getSExtValue();
+
+  // If the offset is valid as a scaled immediate, don't match here.
+  if ((RHSC & (Size - 1)) == 0 && RHSC >= 0 && RHSC < (0x1000 << Log2_32(Size)))
+    return None;
+  if (RHSC >= -256 && RHSC < 256) {
+    MachineOperand &Base = RootDef->getOperand(1);
+    return {{
+        [=](MachineInstrBuilder &MIB) { MIB.add(Base); },
+        [=](MachineInstrBuilder &MIB) { MIB.addImm(RHSC); },
+    }};
+  }
+  return None;
+}
+
+/// Select a "register plus scaled unsigned 12-bit immediate" address.  The
+/// "Size" argument is the size in bytes of the memory reference, which
+/// determines the scale.
+InstructionSelector::ComplexRendererFns
+AArch64InstructionSelector::selectAddrModeIndexed(MachineOperand &Root,
+                                                  unsigned Size) const {
+  MachineRegisterInfo &MRI =
+      Root.getParent()->getParent()->getParent()->getRegInfo();
+
+  if (!Root.isReg())
+    return None;
+
+  MachineInstr *RootDef = MRI.getVRegDef(Root.getReg());
+  if (!RootDef)
+    return None;
+
+  if (RootDef->getOpcode() == TargetOpcode::G_FRAME_INDEX) {
+    return {{
+        [=](MachineInstrBuilder &MIB) { MIB.add(RootDef->getOperand(1)); },
+        [=](MachineInstrBuilder &MIB) { MIB.addImm(0); },
+    }};
+  }
+
+  if (isBaseWithConstantOffset(Root, MRI)) {
+    MachineOperand &LHS = RootDef->getOperand(1);
+    MachineOperand &RHS = RootDef->getOperand(2);
+    MachineInstr *LHSDef = MRI.getVRegDef(LHS.getReg());
+    MachineInstr *RHSDef = MRI.getVRegDef(RHS.getReg());
+    if (LHSDef && RHSDef) {
+      int64_t RHSC = (int64_t)RHSDef->getOperand(1).getCImm()->getZExtValue();
+      unsigned Scale = Log2_32(Size);
+      if ((RHSC & (Size - 1)) == 0 && RHSC >= 0 && RHSC < (0x1000 << Scale)) {
+        if (LHSDef->getOpcode() == TargetOpcode::G_FRAME_INDEX)
+          return {{
+              [=](MachineInstrBuilder &MIB) { MIB.add(LHSDef->getOperand(1)); },
+              [=](MachineInstrBuilder &MIB) { MIB.addImm(RHSC >> Scale); },
+          }};
+
+        return {{
+            [=](MachineInstrBuilder &MIB) { MIB.add(LHS); },
+            [=](MachineInstrBuilder &MIB) { MIB.addImm(RHSC >> Scale); },
+        }};
+      }
+    }
+  }
+
+  // Before falling back to our general case, check if the unscaled
+  // instructions can handle this. If so, that's preferable.
+  if (selectAddrModeUnscaled(Root, Size).hasValue())
+    return None;
+
+  return {{
+      [=](MachineInstrBuilder &MIB) { MIB.add(Root); },
+      [=](MachineInstrBuilder &MIB) { MIB.addImm(0); },
+  }};
+}
+
+void AArch64InstructionSelector::renderTruncImm(MachineInstrBuilder &MIB,
+                                                const MachineInstr &MI) const {
+  const MachineRegisterInfo &MRI = MI.getParent()->getParent()->getRegInfo();
+  assert(MI.getOpcode() == TargetOpcode::G_CONSTANT && "Expected G_CONSTANT");
+  Optional<int64_t> CstVal = getConstantVRegVal(MI.getOperand(0).getReg(), MRI);
+  assert(CstVal && "Expected constant value");
+  MIB.addImm(CstVal.getValue());
 }
 
 namespace llvm {

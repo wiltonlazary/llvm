@@ -18,7 +18,7 @@
 #include "X86InstrFMA3Info.h"
 #include "X86RegisterInfo.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/Target/TargetInstrInfo.h"
+#include "llvm/CodeGen/TargetInstrInfo.h"
 
 #define GET_INSTRINFO_HEADER
 #include "X86GenInstrInfo.inc"
@@ -490,7 +490,11 @@ public:
   std::pair<uint16_t, uint16_t>
   getExecutionDomain(const MachineInstr &MI) const override;
 
+  uint16_t getExecutionDomainCustom(const MachineInstr &MI) const;
+
   void setExecutionDomain(MachineInstr &MI, unsigned Domain) const override;
+
+  bool setExecutionDomainCustom(MachineInstr &MI, unsigned Domain) const;
 
   unsigned
   getPartialRegUpdateClearance(const MachineInstr &MI, unsigned OpNum,
@@ -559,30 +563,27 @@ public:
   ArrayRef<std::pair<unsigned, const char *>>
   getSerializableDirectMachineOperandTargetFlags() const override;
 
-  std::pair<size_t, unsigned>
-  getOutliningCallOverhead(MachineBasicBlock::iterator &StartIt,
-                           MachineBasicBlock::iterator &EndIt) const override;
-
-  std::pair<size_t, unsigned> getOutliningFrameOverhead(
+  virtual MachineOutlinerInfo getOutlininingCandidateInfo(
       std::vector<
           std::pair<MachineBasicBlock::iterator, MachineBasicBlock::iterator>>
-          &CandidateClass) const override;
+          &RepeatedSequenceLocs) const override;
 
-  bool isFunctionSafeToOutlineFrom(MachineFunction &MF) const override;
+  bool isFunctionSafeToOutlineFrom(MachineFunction &MF,
+                                   bool OutlineFromLinkOnceODRs) const override;
 
   llvm::X86GenInstrInfo::MachineOutlinerInstrType
-  getOutliningType(MachineInstr &MI) const override;
+  getOutliningType(MachineBasicBlock::iterator &MIT, unsigned Flags) const override;
 
   void insertOutlinerEpilogue(MachineBasicBlock &MBB, MachineFunction &MF,
-                              unsigned FrameClass) const override;
+                              const MachineOutlinerInfo &MInfo) const override;
 
   void insertOutlinerPrologue(MachineBasicBlock &MBB, MachineFunction &MF,
-                              unsigned FrameClass) const override;
+                              const MachineOutlinerInfo &MInfo) const override;
 
   MachineBasicBlock::iterator
   insertOutlinedCall(Module &M, MachineBasicBlock &MBB,
                      MachineBasicBlock::iterator &It, MachineFunction &MF,
-                     unsigned CallClass) const override;
+                     const MachineOutlinerInfo &MInfo) const override;
 
 protected:
   /// Commutes the operands in the given instruction by changing the operands
