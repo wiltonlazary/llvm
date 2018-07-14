@@ -51,6 +51,8 @@ public:
     return true;
   }
   void PreprocessISelDAG() override;
+  void EmitFunctionEntryCode() override;
+
   void Select(SDNode *N) override;
 
   // Complex Pattern Selectors.
@@ -88,6 +90,8 @@ public:
                                     unsigned ConstraintID,
                                     std::vector<SDValue> &OutOps) override;
   bool tryLoadOfLoadIntrinsic(LoadSDNode *N);
+  bool SelectBrevLdIntrinsic(SDNode *IntN);
+  bool SelectNewCircIntrinsic(SDNode *IntN);
   void SelectLoad(SDNode *N);
   void SelectIndexedLoad(LoadSDNode *LD, const SDLoc &dl);
   void SelectIndexedStore(StoreSDNode *ST, const SDLoc &dl);
@@ -98,10 +102,12 @@ public:
   void SelectIntrinsicWOChain(SDNode *N);
   void SelectConstant(SDNode *N);
   void SelectConstantFP(SDNode *N);
-  void SelectBitcast(SDNode *N);
   void SelectV65Gather(SDNode *N);
   void SelectV65GatherPred(SDNode *N);
   void SelectHVXDualOutput(SDNode *N);
+  void SelectAddSubCarry(SDNode *N);
+  void SelectVAlign(SDNode *N);
+  void SelectVAlignAddr(SDNode *N);
   void SelectTypecast(SDNode *N);
   void SelectP2D(SDNode *N);
   void SelectD2P(SDNode *N);
@@ -125,6 +131,7 @@ private:
 
   void SelectHvxShuffle(SDNode *N);
   void SelectHvxRor(SDNode *N);
+  void SelectHvxVAlign(SDNode *N);
 
   bool keepsLowBits(const SDValue &Val, unsigned NumBits, SDValue &Src);
   bool isAlignedMemNode(const MemSDNode *N) const;
@@ -137,7 +144,6 @@ private:
   void ppAddrReorderAddShl(std::vector<SDNode*> &&Nodes);
   void ppAddrRewriteAndSrl(std::vector<SDNode*> &&Nodes);
   void ppHoistZextI1(std::vector<SDNode*> &&Nodes);
-  void ppEmitAligna();
 
   SmallDenseMap<SDNode *,int> RootWeights;
   SmallDenseMap<SDNode *,int> RootHeights;

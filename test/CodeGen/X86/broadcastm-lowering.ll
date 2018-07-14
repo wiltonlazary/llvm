@@ -104,8 +104,8 @@ entry:
 define <8 x i64> @test_mm512_epi64(<8 x i32> %a, <8 x i32> %b) {
 ; AVX512CD-LABEL: test_mm512_epi64:
 ; AVX512CD:       # %bb.0: # %entry
-; AVX512CD-NEXT:    # kill: def %ymm1 killed %ymm1 def %zmm1
-; AVX512CD-NEXT:    # kill: def %ymm0 killed %ymm0 def %zmm0
+; AVX512CD-NEXT:    # kill: def $ymm1 killed $ymm1 def $zmm1
+; AVX512CD-NEXT:    # kill: def $ymm0 killed $ymm0 def $zmm0
 ; AVX512CD-NEXT:    vpcmpeqd %zmm1, %zmm0, %k0
 ; AVX512CD-NEXT:    vpbroadcastmb2q %k0, %zmm0
 ; AVX512CD-NEXT:    retq
@@ -136,14 +136,13 @@ entry:
 define <4 x i64> @test_mm256_epi64(<8 x i32> %a, <8 x i32> %b) {
 ; AVX512CD-LABEL: test_mm256_epi64:
 ; AVX512CD:       # %bb.0: # %entry
-; AVX512CD-NEXT:    # kill: def %ymm1 killed %ymm1 def %zmm1
-; AVX512CD-NEXT:    # kill: def %ymm0 killed %ymm0 def %zmm0
+; AVX512CD-NEXT:    # kill: def $ymm1 killed $ymm1 def $zmm1
+; AVX512CD-NEXT:    # kill: def $ymm0 killed $ymm0 def $zmm0
 ; AVX512CD-NEXT:    vpcmpeqd %zmm1, %zmm0, %k0
 ; AVX512CD-NEXT:    kmovw %k0, %eax
-; AVX512CD-NEXT:    vpxor %xmm0, %xmm0, %xmm0
-; AVX512CD-NEXT:    vpinsrb $0, %eax, %xmm0, %xmm0
-; AVX512CD-NEXT:    vpinsrb $8, %eax, %xmm0, %xmm0
-; AVX512CD-NEXT:    vinserti128 $1, %xmm0, %ymm0, %ymm0
+; AVX512CD-NEXT:    movzbl %al, %eax
+; AVX512CD-NEXT:    vmovq %rax, %xmm0
+; AVX512CD-NEXT:    vpbroadcastq %xmm0, %ymm0
 ; AVX512CD-NEXT:    retq
 ;
 ; AVX512VLCDBW-LABEL: test_mm256_epi64:

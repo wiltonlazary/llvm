@@ -29,6 +29,7 @@
 #include "llvm/Analysis/EHPersonalities.h"
 #include "llvm/Analysis/InstructionSimplify.h"
 #include "llvm/Analysis/ProfileSummaryInfo.h"
+#include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Argument.h"
 #include "llvm/IR/BasicBlock.h"
@@ -60,7 +61,6 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Transforms/Utils/Cloning.h"
-#include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include <algorithm>
 #include <cassert>
@@ -1248,7 +1248,7 @@ static void HandleByValArgumentInit(Value *Dst, Value *Src, Module *M,
   // Always generate a memcpy of alignment 1 here because we don't know
   // the alignment of the src pointer.  Other optimizations can infer
   // better alignment.
-  Builder.CreateMemCpy(Dst, Src, Size, /*Align=*/1);
+  Builder.CreateMemCpy(Dst, /*DstAlign*/1, Src, /*SrcAlign*/1, Size);
 }
 
 /// When inlining a call site that has a byval argument,
@@ -1569,7 +1569,7 @@ bool llvm::InlineFunction(CallSite CS, InlineFunctionInfo &IFI,
   Instruction *CallSiteEHPad = nullptr;
   if (CallerPersonality) {
     EHPersonality Personality = classifyEHPersonality(CallerPersonality);
-    if (isFuncletEHPersonality(Personality)) {
+    if (isScopedEHPersonality(Personality)) {
       Optional<OperandBundleUse> ParentFunclet =
           CS.getOperandBundle(LLVMContext::OB_funclet);
       if (ParentFunclet)
@@ -1826,6 +1826,10 @@ bool llvm::InlineFunction(CallSite CS, InlineFunctionInfo &IFI,
     if (CallInst *CI = dyn_cast<CallInst>(TheCall))
       CallSiteTailKind = CI->getTailCallKind();
 
+    // For inlining purposes, the "notail" marker is the same as no marker.
+    if (CallSiteTailKind == CallInst::TCK_NoTail)
+      CallSiteTailKind = CallInst::TCK_None;
+
     for (Function::iterator BB = FirstNewBlock, E = Caller->end(); BB != E;
          ++BB) {
       for (auto II = BB->begin(); II != BB->end();) {
@@ -1843,7 +1847,7 @@ bool llvm::InlineFunction(CallSite CS, InlineFunctionInfo &IFI,
           // Collect attributes for non-vararg parameters.
           AttributeList Attrs = CI->getAttributes();
           SmallVector<AttributeSet, 8> ArgAttrs;
-          if (!Attrs.isEmpty()) {
+          if (!Attrs.isEmpty() || !VarArgsAttrs.empty()) {
             for (unsigned ArgNo = 0;
                  ArgNo < CI->getFunctionType()->getNumParams(); ++ArgNo)
               ArgAttrs.push_back(Attrs.getParamAttributes(ArgNo));
@@ -1885,6 +1889,8 @@ bool llvm::InlineFunction(CallSite CS, InlineFunctionInfo &IFI,
         //    f -> musttail g ->     tail f  ==>  f ->     tail f
         //    f ->          g -> musttail f  ==>  f ->          f
         //    f ->          g ->     tail f  ==>  f ->          f
+        //
+        // Inlined notail calls should remain notail calls.
         CallInst::TailCallKind ChildTCK = CI->getTailCallKind();
         if (ChildTCK != CallInst::TCK_NoTail)
           ChildTCK = std::min(CallSiteTailKind, ChildTCK);
