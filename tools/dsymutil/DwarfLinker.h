@@ -1,9 +1,8 @@
 //===- tools/dsymutil/DwarfLinker.h - Dwarf debug info linker ---*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -67,11 +66,14 @@ public:
                      const DWARFDie *DIE = nullptr) const;
 
 private:
-  /// Remembers the newest DWARF version we've seen in a unit.
-  void maybeUpdateMaxDwarfVersion(unsigned Version) {
-    if (MaxDwarfVersion < Version)
-      MaxDwarfVersion = Version;
+  /// Remembers the oldest and newest DWARF version we've seen in a unit.
+  void updateDwarfVersion(unsigned Version) {
+    MaxDwarfVersion = std::max(MaxDwarfVersion, Version);
+    MinDwarfVersion = std::min(MinDwarfVersion, Version);
   }
+
+  /// Remembers the kinds of accelerator tables we've seen in a unit.
+  void updateAccelKind(DWARFContext &Dwarf);
 
   /// Emit warnings as Dwarf compile units to leave a trail after linking.
   bool emitPaperTrailWarnings(const DebugMapObject &DMO, const DebugMap &Map,
@@ -134,7 +136,7 @@ private:
                             CompileUnit::DIEInfo &Info);
 
     bool applyValidRelocs(MutableArrayRef<char> Data, uint32_t BaseOffset,
-                          bool isLittleEndian);
+                          bool IsLittleEndian);
   };
 
   /// Keeps track of data associated with one object during linking.
@@ -158,8 +160,10 @@ private:
       DwarfContext = ObjectFile ? DWARFContext::create(*ObjectFile) : nullptr;
     }
 
-    /// Clear compile units and ranges.
+    /// Clear part of the context that's no longer needed when we're done with
+    /// the debug object.
     void Clear() {
+      DwarfContext.reset(nullptr);
       CompileUnits.clear();
       Ranges.clear();
     }
@@ -178,7 +182,7 @@ private:
   /// keep. Store that information in \p CU's DIEInfo.
   ///
   /// The return value indicates whether the DIE is incomplete.
-  bool lookForDIEsToKeep(RelocationManager &RelocMgr, RangesTy &Ranges,
+  void lookForDIEsToKeep(RelocationManager &RelocMgr, RangesTy &Ranges,
                          const UnitListTy &Units, const DWARFDie &DIE,
                          const DebugMapObject &DMO, CompileUnit &CU,
                          unsigned Flags);
@@ -194,8 +198,10 @@ private:
                                RangesTy &Ranges,
                                OffsetsStringPool &OffsetsStringPool,
                                UniquingStringPool &UniquingStringPoolStringPool,
-                               DeclContextTree &ODRContexts, unsigned &UnitID,
-                               unsigned Indent = 0);
+                               DeclContextTree &ODRContexts,
+                               uint64_t ModulesEndOffset, unsigned &UnitID,
+                               bool IsLittleEndian, unsigned Indent = 0,
+                               bool Quiet = false);
 
   /// Recursively add the debug info in this clang module .pcm
   /// file (and all the modules imported by it in a bottom-up fashion)
@@ -205,8 +211,9 @@ private:
                         DebugMap &ModuleMap, const DebugMapObject &DMO,
                         RangesTy &Ranges, OffsetsStringPool &OffsetsStringPool,
                         UniquingStringPool &UniquingStringPool,
-                        DeclContextTree &ODRContexts, unsigned &UnitID,
-                        unsigned Indent = 0);
+                        DeclContextTree &ODRContexts, uint64_t ModulesEndOffset,
+                        unsigned &UnitID, bool IsLittleEndian,
+                        unsigned Indent = 0, bool Quiet = false);
 
   /// Flags passed to DwarfLinker::lookForDIEsToKeep
   enum TraversalFlags {
@@ -230,6 +237,8 @@ private:
                          CompileUnit &Unit, CompileUnit::DIEInfo &MyInfo,
                          unsigned Flags);
 
+  /// Check if a variable describing DIE should be kept.
+  /// \returns updated TraversalFlags.
   unsigned shouldKeepVariableDIE(RelocationManager &RelocMgr,
                                  const DWARFDie &DIE, CompileUnit &Unit,
                                  CompileUnit::DIEInfo &MyInfo, unsigned Flags);
@@ -280,14 +289,15 @@ private:
     DIE *cloneDIE(const DWARFDie &InputDIE, const DebugMapObject &DMO,
                   CompileUnit &U, OffsetsStringPool &StringPool,
                   int64_t PCOffset, uint32_t OutOffset, unsigned Flags,
-                  DIE *Die = nullptr);
+                  bool IsLittleEndian, DIE *Die = nullptr);
 
     /// Construct the output DIE tree by cloning the DIEs we
     /// chose to keep above. If there are no valid relocs, then there's
     /// nothing to clone/emit.
     void cloneAllCompileUnits(DWARFContext &DwarfContext,
                               const DebugMapObject &DMO, RangesTy &Ranges,
-                              OffsetsStringPool &StringPool);
+                              OffsetsStringPool &StringPool,
+                              bool IsLittleEndian);
 
   private:
     using AttributeSpec = DWARFAbbreviationDeclaration::AttributeSpec;
@@ -329,7 +339,7 @@ private:
                             OffsetsStringPool &StringPool,
                             const DWARFFormValue &Val,
                             const AttributeSpec AttrSpec, unsigned AttrSize,
-                            AttributesInfo &AttrInfo);
+                            AttributesInfo &AttrInfo, bool IsLittleEndian);
 
     /// Clone a string attribute described by \p AttrSpec and add
     /// it to \p Die.
@@ -349,11 +359,18 @@ private:
                                         const DebugMapObject &DMO,
                                         CompileUnit &Unit);
 
+    /// Clone a DWARF expression that may be referencing another DIE.
+    void cloneExpression(DataExtractor &Data, DWARFExpression Expression,
+                         const DebugMapObject &DMO, CompileUnit &Unit,
+                         SmallVectorImpl<uint8_t> &OutputBuffer);
+
     /// Clone an attribute referencing another DIE and add
     /// it to \p Die.
     /// \returns the size of the new attribute.
-    unsigned cloneBlockAttribute(DIE &Die, AttributeSpec AttrSpec,
-                                 const DWARFFormValue &Val, unsigned AttrSize);
+    unsigned cloneBlockAttribute(DIE &Die, const DebugMapObject &DMO,
+                                 CompileUnit &Unit, AttributeSpec AttrSpec,
+                                 const DWARFFormValue &Val, unsigned AttrSize,
+                                 bool IsLittleEndian);
 
     /// Clone an attribute referencing another DIE and add
     /// it to \p Die.
@@ -411,6 +428,8 @@ private:
 
   /// Emit the accelerator entries for \p Unit.
   void emitAcceleratorEntriesForUnit(CompileUnit &Unit);
+  void emitDwarfAcceleratorEntriesForUnit(CompileUnit &Unit);
+  void emitAppleAcceleratorEntriesForUnit(CompileUnit &Unit);
 
   /// Patch the frame info for an object file and emit it.
   void patchFrameInfoForObject(const DebugMapObject &, RangesTy &Ranges,
@@ -449,7 +468,12 @@ private:
   LinkOptions Options;
   std::unique_ptr<DwarfStreamer> Streamer;
   uint64_t OutputDebugInfoSize;
+
   unsigned MaxDwarfVersion = 0;
+  unsigned MinDwarfVersion = std::numeric_limits<unsigned>::max();
+
+  bool AtLeastOneAppleAccelTable = false;
+  bool AtLeastOneDwarfAccelTable = false;
 
   /// The CIEs that have been emitted in the output section. The actual CIE
   /// data serves a the key to this StringMap, this takes care of comparing the
@@ -461,6 +485,7 @@ private:
   uint32_t LastCIEOffset = 0;
 
   /// Apple accelerator tables.
+  AccelTable<DWARF5AccelTableStaticData> DebugNames;
   AccelTable<AppleAccelTableStaticOffsetData> AppleNames;
   AccelTable<AppleAccelTableStaticOffsetData> AppleNamespaces;
   AccelTable<AppleAccelTableStaticOffsetData> AppleObjc;

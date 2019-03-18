@@ -850,7 +850,8 @@ define <4  x float> @test42(<4  x float> %x, <4  x float> %x1, float* %ptr) noun
 define <8 x double> @test43(<8 x double> %x, <8 x double> %x1, double* %ptr,<8 x i1> %mask_in) nounwind {
 ; KNL-LABEL: test43:
 ; KNL:       ## %bb.0:
-; KNL-NEXT:    vpmovsxwq %xmm2, %zmm2 ## encoding: [0x62,0xf2,0x7d,0x48,0x24,0xd2]
+; KNL-NEXT:    vpmovzxwq %xmm2, %zmm2 ## encoding: [0x62,0xf2,0x7d,0x48,0x34,0xd2]
+; KNL-NEXT:    ## zmm2 = xmm2[0],zero,zero,zero,xmm2[1],zero,zero,zero,xmm2[2],zero,zero,zero,xmm2[3],zero,zero,zero,xmm2[4],zero,zero,zero,xmm2[5],zero,zero,zero,xmm2[6],zero,zero,zero,xmm2[7],zero,zero,zero
 ; KNL-NEXT:    vpsllq $63, %zmm2, %zmm2 ## encoding: [0x62,0xf1,0xed,0x48,0x73,0xf2,0x3f]
 ; KNL-NEXT:    vptestmq %zmm2, %zmm2, %k1 ## encoding: [0x62,0xf2,0xed,0x48,0x27,0xca]
 ; KNL-NEXT:    vcmpltpd (%rdi){1to8}, %zmm0, %k1 {%k1} ## encoding: [0x62,0xf1,0xfd,0x59,0xc2,0x0f,0x01]
@@ -1106,4 +1107,23 @@ define i16 @pcmpeq_mem_2(<16 x i32> %a, <16 x i32>* %b) {
   %cmp = icmp eq <16 x i32> %load, %a
   %cast = bitcast <16 x i1> %cmp to i16
   ret i16 %cast
+}
+
+; Don't let a degenerate case trigger an infinite loop.
+; This should get simplified before it even exists as a vselect node,
+; but that does not happen as of this change.
+
+define <2 x i64> @PR41066(<2 x i64> %t0, <2 x double> %x, <2 x double> %y) {
+; AVX512-LABEL: PR41066:
+; AVX512:       ## %bb.0:
+; AVX512-NEXT:    vxorps %xmm0, %xmm0, %xmm0 ## encoding: [0xc5,0xf8,0x57,0xc0]
+; AVX512-NEXT:    retq ## encoding: [0xc3]
+;
+; SKX-LABEL: PR41066:
+; SKX:       ## %bb.0:
+; SKX-NEXT:    vxorps %xmm0, %xmm0, %xmm0 ## EVEX TO VEX Compression encoding: [0xc5,0xf8,0x57,0xc0]
+; SKX-NEXT:    retq ## encoding: [0xc3]
+  %t1 = fcmp ogt <2 x double> %x, %y
+  %t2 = select <2 x i1> %t1, <2 x i64> <i64 undef, i64 0>, <2 x i64> zeroinitializer
+  ret <2 x i64> %t2
 }

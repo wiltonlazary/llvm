@@ -1,9 +1,8 @@
 //===-- llvm/ModuleSummaryIndexYAML.h - YAML I/O for summary ----*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -195,7 +194,6 @@ template <> struct MappingTraits<FunctionSummaryYaml> {
 } // End yaml namespace
 } // End llvm namespace
 
-LLVM_YAML_IS_STRING_MAP(TypeIdSummary)
 LLVM_YAML_IS_SEQUENCE_VECTOR(FunctionSummaryYaml)
 
 namespace llvm {
@@ -225,7 +223,7 @@ template <> struct CustomMappingTraits<GlobalValueSummaryMapTy> {
           GlobalValueSummary::GVFlags(
               static_cast<GlobalValue::LinkageTypes>(FSum.Linkage),
               FSum.NotEligibleToImport, FSum.Live, FSum.IsLocal),
-          0, FunctionSummary::FFlags{}, Refs,
+          /*NumInsts=*/0, FunctionSummary::FFlags{}, /*EntryCount=*/0, Refs,
           ArrayRef<FunctionSummary::EdgeTy>{}, std::move(FSum.TypeTests),
           std::move(FSum.TypeTestAssumeVCalls),
           std::move(FSum.TypeCheckedLoadVCalls),
@@ -255,6 +253,18 @@ template <> struct CustomMappingTraits<GlobalValueSummaryMapTy> {
       if (!FSums.empty())
         io.mapRequired(llvm::utostr(P.first).c_str(), FSums);
     }
+  }
+};
+
+template <> struct CustomMappingTraits<TypeIdSummaryMapTy> {
+  static void inputOne(IO &io, StringRef Key, TypeIdSummaryMapTy &V) {
+    TypeIdSummary TId;
+    io.mapRequired(Key.str().c_str(), TId);
+    V.insert({GlobalValue::getGUID(Key), {Key, TId}});
+  }
+  static void output(IO &io, TypeIdSummaryMapTy &V) {
+    for (auto TidIter = V.begin(); TidIter != V.end(); TidIter++)
+      io.mapRequired(TidIter->second.first.c_str(), TidIter->second.second);
   }
 };
 

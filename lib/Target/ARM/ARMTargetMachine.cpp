@@ -1,9 +1,8 @@
 //===-- ARMTargetMachine.cpp - Define TargetMachine for ARM ---------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -90,6 +89,7 @@ extern "C" void LLVMInitializeARMTarget() {
   initializeARMLoadStoreOptPass(Registry);
   initializeARMPreAllocLoadStoreOptPass(Registry);
   initializeARMParallelDSPPass(Registry);
+  initializeARMCodeGenPreparePass(Registry);
   initializeARMConstantIslandsPass(Registry);
   initializeARMExecutionDomainFixPass(Registry);
   initializeARMExpandPseudoPass(Registry);
@@ -140,6 +140,10 @@ static std::string computeDataLayout(const Triple &TT, StringRef CPU,
 
   // Pointers are 32 bits and aligned to 32 bits.
   Ret += "-p:32:32";
+
+  // Function pointers are aligned to 8 bits (because the LSB stores the
+  // ARM/Thumb state).
+  Ret += "-Fi8";
 
   // ABIs other than APCS have 64 bit integers with natural alignment.
   if (ABI != ARMBaseTargetMachine::ARM_ABI_APCS)
@@ -193,12 +197,6 @@ static Reloc::Model getEffectiveRelocModel(const Triple &TT,
   return *RM;
 }
 
-static CodeModel::Model getEffectiveCodeModel(Optional<CodeModel::Model> CM) {
-  if (CM)
-    return *CM;
-  return CodeModel::Small;
-}
-
 /// Create an ARM architecture model.
 ///
 ARMBaseTargetMachine::ARMBaseTargetMachine(const Target &T, const Triple &TT,
@@ -209,17 +207,13 @@ ARMBaseTargetMachine::ARMBaseTargetMachine(const Target &T, const Triple &TT,
                                            CodeGenOpt::Level OL, bool isLittle)
     : LLVMTargetMachine(T, computeDataLayout(TT, CPU, Options, isLittle), TT,
                         CPU, FS, Options, getEffectiveRelocModel(TT, RM),
-                        getEffectiveCodeModel(CM), OL),
+                        getEffectiveCodeModel(CM, CodeModel::Small), OL),
       TargetABI(computeTargetABI(TT, CPU, Options)),
       TLOF(createTLOF(getTargetTriple())), isLittle(isLittle) {
 
   // Default to triple-appropriate float ABI
   if (Options.FloatABIType == FloatABI::Default) {
-    if (TargetTriple.getEnvironment() == Triple::GNUEABIHF ||
-        TargetTriple.getEnvironment() == Triple::MuslEABIHF ||
-        TargetTriple.getEnvironment() == Triple::EABIHF ||
-        TargetTriple.isOSWindows() ||
-        TargetABI == ARMBaseTargetMachine::ARM_ABI_AAPCS16)
+    if (isTargetHardFloat())
       this->Options.FloatABIType = FloatABI::Hard;
     else
       this->Options.FloatABIType = FloatABI::Soft;
@@ -273,13 +267,20 @@ ARMBaseTargetMachine::getSubtargetImpl(const Function &F) const {
   if (SoftFloat)
     FS += FS.empty() ? "+soft-float" : ",+soft-float";
 
-  auto &I = SubtargetMap[CPU + FS];
+  // Use the optminsize to identify the subtarget, but don't use it in the
+  // feature string.
+  std::string Key = CPU + FS;
+  if (F.optForMinSize())
+    Key += "+minsize";
+
+  auto &I = SubtargetMap[Key];
   if (!I) {
     // This needs to be done before we create a new subtarget since any
     // creation will depend on the TM and the code generation flags on the
     // function that reside in TargetOptions.
     resetTargetOptions(F);
-    I = llvm::make_unique<ARMSubtarget>(TargetTriple, CPU, FS, *this, isLittle);
+    I = llvm::make_unique<ARMSubtarget>(TargetTriple, CPU, FS, *this, isLittle,
+                                        F.optForMinSize());
 
     if (!I->isThumb() && !I->hasARMOps())
       F.getContext().emitError("Function '" + F.getName() + "' uses ARM "
@@ -350,6 +351,7 @@ public:
   }
 
   void addIRPasses() override;
+  void addCodeGenPrepare() override;
   bool addPreISel() override;
   bool addInstSelector() override;
   bool addIRTranslator() override;
@@ -401,15 +403,22 @@ void ARMPassConfig::addIRPasses() {
 
   TargetPassConfig::addIRPasses();
 
+  // Run the parallel DSP pass.
+  if (getOptLevel() == CodeGenOpt::Aggressive) 
+    addPass(createARMParallelDSPPass());
+
   // Match interleaved memory accesses to ldN/stN intrinsics.
   if (TM->getOptLevel() != CodeGenOpt::None)
     addPass(createInterleavedAccessPass());
 }
 
-bool ARMPassConfig::addPreISel() {
+void ARMPassConfig::addCodeGenPrepare() {
   if (getOptLevel() != CodeGenOpt::None)
-    addPass(createARMParallelDSPPass());
+    addPass(createARMCodeGenPreparePass());
+  TargetPassConfig::addCodeGenPrepare();
+}
 
+bool ARMPassConfig::addPreISel() {
   if ((TM->getOptLevel() != CodeGenOpt::None &&
        EnableGlobalMerge == cl::BOU_UNSET) ||
       EnableGlobalMerge == cl::BOU_TRUE) {

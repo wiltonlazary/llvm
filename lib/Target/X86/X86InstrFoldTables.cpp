@@ -1,9 +1,8 @@
 //===-- X86InstrFoldTables.cpp - X86 Instruction Folding Tables -----------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -66,7 +65,9 @@ static const X86MemoryFoldTableEntry MemoryFoldTable2Addr[] = {
   { X86::ADD64rr_DB,  X86::ADD64mr,    TB_NO_REVERSE },
   { X86::ADD8ri,      X86::ADD8mi,     0 },
   { X86::ADD8ri8,     X86::ADD8mi8,    0 },
+  { X86::ADD8ri_DB,   X86::ADD8mi,     TB_NO_REVERSE },
   { X86::ADD8rr,      X86::ADD8mr,     0 },
+  { X86::ADD8rr_DB,   X86::ADD8mr,     TB_NO_REVERSE },
   { X86::AND16ri,     X86::AND16mi,    0 },
   { X86::AND16ri8,    X86::AND16mi8,   0 },
   { X86::AND16rr,     X86::AND16mr,    0 },
@@ -340,6 +341,8 @@ static const X86MemoryFoldTableEntry MemoryFoldTable0[] = {
   { X86::TAILJMPr,            X86::TAILJMPm,            TB_FOLDED_LOAD },
   { X86::TAILJMPr64,          X86::TAILJMPm64,          TB_FOLDED_LOAD },
   { X86::TAILJMPr64_REX,      X86::TAILJMPm64_REX,      TB_FOLDED_LOAD },
+  { X86::TCRETURNri,          X86::TCRETURNmi,          TB_FOLDED_LOAD | TB_NO_FORWARD },
+  { X86::TCRETURNri64,        X86::TCRETURNmi64,        TB_FOLDED_LOAD | TB_NO_FORWARD },
   { X86::TEST16ri,            X86::TEST16mi,            TB_FOLDED_LOAD },
   { X86::TEST16rr,            X86::TEST16mr,            TB_FOLDED_LOAD },
   { X86::TEST32ri,            X86::TEST32mi,            TB_FOLDED_LOAD },
@@ -1217,6 +1220,7 @@ static const X86MemoryFoldTableEntry MemoryFoldTable2[] = {
   { X86::ADD64rr,                  X86::ADD64rm,                  0 },
   { X86::ADD64rr_DB,               X86::ADD64rm,                  TB_NO_REVERSE },
   { X86::ADD8rr,                   X86::ADD8rm,                   0 },
+  { X86::ADD8rr_DB,                X86::ADD8rm,                   TB_NO_REVERSE },
   { X86::ADDPDrr,                  X86::ADDPDrm,                  TB_ALIGN_16 },
   { X86::ADDPSrr,                  X86::ADDPSrm,                  TB_ALIGN_16 },
   { X86::ADDSDrr,                  X86::ADDSDrm,                  0 },
@@ -1574,7 +1578,7 @@ static const X86MemoryFoldTableEntry MemoryFoldTable2[] = {
   { X86::SUBSDrr_Int,              X86::SUBSDrm_Int,              TB_NO_REVERSE },
   { X86::SUBSSrr,                  X86::SUBSSrm,                  0 },
   { X86::SUBSSrr_Int,              X86::SUBSSrm_Int,              TB_NO_REVERSE },
-  // FIXME: TEST*rr -> swapped      operand of TEST      *mr.     
+  // FIXME: TEST*rr -> swapped      operand of TEST      *mr.
   { X86::UNPCKHPDrr,               X86::UNPCKHPDrm,               TB_ALIGN_16 },
   { X86::UNPCKHPSrr,               X86::UNPCKHPSrm,               TB_ALIGN_16 },
   { X86::UNPCKLPDrr,               X86::UNPCKLPDrm,               TB_ALIGN_16 },

@@ -1,9 +1,8 @@
 //===- MIRPrinter.cpp - MIR serialization format printer ------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -50,6 +49,7 @@
 #include "llvm/IR/ModuleSlotTracker.h"
 #include "llvm/IR/Value.h"
 #include "llvm/MC/LaneBitmask.h"
+#include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCDwarf.h"
 #include "llvm/MC/MCSymbol.h"
 #include "llvm/Support/AtomicOrdering.h"
@@ -195,6 +195,7 @@ void MIRPrinter::print(const MachineFunction &MF) {
   YamlMF.Name = MF.getName();
   YamlMF.Alignment = MF.getAlignment();
   YamlMF.ExposesReturnsTwice = MF.exposesReturnsTwice();
+  YamlMF.HasWinCFI = MF.hasWinCFI();
 
   YamlMF.Legalized = MF.getProperties().hasProperty(
       MachineFunctionProperties::Property::Legalized);
@@ -214,6 +215,11 @@ void MIRPrinter::print(const MachineFunction &MF) {
     convert(YamlMF, *ConstantPool);
   if (const auto *JumpTableInfo = MF.getJumpTableInfo())
     convert(MST, YamlMF.JumpTableInfo, *JumpTableInfo);
+
+  const TargetMachine &TM = MF.getTarget();
+  YamlMF.MachineFuncInfo =
+      std::unique_ptr<yaml::MachineFunctionInfo>(TM.convertFuncInfoToYAML(MF));
+
   raw_string_ostream StrOS(YamlMF.Body.Value.Value);
   bool IsNewlineNeeded = false;
   for (const auto &MBB : MF) {
@@ -327,6 +333,8 @@ void MIRPrinter::convert(ModuleSlotTracker &MST,
   YamlMFI.HasCalls = MFI.hasCalls();
   YamlMFI.MaxCallFrameSize = MFI.isMaxCallFrameSizeComputed()
     ? MFI.getMaxCallFrameSize() : ~0u;
+  YamlMFI.CVBytesOfCalleeSavedRegisters =
+      MFI.getCVBytesOfCalleeSavedRegisters();
   YamlMFI.HasOpaqueSPAdjustment = MFI.hasOpaqueSPAdjustment();
   YamlMFI.HasVAStart = MFI.hasVAStart();
   YamlMFI.HasMustTailInVarArgFunc = MFI.hasMustTailInVarArgFunc();
@@ -348,7 +356,7 @@ void MIRPrinter::convertStackObjects(yaml::MachineFunction &YMF,
   const TargetRegisterInfo *TRI = MF.getSubtarget().getRegisterInfo();
   // Process fixed stack objects.
   unsigned ID = 0;
-  for (int I = MFI.getObjectIndexBegin(); I < 0; ++I) {
+  for (int I = MFI.getObjectIndexBegin(); I < 0; ++I, ++ID) {
     if (MFI.isDeadObjectIndex(I))
       continue;
 
@@ -365,12 +373,12 @@ void MIRPrinter::convertStackObjects(yaml::MachineFunction &YMF,
     YamlObject.IsAliased = MFI.isAliasedObjectIndex(I);
     YMF.FixedStackObjects.push_back(YamlObject);
     StackObjectOperandMapping.insert(
-        std::make_pair(I, FrameIndexOperand::createFixed(ID++)));
+        std::make_pair(I, FrameIndexOperand::createFixed(ID)));
   }
 
   // Process ordinary stack objects.
   ID = 0;
-  for (int I = 0, E = MFI.getObjectIndexEnd(); I < E; ++I) {
+  for (int I = 0, E = MFI.getObjectIndexEnd(); I < E; ++I, ++ID) {
     if (MFI.isDeadObjectIndex(I))
       continue;
 
@@ -391,24 +399,26 @@ void MIRPrinter::convertStackObjects(yaml::MachineFunction &YMF,
 
     YMF.StackObjects.push_back(YamlObject);
     StackObjectOperandMapping.insert(std::make_pair(
-        I, FrameIndexOperand::create(YamlObject.Name.Value, ID++)));
+        I, FrameIndexOperand::create(YamlObject.Name.Value, ID)));
   }
 
   for (const auto &CSInfo : MFI.getCalleeSavedInfo()) {
     yaml::StringValue Reg;
     printRegMIR(CSInfo.getReg(), Reg, TRI);
-    auto StackObjectInfo = StackObjectOperandMapping.find(CSInfo.getFrameIdx());
-    assert(StackObjectInfo != StackObjectOperandMapping.end() &&
-           "Invalid stack object index");
-    const FrameIndexOperand &StackObject = StackObjectInfo->second;
-    if (StackObject.IsFixed) {
-      YMF.FixedStackObjects[StackObject.ID].CalleeSavedRegister = Reg;
-      YMF.FixedStackObjects[StackObject.ID].CalleeSavedRestored =
-        CSInfo.isRestored();
-    } else {
-      YMF.StackObjects[StackObject.ID].CalleeSavedRegister = Reg;
-      YMF.StackObjects[StackObject.ID].CalleeSavedRestored =
-        CSInfo.isRestored();
+    if (!CSInfo.isSpilledToReg()) {
+      auto StackObjectInfo = StackObjectOperandMapping.find(CSInfo.getFrameIdx());
+      assert(StackObjectInfo != StackObjectOperandMapping.end() &&
+             "Invalid stack object index");
+      const FrameIndexOperand &StackObject = StackObjectInfo->second;
+      if (StackObject.IsFixed) {
+        YMF.FixedStackObjects[StackObject.ID].CalleeSavedRegister = Reg;
+        YMF.FixedStackObjects[StackObject.ID].CalleeSavedRestored =
+          CSInfo.isRestored();
+      } else {
+        YMF.StackObjects[StackObject.ID].CalleeSavedRegister = Reg;
+        YMF.StackObjects[StackObject.ID].CalleeSavedRestored =
+          CSInfo.isRestored();
+      }
     }
   }
   for (unsigned I = 0, E = MFI.getLocalFrameObjectCount(); I < E; ++I) {
@@ -694,6 +704,12 @@ void MIPrinter::print(const MachineInstr &MI) {
     OS << "afn ";
   if (MI.getFlag(MachineInstr::FmReassoc))
     OS << "reassoc ";
+  if (MI.getFlag(MachineInstr::NoUWrap))
+    OS << "nuw ";
+  if (MI.getFlag(MachineInstr::NoSWrap))
+    OS << "nsw ";
+  if (MI.getFlag(MachineInstr::IsExact))
+    OS << "exact ";
 
   OS << TII->getName(MI.getOpcode());
   if (I < E)
@@ -705,6 +721,23 @@ void MIPrinter::print(const MachineInstr &MI) {
       OS << ", ";
     print(MI, I, TRI, ShouldPrintRegisterTies,
           MI.getTypeToPrint(I, PrintedTypes, MRI));
+    NeedComma = true;
+  }
+
+  // Print any optional symbols attached to this instruction as-if they were
+  // operands.
+  if (MCSymbol *PreInstrSymbol = MI.getPreInstrSymbol()) {
+    if (NeedComma)
+      OS << ',';
+    OS << " pre-instr-symbol ";
+    MachineOperand::printSymbol(OS, *PreInstrSymbol);
+    NeedComma = true;
+  }
+  if (MCSymbol *PostInstrSymbol = MI.getPostInstrSymbol()) {
+    if (NeedComma)
+      OS << ',';
+    OS << " post-instr-symbol ";
+    MachineOperand::printSymbol(OS, *PostInstrSymbol);
     NeedComma = true;
   }
 

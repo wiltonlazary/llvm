@@ -1,9 +1,8 @@
 //===-- ARMSubtarget.cpp - ARM Subtarget Information ----------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -93,10 +92,12 @@ ARMFrameLowering *ARMSubtarget::initializeFrameLowering(StringRef CPU,
 
 ARMSubtarget::ARMSubtarget(const Triple &TT, const std::string &CPU,
                            const std::string &FS,
-                           const ARMBaseTargetMachine &TM, bool IsLittle)
+                           const ARMBaseTargetMachine &TM, bool IsLittle,
+                           bool MinSize)
     : ARMGenSubtargetInfo(TT, CPU, FS), UseMulOps(UseFusedMulOps),
-      CPUString(CPU), IsLittle(IsLittle), TargetTriple(TT), Options(TM.Options),
-      TM(TM), FrameLowering(initializeFrameLowering(CPU, FS)),
+      CPUString(CPU), OptMinSize(MinSize), IsLittle(IsLittle),
+      TargetTriple(TT), Options(TM.Options), TM(TM),
+      FrameLowering(initializeFrameLowering(CPU, FS)),
       // At this point initializeSubtargetDependencies has been called so
       // we can query directly.
       InstrInfo(isThumb1Only()
@@ -188,8 +189,10 @@ void ARMSubtarget::initSubtargetFeatures(StringRef CPU, StringRef FS) {
   assert(hasV6T2Ops() || !hasThumb2());
 
   // Execute only support requires movt support
-  if (genExecuteOnly())
-    assert(hasV8MBaselineOps() && !NoMovt && "Cannot generate execute-only code for this target");
+  if (genExecuteOnly()) {
+    NoMovt = false;
+    assert(hasV8MBaselineOps() && "Cannot generate execute-only code for this target");
+  }
 
   // Keep a pointer to static instruction cost data for the specified CPU.
   SchedModel = getSchedModelForCPU(CPUString);
@@ -281,13 +284,20 @@ void ARMSubtarget::initSubtargetFeatures(StringRef CPU, StringRef FS) {
   case CortexA72:
   case CortexA73:
   case CortexA75:
+  case CortexA76:
   case CortexR4:
   case CortexR4F:
   case CortexR5:
   case CortexR7:
   case CortexM3:
   case CortexR52:
-  case ExynosM1:
+    break;
+  case Exynos:
+    LdStMultipleTiming = SingleIssuePlusExtras;
+    MaxInterleaveFactor = 4;
+    if (!isThumb())
+      PrefLoopAlignment = 3;
+    break;
   case Kryo:
     break;
   case Krait:
@@ -301,6 +311,8 @@ void ARMSubtarget::initSubtargetFeatures(StringRef CPU, StringRef FS) {
     break;
   }
 }
+
+bool ARMSubtarget::isTargetHardFloat() const { return TM.isTargetHardFloat(); }
 
 bool ARMSubtarget::isAPCS_ABI() const {
   assert(TM.TargetABI != ARMBaseTargetMachine::ARM_ABI_UNKNOWN);
@@ -364,19 +376,20 @@ bool ARMSubtarget::enablePostRAScheduler() const {
 
 bool ARMSubtarget::enableAtomicExpand() const { return hasAnyDataBarrier(); }
 
-bool ARMSubtarget::useStride4VFPs(const MachineFunction &MF) const {
+bool ARMSubtarget::useStride4VFPs() const {
   // For general targets, the prologue can grow when VFPs are allocated with
   // stride 4 (more vpush instructions). But WatchOS uses a compact unwind
   // format which it's more important to get right.
-  return isTargetWatchABI() || (isSwift() && !MF.getFunction().optForMinSize());
+  return isTargetWatchABI() ||
+         (useWideStrideVFP() && !OptMinSize);
 }
 
-bool ARMSubtarget::useMovt(const MachineFunction &MF) const {
+bool ARMSubtarget::useMovt() const {
   // NOTE Windows on ARM needs to use mov.w/mov.t pairs to materialise 32-bit
   // immediates as it is inherently position independent, and may be out of
   // range otherwise.
   return !NoMovt && hasV8MBaselineOps() &&
-         (isTargetWindows() || !MF.getFunction().optForMinSize() || genExecuteOnly());
+         (isTargetWindows() || !OptMinSize || genExecuteOnly());
 }
 
 bool ARMSubtarget::useFastISel() const {

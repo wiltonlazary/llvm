@@ -1,9 +1,8 @@
 //===-- PPCInstPrinter.cpp - Convert PPC MCInst to assembly syntax --------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -175,7 +174,7 @@ void PPCInstPrinter::printInst(const MCInst *MI, raw_ostream &O,
 
 
 void PPCInstPrinter::printPredicateOperand(const MCInst *MI, unsigned OpNo,
-                                           raw_ostream &O, 
+                                           raw_ostream &O,
                                            const char *Modifier) {
   unsigned Code = MI->getOperand(OpNo).getImm();
 
@@ -382,8 +381,11 @@ void PPCInstPrinter::printBranchOperand(const MCInst *MI, unsigned OpNo,
 
   // Branches can take an immediate operand.  This is used by the branch
   // selection pass to print .+8, an eight byte displacement from the PC.
-  O << ".+";
-  printAbsBranchOperand(MI, OpNo, O);
+  O << ".";
+  int32_t Imm = SignExtend32<32>((unsigned)MI->getOperand(OpNo).getImm() << 2);
+  if (Imm >= 0)
+    O << "+";
+  O << Imm;
 }
 
 void PPCInstPrinter::printAbsBranchOperand(const MCInst *MI, unsigned OpNo,
@@ -442,13 +444,22 @@ void PPCInstPrinter::printTLSCall(const MCInst *MI, unsigned OpNo,
   // On PPC64, VariantKind is VK_None, but on PPC32, it's VK_PLT, and it must
   // come at the _end_ of the expression.
   const MCOperand &Op = MI->getOperand(OpNo);
-  const MCSymbolRefExpr &refExp = cast<MCSymbolRefExpr>(*Op.getExpr());
-  O << refExp.getSymbol().getName();
+  const MCSymbolRefExpr *RefExp = nullptr;
+  const MCConstantExpr *ConstExp = nullptr;
+  if (const MCBinaryExpr *BinExpr = dyn_cast<MCBinaryExpr>(Op.getExpr())) {
+    RefExp = cast<MCSymbolRefExpr>(BinExpr->getLHS());
+    ConstExp = cast<MCConstantExpr>(BinExpr->getRHS());
+  } else
+    RefExp = cast<MCSymbolRefExpr>(Op.getExpr());
+
+  O << RefExp->getSymbol().getName();
   O << '(';
   printOperand(MI, OpNo+1, O);
   O << ')';
-  if (refExp.getKind() != MCSymbolRefExpr::VK_None)
-    O << '@' << MCSymbolRefExpr::getVariantKindName(refExp.getKind());
+  if (RefExp->getKind() != MCSymbolRefExpr::VK_None)
+    O << '@' << MCSymbolRefExpr::getVariantKindName(RefExp->getKind());
+  if (ConstExp != nullptr)
+    O << '+' << ConstExp->getValue();
 }
 
 /// showRegistersWithPercentPrefix - Check if this register name should be
@@ -499,43 +510,14 @@ bool PPCInstPrinter::showRegistersWithPrefix() const {
   return TT.isOSDarwin() || FullRegNamesWithPercent || FullRegNames;
 }
 
-/// stripRegisterPrefix - This method strips the character prefix from a
-/// register name so that only the number is left.
-static const char *stripRegisterPrefix(const char *RegName) {
-  switch (RegName[0]) {
-  case 'r':
-  case 'f':
-  case 'q': // for QPX
-  case 'v':
-    if (RegName[1] == 's')
-      return RegName + 2;
-    return RegName + 1;
-  case 'c': if (RegName[1] == 'r') return RegName + 2;
-  }
-
-  return RegName;
-}
-
 void PPCInstPrinter::printOperand(const MCInst *MI, unsigned OpNo,
                                   raw_ostream &O) {
   const MCOperand &Op = MI->getOperand(OpNo);
   if (Op.isReg()) {
     unsigned Reg = Op.getReg();
-
-    // There are VSX instructions that use VSX register numbering (vs0 - vs63)
-    // as well as those that use VMX register numbering (v0 - v31 which
-    // correspond to vs32 - vs63). If we have an instruction that uses VSX
-    // numbering, we need to convert the VMX registers to VSX registers.
-    // Namely, we print 32-63 when the instruction operates on one of the
-    // VMX registers.
-    // (Please synchronize with PPCAsmPrinter::printOperand)
-    if ((MII.get(MI->getOpcode()).TSFlags & PPCII::UseVSXReg) &&
-        !ShowVSRNumsAsVR) {
-      if (PPCInstrInfo::isVRRegister(Reg))
-        Reg = PPC::VSX32 + (Reg - PPC::V0);
-      else if (PPCInstrInfo::isVFRegister(Reg))
-        Reg = PPC::VSX32 + (Reg - PPC::VF0);
-    }
+    if (!ShowVSRNumsAsVR)
+      Reg = PPCInstrInfo::getRegNumForOperand(MII.get(MI->getOpcode()),
+                                              Reg, OpNo);
 
     const char *RegName;
     RegName = getVerboseConditionRegName(Reg, MRI.getEncodingValue(Reg));
@@ -544,7 +526,7 @@ void PPCInstPrinter::printOperand(const MCInst *MI, unsigned OpNo,
     if (showRegistersWithPercentPrefix(RegName))
       O << "%";
     if (!showRegistersWithPrefix())
-      RegName = stripRegisterPrefix(RegName);
+      RegName = PPCRegisterInfo::stripRegisterPrefix(RegName);
 
     O << RegName;
     return;

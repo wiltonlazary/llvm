@@ -1,17 +1,19 @@
 add_llvm_library(LLVMInstrumentation
   AddressSanitizer.cpp
   BoundsChecking.cpp
+  CGProfile.cpp
+  ControlHeightReduction.cpp
   DataFlowSanitizer.cpp
   GCOVProfiling.cpp
   MemorySanitizer.cpp
   IndirectCallPromotion.cpp
   Instrumentation.cpp
+  InstrOrderFile.cpp
   InstrProfiling.cpp
   PGOInstrumentation.cpp
   PGOMemOPSizeOpt.cpp
   SanitizerCoverage.cpp
   ThreadSanitizer.cpp
-  EfficiencySanitizer.cpp
   HWAddressSanitizer.cpp
 
   ADDITIONAL_HEADER_DIRS

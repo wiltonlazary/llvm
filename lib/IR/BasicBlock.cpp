@@ -1,9 +1,8 @@
 //===-- BasicBlock.cpp - Implement BasicBlock related methods -------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -135,9 +134,10 @@ const Module *BasicBlock::getModule() const {
   return getParent()->getParent();
 }
 
-const TerminatorInst *BasicBlock::getTerminator() const {
-  if (InstList.empty()) return nullptr;
-  return dyn_cast<TerminatorInst>(&InstList.back());
+const Instruction *BasicBlock::getTerminator() const {
+  if (InstList.empty() || !InstList.back().isTerminator())
+    return nullptr;
+  return &InstList.back();
 }
 
 const CallInst *BasicBlock::getTerminatingMustTailCall() const {
@@ -205,10 +205,8 @@ const Instruction* BasicBlock::getFirstNonPHIOrDbgOrLifetime() const {
     if (isa<PHINode>(I) || isa<DbgInfoIntrinsic>(I))
       continue;
 
-    if (auto *II = dyn_cast<IntrinsicInst>(&I))
-      if (II->getIntrinsicID() == Intrinsic::lifetime_start ||
-          II->getIntrinsicID() == Intrinsic::lifetime_end)
-        continue;
+    if (I.isLifetimeStartOrEnd())
+      continue;
 
     return &I;
   }
@@ -259,6 +257,14 @@ const BasicBlock *BasicBlock::getUniquePredecessor() const {
   return PredBB;
 }
 
+bool BasicBlock::hasNPredecessors(unsigned N) const {
+  return hasNItems(pred_begin(this), pred_end(this), N);
+}
+
+bool BasicBlock::hasNPredecessorsOrMore(unsigned N) const {
+  return hasNItemsOrMore(pred_begin(this), pred_end(this), N);
+}
+
 const BasicBlock *BasicBlock::getSingleSuccessor() const {
   succ_const_iterator SI = succ_begin(this), E = succ_end(this);
   if (SI == E) return nullptr; // no successors
@@ -293,7 +299,7 @@ iterator_range<BasicBlock::phi_iterator> BasicBlock::phis() {
 /// called while the predecessor still refers to this block.
 ///
 void BasicBlock::removePredecessor(BasicBlock *Pred,
-                                   bool DontDeleteUselessPHIs) {
+                                   bool KeepOneInputPHIs) {
   assert((hasNUsesOrMore(16)||// Reduce cost of this assertion for complex CFGs.
           find(pred_begin(this), pred_end(this), Pred) != pred_end(this)) &&
          "removePredecessor: BB is not a predecessor!");
@@ -324,11 +330,11 @@ void BasicBlock::removePredecessor(BasicBlock *Pred,
   }
 
   // <= Two predecessors BEFORE I remove one?
-  if (max_idx <= 2 && !DontDeleteUselessPHIs) {
+  if (max_idx <= 2 && !KeepOneInputPHIs) {
     // Yup, loop through and nuke the PHI nodes
     while (PHINode *PN = dyn_cast<PHINode>(&front())) {
       // Remove the predecessor first.
-      PN->removeIncomingValue(Pred, !DontDeleteUselessPHIs);
+      PN->removeIncomingValue(Pred, !KeepOneInputPHIs);
 
       // If the PHI _HAD_ two uses, replace PHI node with its now *single* value
       if (max_idx == 2) {
@@ -353,7 +359,7 @@ void BasicBlock::removePredecessor(BasicBlock *Pred,
       // If all incoming values to the Phi are the same, we can replace the Phi
       // with that value.
       Value* PNV = nullptr;
-      if (!DontDeleteUselessPHIs && (PNV = PN->hasConstantValue()))
+      if (!KeepOneInputPHIs && (PNV = PN->hasConstantValue()))
         if (PNV != PN) {
           PN->replaceAllUsesWith(PNV);
           PN->eraseFromParent();
@@ -384,7 +390,7 @@ bool BasicBlock::isLegalToHoistInto() const {
   assert(Term->getNumSuccessors() > 0);
 
   // Instructions should not be hoisted across exception handling boundaries.
-  return !Term->isExceptional();
+  return !Term->isExceptionalTerminator();
 }
 
 /// This splits a basic block into two at the specified
@@ -437,12 +443,12 @@ BasicBlock *BasicBlock::splitBasicBlock(iterator I, const Twine &BBName) {
 }
 
 void BasicBlock::replaceSuccessorsPhiUsesWith(BasicBlock *New) {
-  TerminatorInst *TI = getTerminator();
+  Instruction *TI = getTerminator();
   if (!TI)
     // Cope with being called on a BasicBlock that doesn't have a terminator
     // yet. Clang's CodeGenFunction::EmitReturnBlock() likes to do this.
     return;
-  for (BasicBlock *Succ : TI->successors()) {
+  for (BasicBlock *Succ : successors(TI)) {
     // N.B. Succ might not be a complete BasicBlock, so don't assume
     // that it ends with a non-phi instruction.
     for (iterator II = Succ->begin(), IE = Succ->end(); II != IE; ++II) {
@@ -468,7 +474,7 @@ const LandingPadInst *BasicBlock::getLandingPadInst() const {
 }
 
 Optional<uint64_t> BasicBlock::getIrrLoopHeaderWeight() const {
-  const TerminatorInst *TI = getTerminator();
+  const Instruction *TI = getTerminator();
   if (MDNode *MDIrrLoopHeader =
       TI->getMetadata(LLVMContext::MD_irr_loop)) {
     MDString *MDName = cast<MDString>(MDIrrLoopHeader->getOperand(0));

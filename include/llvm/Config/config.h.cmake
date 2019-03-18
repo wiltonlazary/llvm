@@ -13,6 +13,9 @@
 /* Define to 1 to enable crash overrides, and to 0 otherwise. */
 #cmakedefine01 ENABLE_CRASH_OVERRIDES
 
+/* Define to 1 to enable crash memory dumps, and to 0 otherwise. */
+#cmakedefine01 LLVM_ENABLE_CRASH_DUMPS
+
 /* Define to 1 if you have the `backtrace' function. */
 #cmakedefine HAVE_BACKTRACE ${HAVE_BACKTRACE}
 
@@ -124,9 +127,6 @@
 /* Define to 1 if you have the `mallinfo' function. */
 #cmakedefine HAVE_MALLINFO ${HAVE_MALLINFO}
 
-/* Define to 1 if you have the <malloc.h> header file. */
-#cmakedefine HAVE_MALLOC_H ${HAVE_MALLOC_H}
-
 /* Define to 1 if you have the <malloc/malloc.h> header file. */
 #cmakedefine HAVE_MALLOC_MALLOC_H ${HAVE_MALLOC_MALLOC_H}
 
@@ -204,6 +204,12 @@
 
 /* Define to 1 if you have the <sys/time.h> header file. */
 #cmakedefine HAVE_SYS_TIME_H ${HAVE_SYS_TIME_H}
+
+/* Define to 1 if stat struct has st_mtimespec member .*/
+#cmakedefine HAVE_STRUCT_STAT_ST_MTIMESPEC_TV_NSEC ${HAVE_STRUCT_STAT_ST_MTIMESPEC_TV_NSEC}
+
+/* Define to 1 if stat struct has st_mtim member. */
+#cmakedefine HAVE_STRUCT_STAT_ST_MTIM_TV_NSEC ${HAVE_STRUCT_STAT_ST_MTIM_TV_NSEC}
 
 /* Define to 1 if you have the <sys/types.h> header file. */
 #cmakedefine HAVE_SYS_TYPES_H ${HAVE_SYS_TYPES_H}
@@ -329,6 +335,9 @@
 /* Define as the return type of signal handlers (`int' or `void'). */
 #cmakedefine RETSIGTYPE ${RETSIGTYPE}
 
+/* Define if std::is_trivially_copyable is supported */
+#cmakedefine HAVE_STD_IS_TRIVIALLY_COPYABLE ${HAVE_STD_IS_TRIVIALLY_COPYABLE}
+
 /* Define to a function implementing stricmp */
 #cmakedefine stricmp ${stricmp}
 
@@ -340,5 +349,8 @@
 
 /* Define to the default GlobalISel coverage file prefix */
 #cmakedefine LLVM_GISEL_COV_PREFIX "${LLVM_GISEL_COV_PREFIX}"
+
+/* Whether Timers signpost passes in Xcode Instruments */
+#cmakedefine01 LLVM_SUPPORT_XCODE_SIGNPOSTS
 
 #endif

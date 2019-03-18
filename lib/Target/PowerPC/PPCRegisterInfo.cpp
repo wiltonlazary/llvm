@@ -1,9 +1,8 @@
 //===-- PPCRegisterInfo.cpp - PowerPC Register Information ----------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -71,6 +70,8 @@ StackPtrConst("ppc-stack-ptr-caller-preserved",
                          "caller preserved registers can be LICM candidates"),
                 cl::init(true), cl::Hidden);
 
+static unsigned offsetMinAlignForOpcode(unsigned OpC);
+
 PPCRegisterInfo::PPCRegisterInfo(const PPCTargetMachine &TM)
   : PPCGenRegisterInfo(TM.isPPC64() ? PPC::LR8 : PPC::LR,
                        TM.isPPC64() ? 0 : 1,
@@ -106,6 +107,12 @@ PPCRegisterInfo::PPCRegisterInfo(const PPCTargetMachine &TM)
   ImmToIdxMap[PPC::STXV] = PPC::STXVX;
   ImmToIdxMap[PPC::STXSD] = PPC::STXSDX;
   ImmToIdxMap[PPC::STXSSP] = PPC::STXSSPX;
+
+  // SPE
+  ImmToIdxMap[PPC::EVLDD] = PPC::EVLDDX;
+  ImmToIdxMap[PPC::EVSTDD] = PPC::EVSTDDX;
+  ImmToIdxMap[PPC::SPESTW] = PPC::SPESTWX;
+  ImmToIdxMap[PPC::SPELWZ] = PPC::SPELWZX;
 }
 
 /// getPointerRegClass - Return the register class to use to hold pointers.
@@ -146,6 +153,9 @@ PPCRegisterInfo::getCalleeSavedRegs(const MachineFunction *MF) const {
 
   if (TM.isPPC64() && MF->getInfo<PPCFunctionInfo>()->isSplitCSR())
     return CSR_SRV464_TLS_PE_SaveList;
+
+  if (Subtarget.hasSPE())
+    return CSR_SVR432_SPE_SaveList;
 
   // On PPC64, we might need to save r2 (but only if it is not reserved).
   bool SaveR2 = MF->getRegInfo().isAllocatable(PPC::X2);
@@ -307,6 +317,51 @@ BitVector PPCRegisterInfo::getReservedRegs(const MachineFunction &MF) const {
   return Reserved;
 }
 
+bool PPCRegisterInfo::requiresFrameIndexScavenging(const MachineFunction &MF) const {
+  const PPCSubtarget &Subtarget = MF.getSubtarget<PPCSubtarget>();
+  const PPCInstrInfo *InstrInfo =  Subtarget.getInstrInfo();
+  const MachineFrameInfo &MFI = MF.getFrameInfo();
+  const std::vector<CalleeSavedInfo> &Info = MFI.getCalleeSavedInfo();
+
+  // If the callee saved info is invalid we have to default to true for safety.
+  if (!MFI.isCalleeSavedInfoValid())
+    return true;
+
+  // We will require the use of X-Forms because the frame is larger than what
+  // can be represented in signed 16 bits that fit in the immediate of a D-Form.
+  // If we need an X-Form then we need a register to store the address offset.
+  unsigned FrameSize = MFI.getStackSize();
+  // Signed 16 bits means that the FrameSize cannot be more than 15 bits.
+  if (FrameSize & ~0x7FFF)
+    return true;
+
+  // The callee saved info is valid so it can be traversed.
+  // Checking for registers that need saving that do not have load or store
+  // forms where the address offset is an immediate.
+  for (unsigned i = 0; i < Info.size(); i++) {
+    int FrIdx = Info[i].getFrameIdx();
+    unsigned Reg = Info[i].getReg();
+
+    unsigned Opcode = InstrInfo->getStoreOpcodeForSpill(Reg);
+    if (!MFI.isFixedObjectIndex(FrIdx)) {
+      // This is not a fixed object. If it requires alignment then we may still
+      // need to use the XForm.
+      if (offsetMinAlignForOpcode(Opcode) > 1)
+        return true;
+    }
+
+    // This is eiher:
+    // 1) A fixed frame index object which we know are aligned so
+    // as long as we have a valid DForm/DSForm/DQForm (non XForm) we don't
+    // need to consider the alignement here.
+    // 2) A not fixed object but in that case we now know that the min required
+    // alignment is no more than 1 based on the previous check.
+    if (InstrInfo->isXFormMemOp(Opcode))
+      return true;
+  }
+  return false;
+}
+
 bool PPCRegisterInfo::isCallerPreservedPhysReg(unsigned PhysReg,
                                                const MachineFunction &MF) const {
   assert(TargetRegisterInfo::isPhysicalRegister(PhysReg));
@@ -342,6 +397,8 @@ unsigned PPCRegisterInfo::getRegPressureLimit(const TargetRegisterClass *RC,
     return 0;
   case PPC::G8RC_NOX0RegClassID:
   case PPC::GPRC_NOR0RegClassID:
+  case PPC::SPERCRegClassID:
+  case PPC::SPE4RCRegClassID:
   case PPC::G8RCRegClassID:
   case PPC::GPRCRegClassID: {
     unsigned FP = TFI->hasFP(MF) ? 1 : 0;
@@ -662,12 +719,15 @@ void PPCRegisterInfo::lowerCRBitSpilling(MachineBasicBlock::iterator II,
   unsigned Reg = MF.getRegInfo().createVirtualRegister(LP64 ? G8RC : GPRC);
   unsigned SrcReg = MI.getOperand(0).getReg();
 
-  BuildMI(MBB, II, dl, TII.get(TargetOpcode::KILL),
-          getCRFromCRBit(SrcReg))
-          .addReg(SrcReg, getKillRegState(MI.getOperand(0).isKill()));
-
+  // We need to move the CR field that contains the CR bit we are spilling.
+  // The super register may not be explicitly defined (i.e. it can be defined
+  // by a CR-logical that only defines the subreg) so we state that the CR
+  // field is undef. Also, in order to preserve the kill flag on the CR bit,
+  // we add it as an implicit use.
   BuildMI(MBB, II, dl, TII.get(LP64 ? PPC::MFOCRF8 : PPC::MFOCRF), Reg)
-      .addReg(getCRFromCRBit(SrcReg));
+      .addReg(getCRFromCRBit(SrcReg), RegState::Undef)
+      .addReg(SrcReg,
+              RegState::Implicit | getKillRegState(MI.getOperand(0).isKill()));
 
   // If the saved register wasn't CR0LT, shift the bits left so that the bit to
   // store is the first one. Mask all but that bit.
@@ -812,9 +872,7 @@ bool PPCRegisterInfo::hasReservedSpillSlot(const MachineFunction &MF,
 }
 
 // If the offset must be a multiple of some value, return what that value is.
-static unsigned offsetMinAlign(const MachineInstr &MI) {
-  unsigned OpC = MI.getOpcode();
-
+static unsigned offsetMinAlignForOpcode(unsigned OpC) {
   switch (OpC) {
   default:
     return 1;
@@ -837,6 +895,12 @@ static unsigned offsetMinAlign(const MachineInstr &MI) {
   case PPC::STXV:
     return 16;
   }
+}
+
+// If the offset must be a multiple of some value, return what that value is.
+static unsigned offsetMinAlign(const MachineInstr &MI) {
+  unsigned OpC = MI.getOpcode();
+  return offsetMinAlignForOpcode(OpC);
 }
 
 // Return the OffsetOperandNo given the FIOperandNum (and the instruction).
@@ -968,7 +1032,7 @@ PPCRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
            SReg = MF.getRegInfo().createVirtualRegister(RC);
 
   // Insert a set of rA with the full offset value before the ld, st, or add
-  if (isInt<16>(Offset)) 
+  if (isInt<16>(Offset))
     BuildMI(MBB, II, dl, TII.get(is64Bit ? PPC::LI8 : PPC::LI), SReg)
       .addImm(Offset);
   else {
@@ -987,7 +1051,8 @@ PPCRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
 
   if (noImmForm)
     OperandBase = 1;
-  else if (OpC != TargetOpcode::INLINEASM) {
+  else if (OpC != TargetOpcode::INLINEASM &&
+           OpC != TargetOpcode::INLINEASM_BR) {
     assert(ImmToIdxMap.count(OpC) &&
            "No indexed form of load or store available!");
     unsigned NewOpcode = ImmToIdxMap.find(OpC)->second;
@@ -1066,7 +1131,7 @@ needsFrameBaseReg(MachineInstr *MI, int64_t Offset) const {
   MachineBasicBlock &MBB = *MI->getParent();
   MachineFunction &MF = *MBB.getParent();
   const PPCFrameLowering *TFI = getFrameLowering(MF);
-  unsigned StackEst = TFI->determineFrameLayout(MF, false, true);
+  unsigned StackEst = TFI->determineFrameLayout(MF, true);
 
   // If we likely don't need a stack frame, then we probably don't need a
   // virtual base register either.

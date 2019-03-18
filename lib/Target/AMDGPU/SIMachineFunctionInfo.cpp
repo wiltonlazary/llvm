@@ -1,9 +1,8 @@
 //===- SIMachineFunctionInfo.cpp - SI Machine Function Info ---------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -54,6 +53,16 @@ SIMachineFunctionInfo::SIMachineFunctionInfo(const MachineFunction &MF)
 
   Occupancy = getMaxWavesPerEU();
   limitOccupancy(MF);
+  CallingConv::ID CC = F.getCallingConv();
+
+  if (CC == CallingConv::AMDGPU_KERNEL || CC == CallingConv::SPIR_KERNEL) {
+    if (!F.arg_empty())
+      KernargSegmentPtr = true;
+    WorkGroupIDX = true;
+    WorkItemIDX = true;
+  } else if (CC == CallingConv::AMDGPU_PS) {
+    PSInputAddr = AMDGPU::getInitialPSInputAddr(F);
+  }
 
   if (!isEntryFunction()) {
     // Non-entry functions have no special inputs for now, other registers
@@ -73,51 +82,30 @@ SIMachineFunctionInfo::SIMachineFunctionInfo(const MachineFunction &MF)
   } else {
     if (F.hasFnAttribute("amdgpu-implicitarg-ptr")) {
       KernargSegmentPtr = true;
-      assert(MaxKernArgAlign == 0);
-      MaxKernArgAlign =  ST.getAlignmentForImplicitArgPtr();
+      MaxKernArgAlign = std::max(ST.getAlignmentForImplicitArgPtr(),
+                                 MaxKernArgAlign);
     }
   }
 
-  CallingConv::ID CC = F.getCallingConv();
-  if (CC == CallingConv::AMDGPU_KERNEL || CC == CallingConv::SPIR_KERNEL) {
-    if (!F.arg_empty())
-      KernargSegmentPtr = true;
+  if (F.hasFnAttribute("amdgpu-work-group-id-x"))
     WorkGroupIDX = true;
-    WorkItemIDX = true;
-  } else if (CC == CallingConv::AMDGPU_PS) {
-    PSInputAddr = AMDGPU::getInitialPSInputAddr(F);
-  }
 
-  if (ST.debuggerEmitPrologue()) {
-    // Enable everything.
-    WorkGroupIDX = true;
+  if (F.hasFnAttribute("amdgpu-work-group-id-y"))
     WorkGroupIDY = true;
+
+  if (F.hasFnAttribute("amdgpu-work-group-id-z"))
     WorkGroupIDZ = true;
+
+  if (F.hasFnAttribute("amdgpu-work-item-id-x"))
     WorkItemIDX = true;
+
+  if (F.hasFnAttribute("amdgpu-work-item-id-y"))
     WorkItemIDY = true;
+
+  if (F.hasFnAttribute("amdgpu-work-item-id-z"))
     WorkItemIDZ = true;
-  } else {
-    if (F.hasFnAttribute("amdgpu-work-group-id-x"))
-      WorkGroupIDX = true;
-
-    if (F.hasFnAttribute("amdgpu-work-group-id-y"))
-      WorkGroupIDY = true;
-
-    if (F.hasFnAttribute("amdgpu-work-group-id-z"))
-      WorkGroupIDZ = true;
-
-    if (F.hasFnAttribute("amdgpu-work-item-id-x"))
-      WorkItemIDX = true;
-
-    if (F.hasFnAttribute("amdgpu-work-item-id-y"))
-      WorkItemIDY = true;
-
-    if (F.hasFnAttribute("amdgpu-work-item-id-z"))
-      WorkItemIDZ = true;
-  }
 
   const MachineFrameInfo &FrameInfo = MF.getFrameInfo();
-  bool MaySpill = ST.isVGPRSpillingEnabled(F);
   bool HasStackObjects = FrameInfo.hasStackObjects();
 
   if (isEntryFunction()) {
@@ -126,21 +114,18 @@ SIMachineFunctionInfo::SIMachineFunctionInfo(const MachineFunction &MF)
     if (WorkItemIDZ)
       WorkItemIDY = true;
 
-    if (HasStackObjects || MaySpill) {
-      PrivateSegmentWaveByteOffset = true;
+    PrivateSegmentWaveByteOffset = true;
 
     // HS and GS always have the scratch wave offset in SGPR5 on GFX9.
     if (ST.getGeneration() >= AMDGPUSubtarget::GFX9 &&
         (CC == CallingConv::AMDGPU_HS || CC == CallingConv::AMDGPU_GS))
-      ArgInfo.PrivateSegmentWaveByteOffset
-        = ArgDescriptor::createRegister(AMDGPU::SGPR5);
-    }
+      ArgInfo.PrivateSegmentWaveByteOffset =
+          ArgDescriptor::createRegister(AMDGPU::SGPR5);
   }
 
-  bool IsCOV2 = ST.isAmdCodeObjectV2(F);
-  if (IsCOV2) {
-    if (HasStackObjects || MaySpill)
-      PrivateSegmentBuffer = true;
+  bool isAmdHsaOrMesa = ST.isAmdHsaOrMesa(F);
+  if (isAmdHsaOrMesa) {
+    PrivateSegmentBuffer = true;
 
     if (F.hasFnAttribute("amdgpu-dispatch-ptr"))
       DispatchPtr = true;
@@ -151,14 +136,13 @@ SIMachineFunctionInfo::SIMachineFunctionInfo(const MachineFunction &MF)
     if (F.hasFnAttribute("amdgpu-dispatch-id"))
       DispatchID = true;
   } else if (ST.isMesaGfxShader(F)) {
-    if (HasStackObjects || MaySpill)
-      ImplicitBufferPtr = true;
+    ImplicitBufferPtr = true;
   }
 
   if (F.hasFnAttribute("amdgpu-kernarg-segment-ptr"))
     KernargSegmentPtr = true;
 
-  if (ST.hasFlatAddressSpace() && isEntryFunction() && IsCOV2) {
+  if (ST.hasFlatAddressSpace() && isEntryFunction() && isAmdHsaOrMesa) {
     // TODO: This could be refined a lot. The attribute is a poor way of
     // detecting calls that may require it before argument lowering.
     if (HasStackObjects || F.hasFnAttribute("amdgpu-flat-scratch"))
@@ -334,4 +318,43 @@ MCPhysReg SIMachineFunctionInfo::getNextUserSGPR() const {
 
 MCPhysReg SIMachineFunctionInfo::getNextSystemSGPR() const {
   return AMDGPU::SGPR0 + NumUserSGPRs + NumSystemSGPRs;
+}
+
+static yaml::StringValue regToString(unsigned Reg,
+                                     const TargetRegisterInfo &TRI) {
+  yaml::StringValue Dest;
+  raw_string_ostream OS(Dest.Value);
+  OS << printReg(Reg, &TRI);
+  return Dest;
+}
+
+yaml::SIMachineFunctionInfo::SIMachineFunctionInfo(
+  const llvm::SIMachineFunctionInfo& MFI,
+  const TargetRegisterInfo &TRI)
+  : ExplicitKernArgSize(MFI.getExplicitKernArgSize()),
+    MaxKernArgAlign(MFI.getMaxKernArgAlign()),
+    LDSSize(MFI.getLDSSize()),
+    IsEntryFunction(MFI.isEntryFunction()),
+    NoSignedZerosFPMath(MFI.hasNoSignedZerosFPMath()),
+    MemoryBound(MFI.isMemoryBound()),
+    WaveLimiter(MFI.needsWaveLimiter()),
+    ScratchRSrcReg(regToString(MFI.getScratchRSrcReg(), TRI)),
+    ScratchWaveOffsetReg(regToString(MFI.getScratchWaveOffsetReg(), TRI)),
+    FrameOffsetReg(regToString(MFI.getFrameOffsetReg(), TRI)),
+    StackPtrOffsetReg(regToString(MFI.getStackPtrOffsetReg(), TRI)) {}
+
+void yaml::SIMachineFunctionInfo::mappingImpl(yaml::IO &YamlIO) {
+  MappingTraits<SIMachineFunctionInfo>::mapping(YamlIO, *this);
+}
+
+bool SIMachineFunctionInfo::initializeBaseYamlFields(
+  const yaml::SIMachineFunctionInfo &YamlMFI) {
+  ExplicitKernArgSize = YamlMFI.ExplicitKernArgSize;
+  MaxKernArgAlign = YamlMFI.MaxKernArgAlign;
+  LDSSize = YamlMFI.LDSSize;
+  IsEntryFunction = YamlMFI.IsEntryFunction;
+  NoSignedZerosFPMath = YamlMFI.NoSignedZerosFPMath;
+  MemoryBound = YamlMFI.MemoryBound;
+  WaveLimiter = YamlMFI.WaveLimiter;
+  return false;
 }

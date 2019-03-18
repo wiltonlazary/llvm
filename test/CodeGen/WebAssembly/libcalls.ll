@@ -1,4 +1,4 @@
-; RUN: llc < %s -asm-verbose=false -disable-wasm-fallthrough-return-opt | FileCheck %s
+; RUN: llc < %s -asm-verbose=false -disable-wasm-fallthrough-return-opt -wasm-keep-registers | FileCheck %s
 
 ; Test a subset of compiler-rt/libm libcalls expected to be emitted by the wasm backend
 
@@ -52,9 +52,9 @@ define i128 @i128libcalls(i128 %x, i128 %y) {
 
 ; CHECK-LABEL: f64libcalls:
 define double @f64libcalls(double %x, double %y) {
- ; CHECK: f64.call $push{{[0-9]}}=, cos@FUNCTION
+ ; CHECK: f64.call $push{{[0-9]}}=, cos
  %a = call double @llvm.cos.f64(double %x)
- ; CHECK: f64.call $push{{[0-9]}}=, log10@FUNCTION
+ ; CHECK: f64.call $push{{[0-9]}}=, log10
  %b = call double @llvm.log10.f64(double %a)
  ret double %b
 }

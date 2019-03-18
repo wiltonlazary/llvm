@@ -1,9 +1,8 @@
 //===-LTOBackend.cpp - LLVM Link Time Optimizer Backend -------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -138,22 +137,38 @@ createTargetMachine(Config &Conf, const Target *TheTarget, Module &M) {
     RelocModel =
         M.getPICLevel() == PICLevel::NotPIC ? Reloc::Static : Reloc::PIC_;
 
+  Optional<CodeModel::Model> CodeModel;
+  if (Conf.CodeModel)
+    CodeModel = *Conf.CodeModel;
+  else
+    CodeModel = M.getCodeModel();
+
   return std::unique_ptr<TargetMachine>(TheTarget->createTargetMachine(
       TheTriple, Conf.CPU, Features.getString(), Conf.Options, RelocModel,
-      Conf.CodeModel, Conf.CGOptLevel));
+      CodeModel, Conf.CGOptLevel));
 }
 
 static void runNewPMPasses(Config &Conf, Module &Mod, TargetMachine *TM,
-                           unsigned OptLevel, bool IsThinLTO) {
+                           unsigned OptLevel, bool IsThinLTO,
+                           ModuleSummaryIndex *ExportSummary,
+                           const ModuleSummaryIndex *ImportSummary) {
   Optional<PGOOptions> PGOOpt;
   if (!Conf.SampleProfile.empty())
-    PGOOpt = PGOOptions("", "", Conf.SampleProfile, false, true);
+    PGOOpt = PGOOptions(Conf.SampleProfile, "", Conf.ProfileRemapping,
+                        PGOOptions::SampleUse, PGOOptions::NoCSAction, true);
+  else if (Conf.RunCSIRInstr) {
+    PGOOpt = PGOOptions("", Conf.CSIRProfile, Conf.ProfileRemapping,
+                        PGOOptions::IRUse, PGOOptions::CSIRInstr);
+  } else if (!Conf.CSIRProfile.empty()) {
+    PGOOpt = PGOOptions(Conf.CSIRProfile, "", Conf.ProfileRemapping,
+                        PGOOptions::IRUse, PGOOptions::CSIRUse);
+  }
 
   PassBuilder PB(TM, PGOOpt);
   AAManager AA;
 
   // Parse a custom AA pipeline if asked to.
-  if (!PB.parseAAPipeline(AA, "default"))
+  if (auto Err = PB.parseAAPipeline(AA, "default"))
     report_fatal_error("Error parsing default AA pipeline");
 
   LoopAnalysisManager LAM(Conf.DebugPassManager);
@@ -194,9 +209,10 @@ static void runNewPMPasses(Config &Conf, Module &Mod, TargetMachine *TM,
   }
 
   if (IsThinLTO)
-    MPM = PB.buildThinLTODefaultPipeline(OL, Conf.DebugPassManager);
+    MPM = PB.buildThinLTODefaultPipeline(OL, Conf.DebugPassManager,
+                                         ImportSummary);
   else
-    MPM = PB.buildLTODefaultPipeline(OL, Conf.DebugPassManager);
+    MPM = PB.buildLTODefaultPipeline(OL, Conf.DebugPassManager, ExportSummary);
   MPM.run(Mod, MAM);
 
   // FIXME (davide): verify the output.
@@ -211,9 +227,9 @@ static void runNewPMCustomPasses(Module &Mod, TargetMachine *TM,
 
   // Parse a custom AA pipeline if asked to.
   if (!AAPipelineDesc.empty())
-    if (!PB.parseAAPipeline(AA, AAPipelineDesc))
-      report_fatal_error("unable to parse AA pipeline description: " +
-                         AAPipelineDesc);
+    if (auto Err = PB.parseAAPipeline(AA, AAPipelineDesc))
+      report_fatal_error("unable to parse AA pipeline description '" +
+                         AAPipelineDesc + "': " + toString(std::move(Err)));
 
   LoopAnalysisManager LAM;
   FunctionAnalysisManager FAM;
@@ -236,9 +252,9 @@ static void runNewPMCustomPasses(Module &Mod, TargetMachine *TM,
   MPM.addPass(VerifierPass());
 
   // Now, add all the passes we've been requested to.
-  if (!PB.parsePassPipeline(MPM, PipelineDesc))
-    report_fatal_error("unable to parse pass pipeline description: " +
-                       PipelineDesc);
+  if (auto Err = PB.parsePassPipeline(MPM, PipelineDesc))
+    report_fatal_error("unable to parse pass pipeline description '" +
+                       PipelineDesc + "': " + toString(std::move(Err)));
 
   if (!DisableVerify)
     MPM.addPass(VerifierPass());
@@ -264,6 +280,11 @@ static void runOldPMPasses(Config &Conf, Module &Mod, TargetMachine *TM,
   PMB.SLPVectorize = true;
   PMB.OptLevel = Conf.OptLevel;
   PMB.PGOSampleUse = Conf.SampleProfile;
+  PMB.EnablePGOCSInstrGen = Conf.RunCSIRInstr;
+  if (!Conf.RunCSIRInstr && !Conf.CSIRProfile.empty()) {
+    PMB.EnablePGOCSInstrUse = true;
+    PMB.PGOInstrUse = Conf.CSIRProfile;
+  }
   if (IsThinLTO)
     PMB.populateThinLTOPassManager(passes);
   else
@@ -279,7 +300,8 @@ bool opt(Config &Conf, TargetMachine *TM, unsigned Task, Module &Mod,
     runNewPMCustomPasses(Mod, TM, Conf.OptPipeline, Conf.AAPipeline,
                          Conf.DisableVerify);
   else if (Conf.UseNewPM)
-    runNewPMPasses(Conf, Mod, TM, Conf.OptLevel, IsThinLTO);
+    runNewPMPasses(Conf, Mod, TM, Conf.OptLevel, IsThinLTO, ExportSummary,
+                   ImportSummary);
   else
     runOldPMPasses(Conf, Mod, TM, IsThinLTO, ExportSummary, ImportSummary);
   return !Conf.PostOptModuleHook || Conf.PostOptModuleHook(Task, Mod);
@@ -407,8 +429,9 @@ Error lto::backend(Config &C, AddStreamFn AddStream,
   std::unique_ptr<TargetMachine> TM = createTargetMachine(C, *TOrErr, *Mod);
 
   // Setup optimization remarks.
-  auto DiagFileOrErr = lto::setupOptimizationRemarks(
-      Mod->getContext(), C.RemarksFilename, C.RemarksWithHotness);
+  auto DiagFileOrErr =
+      lto::setupOptimizationRemarks(Mod->getContext(), C.RemarksFilename,
+                                    C.RemarksPasses, C.RemarksWithHotness);
   if (!DiagFileOrErr)
     return DiagFileOrErr.takeError();
   auto DiagnosticOutputFile = std::move(*DiagFileOrErr);
@@ -462,7 +485,8 @@ Error lto::thinBackend(Config &Conf, unsigned Task, AddStreamFn AddStream,
 
   // Setup optimization remarks.
   auto DiagFileOrErr = lto::setupOptimizationRemarks(
-      Mod.getContext(), Conf.RemarksFilename, Conf.RemarksWithHotness, Task);
+      Mod.getContext(), Conf.RemarksFilename, Conf.RemarksPasses,
+      Conf.RemarksWithHotness, Task);
   if (!DiagFileOrErr)
     return DiagFileOrErr.takeError();
   auto DiagnosticOutputFile = std::move(*DiagFileOrErr);
@@ -479,7 +503,7 @@ Error lto::thinBackend(Config &Conf, unsigned Task, AddStreamFn AddStream,
 
   dropDeadSymbols(Mod, DefinedGlobals, CombinedIndex);
 
-  thinLTOResolveWeakForLinkerModule(Mod, DefinedGlobals);
+  thinLTOResolvePrevailingInModule(Mod, DefinedGlobals);
 
   if (Conf.PostPromoteModuleHook && !Conf.PostPromoteModuleHook(Task, Mod))
     return finalizeOptimizationRemarks(std::move(DiagnosticOutputFile));

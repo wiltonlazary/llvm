@@ -1,9 +1,8 @@
 //===-- SystemZOperators.td - SystemZ-specific operators ------*- tblgen-*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -127,14 +126,6 @@ def SDT_ZIPM                : SDTypeProfile<1, 1,
 def SDT_ZPrefetch           : SDTypeProfile<0, 2,
                                             [SDTCisVT<0, i32>,
                                              SDTCisPtrTy<1>]>;
-def SDT_ZLoadBSwap          : SDTypeProfile<1, 2,
-                                            [SDTCisInt<0>,
-                                             SDTCisPtrTy<1>,
-                                             SDTCisVT<2, OtherVT>]>;
-def SDT_ZStoreBSwap         : SDTypeProfile<0, 3,
-                                            [SDTCisInt<0>,
-                                             SDTCisPtrTy<1>,
-                                             SDTCisVT<2, OtherVT>]>;
 def SDT_ZTBegin             : SDTypeProfile<1, 2,
                                             [SDTCisVT<0, i32>,
                                              SDTCisPtrTy<1>,
@@ -283,9 +274,9 @@ def z_subcarry_1        : SDNode<"SystemZISD::SUBCARRY", SDT_ZBinaryWithCarry>;
 def z_membarrier        : SDNode<"SystemZISD::MEMBARRIER", SDTNone,
                                  [SDNPHasChain, SDNPSideEffect]>;
 
-def z_loadbswap        : SDNode<"SystemZISD::LRV", SDT_ZLoadBSwap,
+def z_loadbswap        : SDNode<"SystemZISD::LRV", SDTLoad,
                                  [SDNPHasChain, SDNPMayLoad, SDNPMemOperand]>;
-def z_storebswap       : SDNode<"SystemZISD::STRV", SDT_ZStoreBSwap,
+def z_storebswap       : SDNode<"SystemZISD::STRV", SDTStore,
                                  [SDNPHasChain, SDNPMayStore, SDNPMemOperand]>;
 
 def z_tdc               : SDNode<"SystemZISD::TDC", SDT_ZTest>;
@@ -429,16 +420,28 @@ def z_vsrl              : SDNode<"ISD::SRL", SDT_ZVecBinary>;
 // Pattern fragments
 //===----------------------------------------------------------------------===//
 
-def z_lrvh  : PatFrag<(ops node:$addr), (z_loadbswap node:$addr, i16)>;
-def z_lrv   : PatFrag<(ops node:$addr), (z_loadbswap node:$addr, i32)>;
-def z_lrvg  : PatFrag<(ops node:$addr), (z_loadbswap node:$addr, i64)>;
+def z_loadbswap16 : PatFrag<(ops node:$addr), (z_loadbswap node:$addr), [{
+  return cast<MemIntrinsicSDNode>(N)->getMemoryVT() == MVT::i16;
+}]>;
+def z_loadbswap32 : PatFrag<(ops node:$addr), (z_loadbswap node:$addr), [{
+  return cast<MemIntrinsicSDNode>(N)->getMemoryVT() == MVT::i32;
+}]>;
+def z_loadbswap64 : PatFrag<(ops node:$addr), (z_loadbswap node:$addr), [{
+  return cast<MemIntrinsicSDNode>(N)->getMemoryVT() == MVT::i64;
+}]>;
 
-def z_strvh : PatFrag<(ops node:$src, node:$addr),
-                      (z_storebswap node:$src, node:$addr, i16)>;
-def z_strv  : PatFrag<(ops node:$src, node:$addr),
-                      (z_storebswap node:$src, node:$addr, i32)>;
-def z_strvg : PatFrag<(ops node:$src, node:$addr),
-                      (z_storebswap node:$src, node:$addr, i64)>;
+def z_storebswap16 : PatFrag<(ops node:$src, node:$addr),
+                             (z_storebswap node:$src, node:$addr), [{
+  return cast<MemIntrinsicSDNode>(N)->getMemoryVT() == MVT::i16;
+}]>;
+def z_storebswap32 : PatFrag<(ops node:$src, node:$addr),
+                             (z_storebswap node:$src, node:$addr), [{
+  return cast<MemIntrinsicSDNode>(N)->getMemoryVT() == MVT::i32;
+}]>;
+def z_storebswap64 : PatFrag<(ops node:$src, node:$addr),
+                             (z_storebswap node:$src, node:$addr), [{
+  return cast<MemIntrinsicSDNode>(N)->getMemoryVT() == MVT::i64;
+}]>;
 
 // Fragments including CC as an implicit source.
 def z_br_ccmask
@@ -556,7 +559,6 @@ class NonvolatileLoad<SDPatternOperator load>
   auto *Load = cast<LoadSDNode>(N);
   return !Load->isVolatile();
 }]>;
-def nonvolatile_load          : NonvolatileLoad<load>;
 def nonvolatile_anyextloadi8  : NonvolatileLoad<anyextloadi8>;
 def nonvolatile_anyextloadi16 : NonvolatileLoad<anyextloadi16>;
 def nonvolatile_anyextloadi32 : NonvolatileLoad<anyextloadi32>;
@@ -567,7 +569,6 @@ class NonvolatileStore<SDPatternOperator store>
   auto *Store = cast<StoreSDNode>(N);
   return !Store->isVolatile();
 }]>;
-def nonvolatile_store         : NonvolatileStore<store>;
 def nonvolatile_truncstorei8  : NonvolatileStore<truncstorei8>;
 def nonvolatile_truncstorei16 : NonvolatileStore<truncstorei16>;
 def nonvolatile_truncstorei32 : NonvolatileStore<truncstorei32>;
@@ -697,9 +698,15 @@ class storei<SDPatternOperator operator, SDPatternOperator store = store>
   : PatFrag<(ops node:$addr),
             (store (operator), node:$addr)>;
 
-// Vector representation of all-zeros and all-ones.
-def z_vzero : PatFrag<(ops), (bitconvert (v16i8 (z_byte_mask (i32 0))))>;
-def z_vones : PatFrag<(ops), (bitconvert (v16i8 (z_byte_mask (i32 65535))))>;
+// Create a shift operator that optionally ignores an AND of the
+// shift count with an immediate if the bottom 6 bits are all set.
+def imm32bottom6set : PatLeaf<(i32 imm), [{
+  return (N->getZExtValue() & 0x3f) == 0x3f;
+}]>;
+class shiftop<SDPatternOperator operator>
+  : PatFrags<(ops node:$val, node:$count),
+             [(operator node:$val, node:$count),
+              (operator node:$val, (and node:$count, imm32bottom6set))]>;
 
 // Load a scalar and replicate it in all elements of a vector.
 class z_replicate_load<ValueType scalartype, SDPatternOperator load>
@@ -728,42 +735,44 @@ def z_vlef64 : z_vle<f64, load>;
 // zeroed vector.
 class z_vllez<ValueType scalartype, SDPatternOperator load, int index>
   : PatFrag<(ops node:$addr),
-            (z_vector_insert (z_vzero),
+            (z_vector_insert immAllZerosV,
                              (scalartype (load node:$addr)), (i32 index))>;
 def z_vllezi8  : z_vllez<i32, anyextloadi8, 7>;
 def z_vllezi16 : z_vllez<i32, anyextloadi16, 3>;
 def z_vllezi32 : z_vllez<i32, load, 1>;
-def z_vllezi64 : PatFrag<(ops node:$addr),
-                         (z_join_dwords (i64 (load node:$addr)), (i64 0))>;
+def z_vllezi64 : PatFrags<(ops node:$addr),
+                          [(z_vector_insert immAllZerosV,
+                                            (i64 (load node:$addr)), (i32 0)),
+                           (z_join_dwords (i64 (load node:$addr)), (i64 0))]>;
 // We use high merges to form a v4f32 from four f32s.  Propagating zero
 // into all elements but index 1 gives this expression.
 def z_vllezf32 : PatFrag<(ops node:$addr),
-                         (bitconvert
-                          (z_merge_high
-                           (v2i64
-                            (z_unpackl_high
-                             (v4i32
-                              (bitconvert
-                               (v4f32 (scalar_to_vector
-                                       (f32 (load node:$addr)))))))),
-                           (v2i64 (z_vzero))))>;
+                         (z_merge_high
+                          (v2i64
+                           (z_unpackl_high
+                            (v4i32
+                             (bitconvert
+                              (v4f32 (scalar_to_vector
+                                      (f32 (load node:$addr)))))))),
+                          (v2i64
+                           (bitconvert (v4f32 immAllZerosV))))>;
 def z_vllezf64 : PatFrag<(ops node:$addr),
                          (z_merge_high
-                          (scalar_to_vector (f64 (load node:$addr))),
-                          (z_vzero))>;
+                          (v2f64 (scalar_to_vector (f64 (load node:$addr)))),
+                          immAllZerosV)>;
 
 // Similarly for the high element of a zeroed vector.
 def z_vllezli32 : z_vllez<i32, load, 0>;
 def z_vllezlf32 : PatFrag<(ops node:$addr),
-                          (bitconvert
-                           (z_merge_high
-                            (v2i64
-                             (bitconvert
-                              (z_merge_high
-                               (v4f32 (scalar_to_vector
-                                       (f32 (load node:$addr)))),
-                               (v4f32 (z_vzero))))),
-                            (v2i64 (z_vzero))))>;
+                          (z_merge_high
+                           (v2i64
+                            (bitconvert
+                             (z_merge_high
+                              (v4f32 (scalar_to_vector
+                                      (f32 (load node:$addr)))),
+                              (v4f32 immAllZerosV)))),
+                           (v2i64
+                            (bitconvert (v4f32 immAllZerosV))))>;
 
 // Store one element of a vector.
 class z_vste<ValueType scalartype, SDPatternOperator store>
@@ -778,16 +787,16 @@ def z_vstef32 : z_vste<f32, store>;
 def z_vstef64 : z_vste<f64, store>;
 
 // Arithmetic negation on vectors.
-def z_vneg : PatFrag<(ops node:$x), (sub (z_vzero), node:$x)>;
+def z_vneg : PatFrag<(ops node:$x), (sub immAllZerosV, node:$x)>;
 
 // Bitwise negation on vectors.
-def z_vnot : PatFrag<(ops node:$x), (xor node:$x, (z_vones))>;
+def z_vnot : PatFrag<(ops node:$x), (xor node:$x, immAllOnesV)>;
 
 // Signed "integer greater than zero" on vectors.
-def z_vicmph_zero : PatFrag<(ops node:$x), (z_vicmph node:$x, (z_vzero))>;
+def z_vicmph_zero : PatFrag<(ops node:$x), (z_vicmph node:$x, immAllZerosV)>;
 
 // Signed "integer less than zero" on vectors.
-def z_vicmpl_zero : PatFrag<(ops node:$x), (z_vicmph (z_vzero), node:$x)>;
+def z_vicmpl_zero : PatFrag<(ops node:$x), (z_vicmph immAllZerosV, node:$x)>;
 
 // Integer absolute on vectors.
 class z_viabs<int shift>

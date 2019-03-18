@@ -1,9 +1,8 @@
 //===-- llvm/lib/CodeGen/AsmPrinter/DebugHandlerBase.cpp -------*- C++ -*--===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -12,7 +11,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "DebugHandlerBase.h"
+#include "llvm/CodeGen/DebugHandlerBase.h"
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/CodeGen/AsmPrinter.h"
@@ -125,6 +124,21 @@ MCSymbol *DebugHandlerBase::getLabelAfterInsn(const MachineInstr *MI) {
   return LabelsAfterInsn.lookup(MI);
 }
 
+// Return the function-local offset of an instruction.
+const MCExpr *
+DebugHandlerBase::getFunctionLocalOffsetAfterInsn(const MachineInstr *MI) {
+  MCContext &MC = Asm->OutContext;
+
+  MCSymbol *Start = Asm->getFunctionBegin();
+  const auto *StartRef = MCSymbolRefExpr::create(Start, MC);
+
+  MCSymbol *AfterInsn = getLabelAfterInsn(MI);
+  assert(AfterInsn && "Expected label after instruction");
+  const auto *AfterRef = MCSymbolRefExpr::create(AfterInsn, MC);
+
+  return MCBinaryExpr::createSub(AfterRef, StartRef, MC);
+}
+
 /// If this type is derived from a base type then return base type size.
 uint64_t DebugHandlerBase::getBaseTypeSize(const DITypeRef TyRef) {
   DIType *Ty = TyRef.resolve();
@@ -190,8 +204,9 @@ void DebugHandlerBase::beginFunction(const MachineFunction *MF) {
 
   // Calculate history for local variables.
   assert(DbgValues.empty() && "DbgValues map wasn't cleaned!");
-  calculateDbgValueHistory(MF, Asm->MF->getSubtarget().getRegisterInfo(),
-                           DbgValues);
+  assert(DbgLabels.empty() && "DbgLabels map wasn't cleaned!");
+  calculateDbgEntityHistory(MF, Asm->MF->getSubtarget().getRegisterInfo(),
+                            DbgValues, DbgLabels);
   LLVM_DEBUG(DbgValues.dump());
 
   // Request labels for the full history.
@@ -200,24 +215,36 @@ void DebugHandlerBase::beginFunction(const MachineFunction *MF) {
     if (Ranges.empty())
       continue;
 
-    // The first mention of a function argument gets the CurrentFnBegin
-    // label, so arguments are visible when breaking at function entry.
+    auto IsDescribedByReg = [](const MachineInstr *MI) {
+      return MI->getOperand(0).isReg() && MI->getOperand(0).getReg();
+    };
+
+    // The first mention of a function argument gets the CurrentFnBegin label,
+    // so arguments are visible when breaking at function entry.
+    //
+    // We do not change the label for values that are described by registers,
+    // as that could place them above their defining instructions. We should
+    // ideally not change the labels for constant debug values either, since
+    // doing that violates the ranges that are calculated in the history map.
+    // However, we currently do not emit debug values for constant arguments
+    // directly at the start of the function, so this code is still useful.
     const DILocalVariable *DIVar = Ranges.front().first->getDebugVariable();
     if (DIVar->isParameter() &&
         getDISubprogram(DIVar->getScope())->describes(&MF->getFunction())) {
-      LabelsBeforeInsn[Ranges.front().first] = Asm->getFunctionBegin();
+      if (!IsDescribedByReg(Ranges.front().first))
+        LabelsBeforeInsn[Ranges.front().first] = Asm->getFunctionBegin();
       if (Ranges.front().first->getDebugExpression()->isFragment()) {
         // Mark all non-overlapping initial fragments.
         for (auto I = Ranges.begin(); I != Ranges.end(); ++I) {
           const DIExpression *Fragment = I->first->getDebugExpression();
-          if (std::all_of(Ranges.begin(), I,
+          if (std::any_of(Ranges.begin(), I,
                           [&](DbgValueHistoryMap::InstrRange Pred) {
-                            return !Fragment->fragmentsOverlap(
+                            return Fragment->fragmentsOverlap(
                                 Pred.first->getDebugExpression());
                           }))
-            LabelsBeforeInsn[I->first] = Asm->getFunctionBegin();
-          else
             break;
+          if (!IsDescribedByReg(I->first))
+            LabelsBeforeInsn[I->first] = Asm->getFunctionBegin();
         }
       }
     }
@@ -227,6 +254,12 @@ void DebugHandlerBase::beginFunction(const MachineFunction *MF) {
       if (Range.second)
         requestLabelAfterInsn(Range.second);
     }
+  }
+
+  // Ensure there is a symbol before DBG_LABEL.
+  for (const auto &I : DbgLabels) {
+    const MachineInstr *MI = I.second;
+    requestLabelBeforeInsn(MI);
   }
 
   PrevInstLoc = DebugLoc();
@@ -296,6 +329,7 @@ void DebugHandlerBase::endFunction(const MachineFunction *MF) {
   if (hasDebugInfo(MMI, MF))
     endFunctionImpl(MF);
   DbgValues.clear();
+  DbgLabels.clear();
   LabelsBeforeInsn.clear();
   LabelsAfterInsn.clear();
 }

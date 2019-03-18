@@ -1,9 +1,8 @@
 //===- TargetLoweringBase.cpp - Implement the TargetLoweringBase class ----===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -118,7 +117,7 @@ static cl::opt<int> MinPercentageForPredictableBranch(
 void TargetLoweringBase::InitLibcalls(const Triple &TT) {
 #define HANDLE_LIBCALL(code, name) \
   setLibcallName(RTLIB::code, name);
-#include "llvm/CodeGen/RuntimeLibcalls.def"
+#include "llvm/IR/RuntimeLibcalls.def"
 #undef HANDLE_LIBCALL
   // Initialize calling conventions to their default.
   for (int LC = 0; LC < RTLIB::UNKNOWN_LIBCALL; ++LC)
@@ -161,7 +160,8 @@ void TargetLoweringBase::InitLibcalls(const Triple &TT) {
     setLibcallName(RTLIB::FPROUND_F32_F16, "__gnu_f2h_ieee");
   }
 
-  if (TT.isGNUEnvironment() || TT.isOSFuchsia()) {
+  if (TT.isGNUEnvironment() || TT.isOSFuchsia() ||
+      (TT.isAndroid() && !TT.isAndroidVersionLT(9))) {
     setLibcallName(RTLIB::SINCOS_F32, "sincosf");
     setLibcallName(RTLIB::SINCOS_F64, "sincos");
     setLibcallName(RTLIB::SINCOS_F80, "sincosl");
@@ -582,6 +582,14 @@ void TargetLoweringBase::initActions() {
   std::fill(std::begin(TargetDAGCombineArray),
             std::end(TargetDAGCombineArray), 0);
 
+  for (MVT VT : MVT::fp_valuetypes()) {
+    MVT IntVT = MVT::getIntegerVT(VT.getSizeInBits());
+    if (IntVT.isValid()) {
+      setOperationAction(ISD::ATOMIC_SWAP, VT, Promote);
+      AddPromotedToType(ISD::ATOMIC_SWAP, VT, IntVT);
+    }
+  }
+
   // Set default actions for various operations.
   for (MVT VT : MVT::all_valuetypes()) {
     // Default all indexed load / store to expand.
@@ -599,14 +607,24 @@ void TargetLoweringBase::initActions() {
     setOperationAction(ISD::CONCAT_VECTORS, VT, Expand);
     setOperationAction(ISD::FMINNUM, VT, Expand);
     setOperationAction(ISD::FMAXNUM, VT, Expand);
-    setOperationAction(ISD::FMINNAN, VT, Expand);
-    setOperationAction(ISD::FMAXNAN, VT, Expand);
+    setOperationAction(ISD::FMINNUM_IEEE, VT, Expand);
+    setOperationAction(ISD::FMAXNUM_IEEE, VT, Expand);
+    setOperationAction(ISD::FMINIMUM, VT, Expand);
+    setOperationAction(ISD::FMAXIMUM, VT, Expand);
     setOperationAction(ISD::FMAD, VT, Expand);
     setOperationAction(ISD::SMIN, VT, Expand);
     setOperationAction(ISD::SMAX, VT, Expand);
     setOperationAction(ISD::UMIN, VT, Expand);
     setOperationAction(ISD::UMAX, VT, Expand);
     setOperationAction(ISD::ABS, VT, Expand);
+    setOperationAction(ISD::FSHL, VT, Expand);
+    setOperationAction(ISD::FSHR, VT, Expand);
+    setOperationAction(ISD::SADDSAT, VT, Expand);
+    setOperationAction(ISD::UADDSAT, VT, Expand);
+    setOperationAction(ISD::SSUBSAT, VT, Expand);
+    setOperationAction(ISD::USUBSAT, VT, Expand);
+    setOperationAction(ISD::SMULFIX, VT, Expand);
+    setOperationAction(ISD::UMULFIX, VT, Expand);
 
     // Overflow operations default to expand
     setOperationAction(ISD::SADDO, VT, Expand);
@@ -632,7 +650,7 @@ void TargetLoweringBase::initActions() {
     setOperationAction(ISD::CTTZ_ZERO_UNDEF, VT, Expand);
 
     setOperationAction(ISD::BITREVERSE, VT, Expand);
-    
+
     // These library functions default to expand.
     setOperationAction(ISD::FROUND, VT, Expand);
     setOperationAction(ISD::FPOWI, VT, Expand);
@@ -647,6 +665,21 @@ void TargetLoweringBase::initActions() {
 
     // For most targets @llvm.get.dynamic.area.offset just returns 0.
     setOperationAction(ISD::GET_DYNAMIC_AREA_OFFSET, VT, Expand);
+
+    // Vector reduction default to expand.
+    setOperationAction(ISD::VECREDUCE_FADD, VT, Expand);
+    setOperationAction(ISD::VECREDUCE_FMUL, VT, Expand);
+    setOperationAction(ISD::VECREDUCE_ADD, VT, Expand);
+    setOperationAction(ISD::VECREDUCE_MUL, VT, Expand);
+    setOperationAction(ISD::VECREDUCE_AND, VT, Expand);
+    setOperationAction(ISD::VECREDUCE_OR, VT, Expand);
+    setOperationAction(ISD::VECREDUCE_XOR, VT, Expand);
+    setOperationAction(ISD::VECREDUCE_SMAX, VT, Expand);
+    setOperationAction(ISD::VECREDUCE_SMIN, VT, Expand);
+    setOperationAction(ISD::VECREDUCE_UMAX, VT, Expand);
+    setOperationAction(ISD::VECREDUCE_UMIN, VT, Expand);
+    setOperationAction(ISD::VECREDUCE_FMAX, VT, Expand);
+    setOperationAction(ISD::VECREDUCE_FMIN, VT, Expand);
   }
 
   // Most targets ignore the @llvm.prefetch intrinsic.
@@ -666,6 +699,7 @@ void TargetLoweringBase::initActions() {
 
   // These library functions default to expand.
   for (MVT VT : {MVT::f32, MVT::f64, MVT::f128}) {
+    setOperationAction(ISD::FCBRT,      VT, Expand);
     setOperationAction(ISD::FLOG ,      VT, Expand);
     setOperationAction(ISD::FLOG2,      VT, Expand);
     setOperationAction(ISD::FLOG10,     VT, Expand);
@@ -924,7 +958,7 @@ TargetLoweringBase::emitPatchPoint(MachineInstr &InitialMI,
   // STATEPOINT Deopt Spill - live-through, read only, indirect
   // STATEPOINT Deopt Alloca - live-through, read only, direct
   // (We're currently conservative and mark the deopt slots read/write in
-  // practice.) 
+  // practice.)
   // STATEPOINT GC Spill - live-through, read/write, indirect
   // STATEPOINT GC Alloca - live-through, read/write, direct
   // The live-in vs live-through is handled already (the live through ones are
@@ -968,22 +1002,22 @@ TargetLoweringBase::emitPatchPoint(MachineInstr &InitialMI,
       MIB.add(MI->getOperand(i));
 
     // Inherit previous memory operands.
-    MIB->setMemRefs(MI->memoperands_begin(), MI->memoperands_end());
+    MIB.cloneMemRefs(*MI);
     assert(MIB->mayLoad() && "Folded a stackmap use to a non-load!");
 
     // Add a new memory operand for this FI.
     assert(MFI.getObjectOffset(FI) != -1);
 
-    auto Flags = MachineMemOperand::MOLoad;
-    if (MI->getOpcode() == TargetOpcode::STATEPOINT) {
-      Flags |= MachineMemOperand::MOStore;
-      Flags |= MachineMemOperand::MOVolatile;
+    // Note: STATEPOINT MMOs are added during SelectionDAG.  STACKMAP, and
+    // PATCHPOINT should be updated to do the same. (TODO)
+    if (MI->getOpcode() != TargetOpcode::STATEPOINT) {
+      auto Flags = MachineMemOperand::MOLoad;
+      MachineMemOperand *MMO = MF.getMachineMemOperand(
+          MachinePointerInfo::getFixedStack(MF, FI), Flags,
+          MF.getDataLayout().getPointerSize(), MFI.getObjectAlignment(FI));
+      MIB->addMemOperand(MF, MMO);
     }
-    MachineMemOperand *MMO = MF.getMachineMemOperand(
-        MachinePointerInfo::getFixedStack(MF, FI), Flags,
-        MF.getDataLayout().getPointerSize(), MFI.getObjectAlignment(FI));
-    MIB->addMemOperand(MF, MMO);
-
+    
     // Replace the instruction and update the operand index.
     MBB->insert(MachineBasicBlock::iterator(MI), MIB);
     OperIdx += (MIB->getNumOperands() - MI->getNumOperands()) - 1;
@@ -1096,7 +1130,7 @@ void TargetLoweringBase::computeRegisterProperties(
       LegalIntReg = IntReg;
     } else {
       RegisterTypeForVT[IntReg] = TransformToType[IntReg] =
-        (const MVT::SimpleValueType)LegalIntReg;
+        (MVT::SimpleValueType)LegalIntReg;
       ValueTypeActions.setTypeAction(IVT, TypePromoteInteger);
     }
   }
@@ -1337,7 +1371,8 @@ unsigned TargetLoweringBase::getVectorTypeBreakdown(LLVMContext &Context, EVT VT
 /// type of the given function.  This does not require a DAG or a return value,
 /// and is suitable for use before any DAGs for the function are constructed.
 /// TODO: Move this out of TargetLowering.cpp.
-void llvm::GetReturnInfo(Type *ReturnType, AttributeList attr,
+void llvm::GetReturnInfo(CallingConv::ID CC, Type *ReturnType,
+                         AttributeList attr,
                          SmallVectorImpl<ISD::OutputArg> &Outs,
                          const TargetLowering &TLI, const DataLayout &DL) {
   SmallVector<EVT, 4> ValueVTs;
@@ -1365,9 +1400,9 @@ void llvm::GetReturnInfo(Type *ReturnType, AttributeList attr,
     }
 
     unsigned NumParts =
-        TLI.getNumRegistersForCallingConv(ReturnType->getContext(), VT);
+        TLI.getNumRegistersForCallingConv(ReturnType->getContext(), CC, VT);
     MVT PartVT =
-        TLI.getRegisterTypeForCallingConv(ReturnType->getContext(), VT);
+        TLI.getRegisterTypeForCallingConv(ReturnType->getContext(), CC, VT);
 
     // 'inreg' on function refers to return value
     ISD::ArgFlagsTy Flags = ISD::ArgFlagsTy();
@@ -1410,7 +1445,7 @@ bool TargetLoweringBase::allowsMemoryAccess(LLVMContext &Context,
       *Fast = true;
     return true;
   }
-  
+
   // This is a misaligned access.
   return allowsMisalignedMemoryAccesses(VT, AddrSpace, Alignment, Fast);
 }
@@ -1435,6 +1470,7 @@ int TargetLoweringBase::InstructionOpcodeToISD(unsigned Opcode) const {
   case Switch:         return 0;
   case IndirectBr:     return 0;
   case Invoke:         return 0;
+  case CallBr:         return 0;
   case Resume:         return 0;
   case Unreachable:    return 0;
   case CleanupRet:     return 0;
@@ -1442,6 +1478,7 @@ int TargetLoweringBase::InstructionOpcodeToISD(unsigned Opcode) const {
   case CatchPad:       return 0;
   case CatchSwitch:    return 0;
   case CleanupPad:     return 0;
+  case FNeg:           return ISD::FNEG;
   case Add:            return ISD::ADD;
   case FAdd:           return ISD::FADD;
   case Sub:            return ISD::SUB;
@@ -1567,8 +1604,8 @@ Value *TargetLoweringBase::getSafeStackPointerLocation(IRBuilder<> &IRB) const {
   // thread's unsafe stack pointer.
   Module *M = IRB.GetInsertBlock()->getParent()->getParent();
   Type *StackPtrTy = Type::getInt8PtrTy(M->getContext());
-  Value *Fn = M->getOrInsertFunction("__safestack_pointer_address",
-                                     StackPtrTy->getPointerTo(0));
+  FunctionCallee Fn = M->getOrInsertFunction("__safestack_pointer_address",
+                                             StackPtrTy->getPointerTo(0));
   return IRB.CreateCall(Fn);
 }
 
@@ -1643,7 +1680,7 @@ Value *TargetLoweringBase::getSDagStackGuard(const Module &M) const {
   return M.getNamedValue("__stack_chk_guard");
 }
 
-Value *TargetLoweringBase::getSSPStackGuardCheck(const Module &M) const {
+Function *TargetLoweringBase::getSSPStackGuardCheck(const Module &M) const {
   return nullptr;
 }
 

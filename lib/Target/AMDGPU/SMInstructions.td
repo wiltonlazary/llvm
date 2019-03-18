@@ -1,9 +1,8 @@
 //===---- SMInstructions.td - Scalar Memory Instruction Defintions --------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -34,7 +33,6 @@ class SM_Pseudo <string opName, dag outs, dag ins, string asmOps, list<dag> patt
   let hasSideEffects = 0;
   let UseNamedOperandTable = 1;
   let SchedRW = [WriteSMEM];
-  let SubtargetPredicate = isGCN;
 
   string Mnemonic = opName;
   string AsmOperands = asmOps;
@@ -154,11 +152,19 @@ multiclass SM_Pseudo_Discards<string opName> {
   def _SGPR : SM_Discard_Pseudo <opName, (ins SReg_64:$sbase, SReg_32:$offset), 0>;
 }
 
-class SM_Time_Pseudo<string opName, SDPatternOperator node> : SM_Pseudo<
+class SM_Time_Pseudo<string opName, SDPatternOperator node = null_frag> : SM_Pseudo<
   opName, (outs SReg_64_XEXEC:$sdst), (ins),
   " $sdst", [(set i64:$sdst, (node))]> {
   let hasSideEffects = 1;
-  let mayStore = 0;
+
+  // FIXME: This should be definitively mayStore = 0. TableGen
+  // brokenly tries to infer these based on the intrinsic properties
+  // corresponding to the IR attributes. The target intrinsics are
+  // considered as writing to memory for IR dependency purposes, but
+  // those can be modeled with hasSideEffects here. These also end up
+  // inferring differently for llvm.readcyclecounter and the amdgcn
+  // intrinsics.
+  let mayStore = ?;
   let mayLoad = 1;
   let has_sbase = 0;
   let has_offset = 0;
@@ -373,83 +379,6 @@ let SubtargetPredicate = isGFX9 in {
 defm S_DCACHE_DISCARD    : SM_Pseudo_Discards <"s_dcache_discard">;
 defm S_DCACHE_DISCARD_X2 : SM_Pseudo_Discards <"s_dcache_discard_x2">;
 }
-
-//===----------------------------------------------------------------------===//
-// Scalar Memory Patterns
-//===----------------------------------------------------------------------===//
-
-
-def smrd_load : PatFrag <(ops node:$ptr), (load node:$ptr), [{
-  auto Ld = cast<LoadSDNode>(N);
-  return Ld->getAlignment() >= 4  &&
-    ((((Ld->getAddressSpace() == AMDGPUASI.CONSTANT_ADDRESS) || (Ld->getAddressSpace() == AMDGPUASI.CONSTANT_ADDRESS_32BIT)) && !N->isDivergent()) ||
-    (Subtarget->getScalarizeGlobalBehavior() && Ld->getAddressSpace() == AMDGPUASI.GLOBAL_ADDRESS &&
-     !Ld->isVolatile() && !N->isDivergent() &&
-    static_cast<const SITargetLowering *>(getTargetLowering())->isMemOpHasNoClobberedMemOperand(N)));
-}]>;
-
-def SMRDImm         : ComplexPattern<i64, 2, "SelectSMRDImm">;
-def SMRDImm32       : ComplexPattern<i64, 2, "SelectSMRDImm32">;
-def SMRDSgpr        : ComplexPattern<i64, 2, "SelectSMRDSgpr">;
-def SMRDBufferImm   : ComplexPattern<i32, 1, "SelectSMRDBufferImm">;
-def SMRDBufferImm32 : ComplexPattern<i32, 1, "SelectSMRDBufferImm32">;
-
-multiclass SMRD_Pattern <string Instr, ValueType vt> {
-
-  // 1. IMM offset
-  def : GCNPat <
-    (smrd_load (SMRDImm i64:$sbase, i32:$offset)),
-    (vt (!cast<SM_Pseudo>(Instr#"_IMM") $sbase, $offset, 0))
-  >;
-
-  // 2. SGPR offset
-  def : GCNPat <
-    (smrd_load (SMRDSgpr i64:$sbase, i32:$offset)),
-    (vt (!cast<SM_Pseudo>(Instr#"_SGPR") $sbase, $offset, 0))
-  >;
-}
-
-let OtherPredicates = [isSICI] in {
-def : GCNPat <
-  (i64 (readcyclecounter)),
-  (S_MEMTIME)
->;
-}
-
-// Global and constant loads can be selected to either MUBUF or SMRD
-// instructions, but SMRD instructions are faster so we want the instruction
-// selector to prefer those.
-let AddedComplexity = 100 in {
-
-defm : SMRD_Pattern <"S_LOAD_DWORD",    i32>;
-defm : SMRD_Pattern <"S_LOAD_DWORDX2",  v2i32>;
-defm : SMRD_Pattern <"S_LOAD_DWORDX4",  v4i32>;
-defm : SMRD_Pattern <"S_LOAD_DWORDX8",  v8i32>;
-defm : SMRD_Pattern <"S_LOAD_DWORDX16", v16i32>;
-
-// 1. Offset as an immediate
-def SM_LOAD_PATTERN : GCNPat <  // name this pattern to reuse AddedComplexity on CI
-  (SIload_constant v4i32:$sbase, (SMRDBufferImm i32:$offset)),
-  (S_BUFFER_LOAD_DWORD_IMM $sbase, $offset, 0)
->;
-
-// 2. Offset loaded in an 32bit SGPR
-def : GCNPat <
-  (SIload_constant v4i32:$sbase, i32:$offset),
-  (S_BUFFER_LOAD_DWORD_SGPR $sbase, $offset, 0)
->;
-
-} // End let AddedComplexity = 100
-
-let OtherPredicates = [isVI] in {
-
-def : GCNPat <
-  (i64 (readcyclecounter)),
-  (S_MEMREALTIME)
->;
-
-} // let OtherPredicates = [isVI]
-
 
 //===----------------------------------------------------------------------===//
 // Targets
@@ -757,25 +686,118 @@ class SMRD_Real_ci <bits<5> op, SM_Pseudo ps>
 
 def S_DCACHE_INV_VOL_ci : SMRD_Real_ci <0x1d, S_DCACHE_INV_VOL>;
 
-let AddedComplexity = SM_LOAD_PATTERN.AddedComplexity in {
+//===----------------------------------------------------------------------===//
+// Scalar Memory Patterns
+//===----------------------------------------------------------------------===//
 
-class SMRD_Pattern_ci <string Instr, ValueType vt> : GCNPat <
-  (smrd_load (SMRDImm32 i64:$sbase, i32:$offset)),
-  (vt (!cast<InstSI>(Instr#"_IMM_ci") $sbase, $offset, 0))> {
-  let OtherPredicates = [isCIOnly];
+def smrd_load : PatFrag <(ops node:$ptr), (load node:$ptr), [{ return isUniformLoad(N);}]> {
+  let GISelPredicateCode = [{
+    if (!MI.hasOneMemOperand())
+      return false;
+    if (!isInstrUniform(MI))
+      return false;
+
+    // FIXME: We should probably be caching this.
+    SmallVector<GEPInfo, 4> AddrInfo;
+    getAddrModeInfo(MI, MRI, AddrInfo);
+
+    if (hasVgprParts(AddrInfo))
+      return false;
+    return true;
+  }];
 }
 
-def : SMRD_Pattern_ci <"S_LOAD_DWORD",    i32>;
-def : SMRD_Pattern_ci <"S_LOAD_DWORDX2",  v2i32>;
-def : SMRD_Pattern_ci <"S_LOAD_DWORDX4",  v4i32>;
-def : SMRD_Pattern_ci <"S_LOAD_DWORDX8",  v8i32>;
-def : SMRD_Pattern_ci <"S_LOAD_DWORDX16", v16i32>;
+def SMRDImm         : ComplexPattern<i64, 2, "SelectSMRDImm">;
+def SMRDImm32       : ComplexPattern<i64, 2, "SelectSMRDImm32">;
+def SMRDSgpr        : ComplexPattern<i64, 2, "SelectSMRDSgpr">;
+def SMRDBufferImm   : ComplexPattern<i32, 1, "SelectSMRDBufferImm">;
+def SMRDBufferImm32 : ComplexPattern<i32, 1, "SelectSMRDBufferImm32">;
+
+multiclass SMRD_Pattern <string Instr, ValueType vt> {
+
+  // 1. IMM offset
+  def : GCNPat <
+    (smrd_load (SMRDImm i64:$sbase, i32:$offset)),
+    (vt (!cast<SM_Pseudo>(Instr#"_IMM") $sbase, $offset, 0))
+  >;
+
+  // 2. 32-bit IMM offset on CI
+  def : GCNPat <
+    (smrd_load (SMRDImm32 i64:$sbase, i32:$offset)),
+    (vt (!cast<InstSI>(Instr#"_IMM_ci") $sbase, $offset, 0))> {
+    let OtherPredicates = [isCIOnly];
+  }
+
+  // 3. SGPR offset
+  def : GCNPat <
+    (smrd_load (SMRDSgpr i64:$sbase, i32:$offset)),
+    (vt (!cast<SM_Pseudo>(Instr#"_SGPR") $sbase, $offset, 0))
+  >;
+
+  // 4. No offset
+  def : GCNPat <
+    (vt (smrd_load (i64 SReg_64:$sbase))),
+    (vt (!cast<SM_Pseudo>(Instr#"_IMM") i64:$sbase, 0, 0))
+  >;
+}
+
+multiclass SMLoad_Pattern <string Instr, ValueType vt> {
+  // 1. Offset as an immediate
+  def : GCNPat <
+    (SIsbuffer_load v4i32:$sbase, (SMRDBufferImm i32:$offset), i1:$glc),
+    (vt (!cast<SM_Pseudo>(Instr#"_IMM") $sbase, $offset, (as_i1imm $glc)))
+  >;
+
+  // 2. 32-bit IMM offset on CI
+  def : GCNPat <
+    (vt (SIsbuffer_load v4i32:$sbase, (SMRDBufferImm32 i32:$offset), i1:$glc)),
+    (!cast<InstSI>(Instr#"_IMM_ci") $sbase, $offset, (as_i1imm $glc))> {
+    let OtherPredicates = [isCIOnly];
+  }
+
+  // 3. Offset loaded in an 32bit SGPR
+  def : GCNPat <
+    (SIsbuffer_load v4i32:$sbase, i32:$offset, i1:$glc),
+    (vt (!cast<SM_Pseudo>(Instr#"_SGPR") $sbase, $offset, (as_i1imm $glc)))
+  >;
+}
+
+// Global and constant loads can be selected to either MUBUF or SMRD
+// instructions, but SMRD instructions are faster so we want the instruction
+// selector to prefer those.
+let AddedComplexity = 100 in {
+
+defm : SMRD_Pattern <"S_LOAD_DWORD",    i32>;
+defm : SMRD_Pattern <"S_LOAD_DWORDX2",  v2i32>;
+defm : SMRD_Pattern <"S_LOAD_DWORDX4",  v4i32>;
+defm : SMRD_Pattern <"S_LOAD_DWORDX8",  v8i32>;
+defm : SMRD_Pattern <"S_LOAD_DWORDX16", v16i32>;
+
+defm : SMLoad_Pattern <"S_BUFFER_LOAD_DWORD",     i32>;
+defm : SMLoad_Pattern <"S_BUFFER_LOAD_DWORDX2",   v2i32>;
+defm : SMLoad_Pattern <"S_BUFFER_LOAD_DWORDX4",   v4i32>;
+defm : SMLoad_Pattern <"S_BUFFER_LOAD_DWORDX8",   v8i32>;
+defm : SMLoad_Pattern <"S_BUFFER_LOAD_DWORDX16",  v16i32>;
+
+defm : SMLoad_Pattern <"S_BUFFER_LOAD_DWORD",     f32>;
+defm : SMLoad_Pattern <"S_BUFFER_LOAD_DWORDX2",   v2f32>;
+defm : SMLoad_Pattern <"S_BUFFER_LOAD_DWORDX4",   v4f32>;
+defm : SMLoad_Pattern <"S_BUFFER_LOAD_DWORDX8",   v8f32>;
+defm : SMLoad_Pattern <"S_BUFFER_LOAD_DWORDX16",  v16f32>;
+} // End let AddedComplexity = 100
+
+let OtherPredicates = [isSICI] in {
+def : GCNPat <
+  (i64 (readcyclecounter)),
+  (S_MEMTIME)
+>;
+}
+
+let OtherPredicates = [isVI] in {
 
 def : GCNPat <
-  (SIload_constant v4i32:$sbase, (SMRDBufferImm32 i32:$offset)),
-  (S_BUFFER_LOAD_DWORD_IMM_ci $sbase, $offset, 0)> {
-  let OtherPredicates = [isCI]; // should this be isCIOnly?
-}
+  (i64 (readcyclecounter)),
+  (S_MEMREALTIME)
+>;
 
-} // End let AddedComplexity = SM_LOAD_PATTERN.AddedComplexity
-
+} // let OtherPredicates = [isVI]

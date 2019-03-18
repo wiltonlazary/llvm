@@ -1,9 +1,8 @@
 //===- ARMLoadStoreOptimizer.cpp - ARM load / store opt. pass -------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -1027,6 +1026,18 @@ void ARMLoadStoreOpt::FormCandidates(const MemOpQueue &MemOps) {
     if (AssumeMisalignedLoadStores && !mayCombineMisaligned(*STI, *MI))
       CanMergeToLSMulti = CanMergeToLSDouble = false;
 
+    // vldm / vstm limit are 32 for S variants, 16 for D variants.
+    unsigned Limit;
+    switch (Opcode) {
+    default:
+      Limit = UINT_MAX;
+      break;
+    case ARM::VLDRD:
+    case ARM::VSTRD:
+      Limit = 16;
+      break;
+    }
+
     // Merge following instructions where possible.
     for (unsigned I = SIndex+1; I < EIndex; ++I, ++Count) {
       int NewOffset = MemOps[I].Offset;
@@ -1035,6 +1046,8 @@ void ARMLoadStoreOpt::FormCandidates(const MemOpQueue &MemOps) {
       const MachineOperand &MO = getLoadStoreRegOp(*MemOps[I].MI);
       unsigned Reg = MO.getReg();
       if (Reg == ARM::SP || Reg == ARM::PC)
+        break;
+      if (Count == Limit)
         break;
 
       // See if the current load/store may be part of a multi load/store.
@@ -1273,9 +1286,9 @@ bool ARMLoadStoreOpt::MergeBaseUpdateLSMultiple(MachineInstr *MI) {
       // can still change to a writeback form as that will save us 2 bytes
       // of code size. It can create WAW hazards though, so only do it if
       // we're minimizing code size.
-      if (!MBB.getParent()->getFunction().optForMinSize() || !BaseKill)
+      if (!STI->optForMinSize() || !BaseKill)
         return false;
-      
+
       bool HighRegsUsed = false;
       for (unsigned i = 2, e = MI->getNumOperands(); i != e; ++i)
         if (MI->getOperand(i).getReg() >= ARM::R8) {
@@ -1303,7 +1316,7 @@ bool ARMLoadStoreOpt::MergeBaseUpdateLSMultiple(MachineInstr *MI) {
     MIB.add(MI->getOperand(OpNum));
 
   // Transfer memoperands.
-  MIB->setMemRefs(MI->memoperands_begin(), MI->memoperands_end());
+  MIB.setMemRefs(MI->memoperands());
 
   MBB.erase(MBBI);
   return true;
@@ -1527,7 +1540,7 @@ bool ARMLoadStoreOpt::MergeBaseUpdateLSDouble(MachineInstr &MI) const {
   // Transfer implicit operands.
   for (const MachineOperand &MO : MI.implicit_operands())
     MIB.add(MO);
-  MIB->setMemRefs(MI.memoperands_begin(), MI.memoperands_end());
+  MIB.setMemRefs(MI.memoperands());
 
   MBB.erase(MBBI);
   return true;
@@ -1567,7 +1580,9 @@ static bool isMemoryOp(const MachineInstr &MI) {
   const MachineMemOperand &MMO = **MI.memoperands_begin();
 
   // Don't touch volatile memory accesses - we may be changing their order.
-  if (MMO.isVolatile())
+  // TODO: We could allow unordered and monotonic atomics here, but we need to
+  // make sure the resulting ldm/stm is correctly marked as atomic. 
+  if (MMO.isVolatile() || MMO.isAtomic())
     return false;
 
   // Unaligned ldr/str is emulated by some kernels, but unaligned ldm/stm is
@@ -1834,7 +1849,7 @@ bool ARMLoadStoreOpt::LoadStoreMultipleOpti(MachineBasicBlock &MBB) {
   auto LessThan = [](const MergeCandidate* M0, const MergeCandidate *M1) {
     return M0->InsertPos < M1->InsertPos;
   };
-  llvm::sort(Candidates.begin(), Candidates.end(), LessThan);
+  llvm::sort(Candidates, LessThan);
 
   // Go through list of candidates and merge.
   bool Changed = false;
@@ -2034,6 +2049,11 @@ char ARMPreAllocLoadStoreOpt::ID = 0;
 INITIALIZE_PASS(ARMPreAllocLoadStoreOpt, "arm-prera-ldst-opt",
                 ARM_PREALLOC_LOAD_STORE_OPT_NAME, false, false)
 
+// Limit the number of instructions to be rescheduled.
+// FIXME: tune this limit, and/or come up with some better heuristics.
+static cl::opt<unsigned> InstReorderLimit("arm-prera-ldst-opt-reorder-limit",
+                                          cl::init(8), cl::Hidden);
+
 bool ARMPreAllocLoadStoreOpt::runOnMachineFunction(MachineFunction &Fn) {
   if (AssumeMisalignedLoadStores || skipFunction(Fn.getFunction()))
     return false;
@@ -2126,7 +2146,8 @@ ARMPreAllocLoadStoreOpt::CanFormLdStDWord(MachineInstr *Op0, MachineInstr *Op1,
   // At the moment, we ignore the memoryoperand's value.
   // If we want to use AliasAnalysis, we should check it accordingly.
   if (!Op0->hasOneMemOperand() ||
-      (*Op0->memoperands_begin())->isVolatile())
+      (*Op0->memoperands_begin())->isVolatile() ||
+      (*Op0->memoperands_begin())->isAtomic())
     return false;
 
   unsigned Align = (*Op0->memoperands_begin())->getAlignment();
@@ -2172,13 +2193,12 @@ bool ARMPreAllocLoadStoreOpt::RescheduleOps(MachineBasicBlock *MBB,
   bool RetVal = false;
 
   // Sort by offset (in reverse order).
-  llvm::sort(Ops.begin(), Ops.end(),
-             [](const MachineInstr *LHS, const MachineInstr *RHS) {
-               int LOffset = getMemoryOpOffset(*LHS);
-               int ROffset = getMemoryOpOffset(*RHS);
-               assert(LHS == RHS || LOffset != ROffset);
-               return LOffset > ROffset;
-             });
+  llvm::sort(Ops, [](const MachineInstr *LHS, const MachineInstr *RHS) {
+    int LOffset = getMemoryOpOffset(*LHS);
+    int ROffset = getMemoryOpOffset(*RHS);
+    assert(LHS == RHS || LOffset != ROffset);
+    return LOffset > ROffset;
+  });
 
   // The loads / stores of the same base are in order. Scan them from first to
   // last and check for the following:
@@ -2210,7 +2230,7 @@ bool ARMPreAllocLoadStoreOpt::RescheduleOps(MachineBasicBlock *MBB,
       }
 
       // Don't try to reschedule too many instructions.
-      if (NumMove == 8) // FIXME: Tune this limit.
+      if (NumMove == InstReorderLimit)
         break;
 
       // Found a mergable instruction; save information about it.
@@ -2290,7 +2310,7 @@ bool ARMPreAllocLoadStoreOpt::RescheduleOps(MachineBasicBlock *MBB,
             if (!isT2)
               MIB.addReg(0);
             MIB.addImm(Offset).addImm(Pred).addReg(PredReg);
-            MIB.setMemRefs(Op0->mergeMemRefsWith(*Op1));
+            MIB.cloneMergedMemRefs({Op0, Op1});
             LLVM_DEBUG(dbgs() << "Formed " << *MIB << "\n");
             ++NumLDRDFormed;
           } else {
@@ -2304,7 +2324,7 @@ bool ARMPreAllocLoadStoreOpt::RescheduleOps(MachineBasicBlock *MBB,
             if (!isT2)
               MIB.addReg(0);
             MIB.addImm(Offset).addImm(Pred).addReg(PredReg);
-            MIB.setMemRefs(Op0->mergeMemRefsWith(*Op1));
+            MIB.cloneMergedMemRefs({Op0, Op1});
             LLVM_DEBUG(dbgs() << "Formed " << *MIB << "\n");
             ++NumSTRDFormed;
           }
@@ -2338,10 +2358,13 @@ ARMPreAllocLoadStoreOpt::RescheduleLoadStoreInstrs(MachineBasicBlock *MBB) {
   bool RetVal = false;
 
   DenseMap<MachineInstr*, unsigned> MI2LocMap;
-  DenseMap<unsigned, SmallVector<MachineInstr *, 4>> Base2LdsMap;
-  DenseMap<unsigned, SmallVector<MachineInstr *, 4>> Base2StsMap;
-  SmallVector<unsigned, 4> LdBases;
-  SmallVector<unsigned, 4> StBases;
+  using MapIt = DenseMap<unsigned, SmallVector<MachineInstr *, 4>>::iterator;
+  using Base2InstMap = DenseMap<unsigned, SmallVector<MachineInstr *, 4>>;
+  using BaseVec = SmallVector<unsigned, 4>;
+  Base2InstMap Base2LdsMap;
+  Base2InstMap Base2StsMap;
+  BaseVec LdBases;
+  BaseVec StBases;
 
   unsigned Loc = 0;
   MachineBasicBlock::iterator MBBI = MBB->begin();
@@ -2368,41 +2391,28 @@ ARMPreAllocLoadStoreOpt::RescheduleLoadStoreInstrs(MachineBasicBlock *MBB) {
       bool isLd = isLoadSingle(Opc);
       unsigned Base = MI.getOperand(1).getReg();
       int Offset = getMemoryOpOffset(MI);
-
       bool StopHere = false;
-      if (isLd) {
-        DenseMap<unsigned, SmallVector<MachineInstr *, 4>>::iterator BI =
-          Base2LdsMap.find(Base);
-        if (BI != Base2LdsMap.end()) {
-          for (unsigned i = 0, e = BI->second.size(); i != e; ++i) {
-            if (Offset == getMemoryOpOffset(*BI->second[i])) {
-              StopHere = true;
-              break;
-            }
-          }
-          if (!StopHere)
-            BI->second.push_back(&MI);
-        } else {
-          Base2LdsMap[Base].push_back(&MI);
-          LdBases.push_back(Base);
+      auto FindBases = [&] (Base2InstMap &Base2Ops, BaseVec &Bases) {
+        MapIt BI = Base2Ops.find(Base);
+        if (BI == Base2Ops.end()) {
+          Base2Ops[Base].push_back(&MI);
+          Bases.push_back(Base);
+          return;
         }
-      } else {
-        DenseMap<unsigned, SmallVector<MachineInstr *, 4>>::iterator BI =
-          Base2StsMap.find(Base);
-        if (BI != Base2StsMap.end()) {
-          for (unsigned i = 0, e = BI->second.size(); i != e; ++i) {
-            if (Offset == getMemoryOpOffset(*BI->second[i])) {
-              StopHere = true;
-              break;
-            }
+        for (unsigned i = 0, e = BI->second.size(); i != e; ++i) {
+          if (Offset == getMemoryOpOffset(*BI->second[i])) {
+            StopHere = true;
+            break;
           }
-          if (!StopHere)
-            BI->second.push_back(&MI);
-        } else {
-          Base2StsMap[Base].push_back(&MI);
-          StBases.push_back(Base);
         }
-      }
+        if (!StopHere)
+          BI->second.push_back(&MI);
+      };
+
+      if (isLd)
+        FindBases(Base2LdsMap, LdBases);
+      else
+        FindBases(Base2StsMap, StBases);
 
       if (StopHere) {
         // Found a duplicate (a base+offset combination that's seen earlier).

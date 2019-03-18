@@ -1,9 +1,8 @@
 //===- GlobalOpt.cpp - Optimize Global Variables --------------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -357,6 +356,41 @@ static bool CleanupConstantGlobalUsers(Value *V, Constant *Init,
   return Changed;
 }
 
+static bool isSafeSROAElementUse(Value *V);
+
+/// Return true if the specified GEP is a safe user of a derived
+/// expression from a global that we want to SROA.
+static bool isSafeSROAGEP(User *U) {
+  // Check to see if this ConstantExpr GEP is SRA'able.  In particular, we
+  // don't like < 3 operand CE's, and we don't like non-constant integer
+  // indices.  This enforces that all uses are 'gep GV, 0, C, ...' for some
+  // value of C.
+  if (U->getNumOperands() < 3 || !isa<Constant>(U->getOperand(1)) ||
+      !cast<Constant>(U->getOperand(1))->isNullValue())
+    return false;
+
+  gep_type_iterator GEPI = gep_type_begin(U), E = gep_type_end(U);
+  ++GEPI; // Skip over the pointer index.
+
+  // For all other level we require that the indices are constant and inrange.
+  // In particular, consider: A[0][i].  We cannot know that the user isn't doing
+  // invalid things like allowing i to index an out-of-range subscript that
+  // accesses A[1]. This can also happen between different members of a struct
+  // in llvm IR.
+  for (; GEPI != E; ++GEPI) {
+    if (GEPI.isStruct())
+      continue;
+
+    ConstantInt *IdxVal = dyn_cast<ConstantInt>(GEPI.getOperand());
+    if (!IdxVal || (GEPI.isBoundedSequential() &&
+                    IdxVal->getZExtValue() >= GEPI.getSequentialNumElements()))
+      return false;
+  }
+
+  return llvm::all_of(U->users(),
+                      [](User *UU) { return isSafeSROAElementUse(UU); });
+}
+
 /// Return true if the specified instruction is a safe user of a derived
 /// expression from a global that we want to SROA.
 static bool isSafeSROAElementUse(Value *V) {
@@ -374,83 +408,24 @@ static bool isSafeSROAElementUse(Value *V) {
   if (StoreInst *SI = dyn_cast<StoreInst>(I))
     return SI->getOperand(0) != V;
 
-  // Otherwise, it must be a GEP.
-  GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(I);
-  if (!GEPI) return false;
-
-  if (GEPI->getNumOperands() < 3 || !isa<Constant>(GEPI->getOperand(1)) ||
-      !cast<Constant>(GEPI->getOperand(1))->isNullValue())
-    return false;
-
-  for (User *U : GEPI->users())
-    if (!isSafeSROAElementUse(U))
-      return false;
-  return true;
-}
-
-/// U is a direct user of the specified global value.  Look at it and its uses
-/// and decide whether it is safe to SROA this global.
-static bool IsUserOfGlobalSafeForSRA(User *U, GlobalValue *GV) {
-  // The user of the global must be a GEP Inst or a ConstantExpr GEP.
-  if (!isa<GetElementPtrInst>(U) &&
-      (!isa<ConstantExpr>(U) ||
-       cast<ConstantExpr>(U)->getOpcode() != Instruction::GetElementPtr))
-    return false;
-
-  // Check to see if this ConstantExpr GEP is SRA'able.  In particular, we
-  // don't like < 3 operand CE's, and we don't like non-constant integer
-  // indices.  This enforces that all uses are 'gep GV, 0, C, ...' for some
-  // value of C.
-  if (U->getNumOperands() < 3 || !isa<Constant>(U->getOperand(1)) ||
-      !cast<Constant>(U->getOperand(1))->isNullValue() ||
-      !isa<ConstantInt>(U->getOperand(2)))
-    return false;
-
-  gep_type_iterator GEPI = gep_type_begin(U), E = gep_type_end(U);
-  ++GEPI;  // Skip over the pointer index.
-
-  // If this is a use of an array allocation, do a bit more checking for sanity.
-  if (GEPI.isSequential()) {
-    ConstantInt *Idx = cast<ConstantInt>(U->getOperand(2));
-
-    // Check to make sure that index falls within the array.  If not,
-    // something funny is going on, so we won't do the optimization.
-    //
-    if (GEPI.isBoundedSequential() &&
-        Idx->getZExtValue() >= GEPI.getSequentialNumElements())
-      return false;
-
-    // We cannot scalar repl this level of the array unless any array
-    // sub-indices are in-range constants.  In particular, consider:
-    // A[0][i].  We cannot know that the user isn't doing invalid things like
-    // allowing i to index an out-of-range subscript that accesses A[1].
-    //
-    // Scalar replacing *just* the outer index of the array is probably not
-    // going to be a win anyway, so just give up.
-    for (++GEPI; // Skip array index.
-         GEPI != E;
-         ++GEPI) {
-      if (GEPI.isStruct())
-        continue;
-
-      ConstantInt *IdxVal = dyn_cast<ConstantInt>(GEPI.getOperand());
-      if (!IdxVal ||
-          (GEPI.isBoundedSequential() &&
-           IdxVal->getZExtValue() >= GEPI.getSequentialNumElements()))
-        return false;
-    }
-  }
-
-  return llvm::all_of(U->users(),
-                      [](User *UU) { return isSafeSROAElementUse(UU); });
+  // Otherwise, it must be a GEP. Check it and its users are safe to SRA.
+  return isa<GetElementPtrInst>(I) && isSafeSROAGEP(I);
 }
 
 /// Look at all uses of the global and decide whether it is safe for us to
 /// perform this transformation.
 static bool GlobalUsersSafeToSRA(GlobalValue *GV) {
-  for (User *U : GV->users())
-    if (!IsUserOfGlobalSafeForSRA(U, GV))
+  for (User *U : GV->users()) {
+    // The user of the global must be a GEP Inst or a ConstantExpr GEP.
+    if (!isa<GetElementPtrInst>(U) &&
+        (!isa<ConstantExpr>(U) ||
+        cast<ConstantExpr>(U)->getOpcode() != Instruction::GetElementPtr))
       return false;
+
+    // Check the gep and it's users are safe to SRA
+    if (!isSafeSROAGEP(U))
+      return false;
+  }
 
   return true;
 }
@@ -754,7 +729,8 @@ static bool OptimizeAwayTrappingUsesOfValue(Value *V, Constant *NewV) {
           break;
       if (Idxs.size() == GEPI->getNumOperands()-1)
         Changed |= OptimizeAwayTrappingUsesOfValue(
-            GEPI, ConstantExpr::getGetElementPtr(nullptr, NewV, Idxs));
+            GEPI, ConstantExpr::getGetElementPtr(GEPI->getSourceElementType(),
+                                                 NewV, Idxs));
       if (GEPI->use_empty()) {
         Changed = true;
         GEPI->eraseFromParent();
@@ -930,9 +906,10 @@ OptimizeGlobalAddressOfMalloc(GlobalVariable *GV, CallInst *CI, Type *AllocTy,
 
       // Replace the cmp X, 0 with a use of the bool value.
       // Sink the load to where the compare was, if atomic rules allow us to.
-      Value *LV = new LoadInst(InitBool, InitBool->getName()+".val", false, 0,
+      Value *LV = new LoadInst(InitBool->getValueType(), InitBool,
+                               InitBool->getName() + ".val", false, 0,
                                LI->getOrdering(), LI->getSyncScopeID(),
-                               LI->isUnordered() ? (Instruction*)ICI : LI);
+                               LI->isUnordered() ? (Instruction *)ICI : LI);
       InitBoolUsed = true;
       switch (ICI->getPredicate()) {
       default: llvm_unreachable("Unknown ICmp Predicate!");
@@ -1065,7 +1042,8 @@ static void ReplaceUsesOfMallocWithGlobal(Instruction *Alloc,
     }
 
     // Insert a load from the global, and use it instead of the malloc.
-    Value *NL = new LoadInst(GV, GV->getName()+".val", InsertPt);
+    Value *NL =
+        new LoadInst(GV->getValueType(), GV, GV->getName() + ".val", InsertPt);
     U->replaceUsesOfWith(Alloc, NL);
   }
 }
@@ -1188,10 +1166,10 @@ static Value *GetHeapSROAValue(Value *V, unsigned FieldNo,
   if (LoadInst *LI = dyn_cast<LoadInst>(V)) {
     // This is a scalarized version of the load from the global.  Just create
     // a new Load of the scalarized global.
-    Result = new LoadInst(GetHeapSROAValue(LI->getOperand(0), FieldNo,
-                                           InsertedScalarizedValues,
-                                           PHIsToRewrite),
-                          LI->getName()+".f"+Twine(FieldNo), LI);
+    Value *V = GetHeapSROAValue(LI->getOperand(0), FieldNo,
+                                InsertedScalarizedValues, PHIsToRewrite);
+    Result = new LoadInst(V->getType()->getPointerElementType(), V,
+                          LI->getName() + ".f" + Twine(FieldNo), LI);
   } else {
     PHINode *PN = cast<PHINode>(V);
     // PN's type is pointer to struct.  Make a new PHI of pointer to struct
@@ -1381,7 +1359,9 @@ static GlobalVariable *PerformHeapAllocSRoA(GlobalVariable *GV, CallInst *CI,
   // Within the NullPtrBlock, we need to emit a comparison and branch for each
   // pointer, because some may be null while others are not.
   for (unsigned i = 0, e = FieldGlobals.size(); i != e; ++i) {
-    Value *GVVal = new LoadInst(FieldGlobals[i], "tmp", NullPtrBlock);
+    Value *GVVal =
+        new LoadInst(cast<GlobalVariable>(FieldGlobals[i])->getValueType(),
+                     FieldGlobals[i], "tmp", NullPtrBlock);
     Value *Cmp = new ICmpInst(*NullPtrBlock, ICmpInst::ICMP_NE, GVVal,
                               Constant::getNullValue(GVVal->getType()));
     BasicBlock *FreeBlock = BasicBlock::Create(Cmp->getContext(), "free_it",
@@ -1725,7 +1705,8 @@ static bool TryToShrinkGlobalToBoolean(GlobalVariable *GV, Constant *OtherVal) {
         if (LoadInst *LI = dyn_cast<LoadInst>(StoredVal)) {
           assert(LI->getOperand(0) == GV && "Not a copy!");
           // Insert a new load, to preserve the saved value.
-          StoreVal = new LoadInst(NewGV, LI->getName()+".b", false, 0,
+          StoreVal = new LoadInst(NewGV->getValueType(), NewGV,
+                                  LI->getName() + ".b", false, 0,
                                   LI->getOrdering(), LI->getSyncScopeID(), LI);
         } else {
           assert((isa<CastInst>(StoredVal) || isa<SelectInst>(StoredVal)) &&
@@ -1734,19 +1715,26 @@ static bool TryToShrinkGlobalToBoolean(GlobalVariable *GV, Constant *OtherVal) {
           assert(isa<LoadInst>(StoreVal) && "Not a load of NewGV!");
         }
       }
-      new StoreInst(StoreVal, NewGV, false, 0,
-                    SI->getOrdering(), SI->getSyncScopeID(), SI);
+      StoreInst *NSI =
+          new StoreInst(StoreVal, NewGV, false, 0, SI->getOrdering(),
+                        SI->getSyncScopeID(), SI);
+      NSI->setDebugLoc(SI->getDebugLoc());
     } else {
       // Change the load into a load of bool then a select.
       LoadInst *LI = cast<LoadInst>(UI);
-      LoadInst *NLI = new LoadInst(NewGV, LI->getName()+".b", false, 0,
-                                   LI->getOrdering(), LI->getSyncScopeID(), LI);
-      Value *NSI;
+      LoadInst *NLI =
+          new LoadInst(NewGV->getValueType(), NewGV, LI->getName() + ".b",
+                       false, 0, LI->getOrdering(), LI->getSyncScopeID(), LI);
+      Instruction *NSI;
       if (IsOneZero)
         NSI = new ZExtInst(NLI, LI->getType(), "", LI);
       else
         NSI = SelectInst::Create(NLI, OtherVal, InitVal, "", LI);
       NSI->takeName(LI);
+      // Since LI is split into two instructions, NLI and NSI both inherit the
+      // same DebugLoc
+      NLI->setDebugLoc(LI->getDebugLoc());
+      NSI->setDebugLoc(LI->getDebugLoc());
       LI->replaceAllUsesWith(NSI);
     }
     UI->eraseFromParent();
@@ -2129,6 +2117,13 @@ static bool hasChangeableCC(Function *F) {
 
   // FIXME: Is it worth transforming x86_stdcallcc and x86_fastcallcc?
   if (CC != CallingConv::C && CC != CallingConv::X86_ThisCall)
+    return false;
+
+  // Don't break the invariant that the inalloca parameter is the only parameter
+  // passed in memory.
+  // FIXME: GlobalOpt should remove inalloca when possible and hoist the dynamic
+  // alloca it uses to the entry block if possible.
+  if (F->getAttributes().hasAttrSomewhere(Attribute::InAlloca))
     return false;
 
   // FIXME: Change CC for the whole chain of musttail calls when possible.
@@ -2819,46 +2814,20 @@ static Function *FindCXAAtExit(Module &M, TargetLibraryInfo *TLI) {
 /// Returns whether the given function is an empty C++ destructor and can
 /// therefore be eliminated.
 /// Note that we assume that other optimization passes have already simplified
-/// the code so we only look for a function with a single basic block, where
-/// the only allowed instructions are 'ret', 'call' to an empty C++ dtor and
-/// other side-effect free instructions.
-static bool cxxDtorIsEmpty(const Function &Fn,
-                           SmallPtrSet<const Function *, 8> &CalledFunctions) {
+/// the code so we simply check for 'ret'.
+static bool cxxDtorIsEmpty(const Function &Fn) {
   // FIXME: We could eliminate C++ destructors if they're readonly/readnone and
   // nounwind, but that doesn't seem worth doing.
   if (Fn.isDeclaration())
     return false;
 
-  if (++Fn.begin() != Fn.end())
-    return false;
-
-  const BasicBlock &EntryBlock = Fn.getEntryBlock();
-  for (BasicBlock::const_iterator I = EntryBlock.begin(), E = EntryBlock.end();
-       I != E; ++I) {
-    if (const CallInst *CI = dyn_cast<CallInst>(I)) {
-      // Ignore debug intrinsics.
-      if (isa<DbgInfoIntrinsic>(CI))
-        continue;
-
-      const Function *CalledFn = CI->getCalledFunction();
-
-      if (!CalledFn)
-        return false;
-
-      SmallPtrSet<const Function *, 8> NewCalledFunctions(CalledFunctions);
-
-      // Don't treat recursive functions as empty.
-      if (!NewCalledFunctions.insert(CalledFn).second)
-        return false;
-
-      if (!cxxDtorIsEmpty(*CalledFn, NewCalledFunctions))
-        return false;
-    } else if (isa<ReturnInst>(*I))
-      return true; // We're done.
-    else if (I->mayHaveSideEffects())
-      return false; // Destructor with side effects, bail.
+  for (auto &I : Fn.getEntryBlock()) {
+    if (isa<DbgInfoIntrinsic>(I))
+      continue;
+    if (isa<ReturnInst>(I))
+      return true;
+    break;
   }
-
   return false;
 }
 
@@ -2890,11 +2859,7 @@ static bool OptimizeEmptyGlobalCXXDtors(Function *CXAAtExitFn) {
 
     Function *DtorFn =
       dyn_cast<Function>(CI->getArgOperand(0)->stripPointerCasts());
-    if (!DtorFn)
-      continue;
-
-    SmallPtrSet<const Function *, 8> CalledFunctions;
-    if (!cxxDtorIsEmpty(*DtorFn, CalledFunctions))
+    if (!DtorFn || !cxxDtorIsEmpty(*DtorFn))
       continue;
 
     // Just remove the call.

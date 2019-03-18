@@ -1,9 +1,8 @@
 //===-- X86ISelLowering.h - X86 DAG Lowering Interface ----------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -98,7 +97,7 @@ namespace llvm {
       SETCC,
 
       /// X86 Select
-      SELECT, SELECTS,
+      SELECTS,
 
       // Same as SETCC except it's materialized with a sbb and the value is all
       // one's or all zero's.
@@ -110,8 +109,8 @@ namespace llvm {
       FSETCC,
 
       /// X86 FP SETCC, similar to above, but with output as an i1 mask and
-      /// with optional rounding mode.
-      FSETCCM, FSETCCM_RND,
+      /// and a version with SAE.
+      FSETCCM, FSETCCM_SAE,
 
       /// X86 conditional moves. Operand 0 and operand 1 are the two values
       /// to select from. Operand 2 is the condition code, and operand 3 is the
@@ -203,36 +202,30 @@ namespace llvm {
 
       /// Dynamic (non-constant condition) vector blend where only the sign bits
       /// of the condition elements are used. This is used to enforce that the
-      /// condition mask is not valid for generic VSELECT optimizations.
-      SHRUNKBLEND,
+      /// condition mask is not valid for generic VSELECT optimizations. This
+      /// is also used to implement the intrinsics.
+      /// Operands are in VSELECT order: MASK, TRUE, FALSE
+      BLENDV,
 
       /// Combined add and sub on an FP vector.
       ADDSUB,
 
       //  FP vector ops with rounding mode.
-      FADD_RND, FADDS_RND,
-      FSUB_RND, FSUBS_RND,
-      FMUL_RND, FMULS_RND,
-      FDIV_RND, FDIVS_RND,
-      FMAX_RND, FMAXS_RND,
-      FMIN_RND, FMINS_RND,
-      FSQRT_RND, FSQRTS_RND,
+      FADD_RND, FADDS, FADDS_RND,
+      FSUB_RND, FSUBS, FSUBS_RND,
+      FMUL_RND, FMULS, FMULS_RND,
+      FDIV_RND, FDIVS, FDIVS_RND,
+      FMAX_SAE, FMAXS_SAE,
+      FMIN_SAE, FMINS_SAE,
+      FSQRT_RND, FSQRTS, FSQRTS_RND,
 
       // FP vector get exponent.
-      FGETEXP_RND, FGETEXPS_RND,
+      FGETEXP, FGETEXP_SAE, FGETEXPS, FGETEXPS_SAE,
       // Extract Normalized Mantissas.
-      VGETMANT, VGETMANT_RND, VGETMANTS, VGETMANTS_RND,
+      VGETMANT, VGETMANT_SAE, VGETMANTS, VGETMANTS_SAE,
       // FP Scale.
-      SCALEF,
-      SCALEFS,
-
-      // Integer add/sub with unsigned saturation.
-      ADDUS,
-      SUBUS,
-
-      // Integer add/sub with signed saturation.
-      ADDS,
-      SUBS,
+      SCALEF, SCALEF_RND,
+      SCALEFS, SCALEFS_RND,
 
       // Unsigned Integer average.
       AVG,
@@ -295,21 +288,26 @@ namespace llvm {
       // Vector move to low scalar and zero higher vector elements.
       VZEXT_MOVL,
 
-      // Vector integer zero-extend.
-      VZEXT,
-      // Vector integer signed-extend.
-      VSEXT,
-
       // Vector integer truncate.
       VTRUNC,
       // Vector integer truncate with unsigned/signed saturation.
       VTRUNCUS, VTRUNCS,
 
+      // Masked version of the above. Used when less than a 128-bit result is
+      // produced since the mask only applies to the lower elements and can't
+      // be represented by a select.
+      // SRC, PASSTHRU, MASK
+      VMTRUNC, VMTRUNCUS, VMTRUNCS,
+
       // Vector FP extend.
-      VFPEXT, VFPEXT_RND, VFPEXTS_RND,
+      VFPEXT, VFPEXT_SAE, VFPEXTS, VFPEXTS_SAE,
 
       // Vector FP round.
-      VFPROUND, VFPROUND_RND, VFPROUNDS_RND,
+      VFPROUND, VFPROUND_RND, VFPROUNDS, VFPROUNDS_RND,
+
+      // Masked version of above. Used for v2f64->v4f32.
+      // SRC, PASSTHRU, MASK
+      VMFPROUND,
 
       // 128-bit vector logical left / right shift
       VSHLDQ, VSRLDQ,
@@ -317,10 +315,8 @@ namespace llvm {
       // Vector shift elements
       VSHL, VSRL, VSRA,
 
-      // Vector variable shift right arithmetic.
-      // Unlike ISD::SRA, in case shift count greater then element size
-      // use sign bit to fill destination data element.
-      VSRAV,
+      // Vector variable shift
+      VSHLV, VSRLV, VSRAV,
 
       // Vector shift elements by immediate
       VSHLI, VSRLI, VSRAI,
@@ -345,25 +341,18 @@ namespace llvm {
       /// Vector comparison generating mask bits for fp and
       /// integer signed and unsigned data types.
       CMPM,
-      // Vector comparison with rounding mode for FP values
-      CMPM_RND,
+      // Vector comparison with SAE for FP values
+      CMPM_SAE,
 
       // Arithmetic operations with FLAGS results.
-      ADD, SUB, ADC, SBB, SMUL,
-      INC, DEC, OR, XOR, AND,
+      ADD, SUB, ADC, SBB, SMUL, UMUL,
+      OR, XOR, AND,
 
       // Bit field extract.
       BEXTR,
 
-      // LOW, HI, FLAGS = umul LHS, RHS.
-      UMUL,
-
-      // 8-bit SMUL/UMUL - AX, FLAGS = smul8/umul8 AL, RHS.
-      SMUL8, UMUL8,
-
-      // 8-bit divrem that zero-extend the high result (AH).
-      UDIVREM8_ZEXT_HREG,
-      SDIVREM8_SEXT_HREG,
+      // Zero High Bits Starting with Specified Bit Position.
+      BZHI,
 
       // X86-specific multiply by immediate.
       MUL_IMM,
@@ -428,16 +417,16 @@ namespace llvm {
       // Bitwise ternary logic.
       VPTERNLOG,
       // Fix Up Special Packed Float32/64 values.
-      VFIXUPIMM,
-      VFIXUPIMMS,
+      VFIXUPIMM, VFIXUPIMM_SAE,
+      VFIXUPIMMS, VFIXUPIMMS_SAE,
       // Range Restriction Calculation For Packed Pairs of Float32/64 values.
-      VRANGE, VRANGE_RND, VRANGES, VRANGES_RND,
+      VRANGE, VRANGE_SAE, VRANGES, VRANGES_SAE,
       // Reduce - Perform Reduction Transformation on scalar\packed FP.
-      VREDUCE, VREDUCE_RND, VREDUCES, VREDUCES_RND,
+      VREDUCE, VREDUCE_SAE, VREDUCES, VREDUCES_SAE,
       // RndScale - Round FP Values To Include A Given Number Of Fraction Bits.
       // Also used by the legacy (V)ROUND intrinsics where we mask out the
       // scaling part of the immediate.
-      VRNDSCALE, VRNDSCALE_RND, VRNDSCALES, VRNDSCALES_RND,
+      VRNDSCALE, VRNDSCALE_SAE, VRNDSCALES, VRNDSCALES_SAE,
       // Tests Types Of a FP Values for packed types.
       VFPCLASS,
       // Tests Types Of a FP Values for scalar types.
@@ -508,20 +497,26 @@ namespace llvm {
 
       // Convert Unsigned/Integer to Floating-Point Value with rounding mode.
       SINT_TO_FP_RND, UINT_TO_FP_RND,
+      SCALAR_SINT_TO_FP, SCALAR_UINT_TO_FP,
       SCALAR_SINT_TO_FP_RND, SCALAR_UINT_TO_FP_RND,
 
       // Vector float/double to signed/unsigned integer.
       CVTP2SI, CVTP2UI, CVTP2SI_RND, CVTP2UI_RND,
       // Scalar float/double to signed/unsigned integer.
-      CVTS2SI_RND, CVTS2UI_RND,
+      CVTS2SI, CVTS2UI, CVTS2SI_RND, CVTS2UI_RND,
 
       // Vector float/double to signed/unsigned integer with truncation.
-      CVTTP2SI, CVTTP2UI, CVTTP2SI_RND, CVTTP2UI_RND,
+      CVTTP2SI, CVTTP2UI, CVTTP2SI_SAE, CVTTP2UI_SAE,
       // Scalar float/double to signed/unsigned integer with truncation.
-      CVTTS2SI_RND, CVTTS2UI_RND,
+      CVTTS2SI, CVTTS2UI, CVTTS2SI_SAE, CVTTS2UI_SAE,
 
       // Vector signed/unsigned integer to float/double.
       CVTSI2P, CVTUI2P,
+
+      // Masked versions of above. Used for v2f64->v4f32.
+      // SRC, PASSTHRU, MASK
+      MCVTP2SI, MCVTP2UI, MCVTTP2SI, MCVTTP2UI,
+      MCVTSI2P, MCVTUI2P,
 
       // Save xmm argument registers to the stack, according to %al. An operator
       // is needed so that this can be expanded with control flow.
@@ -565,10 +560,15 @@ namespace llvm {
       XTEST,
 
       // ERI instructions.
-      RSQRT28, RSQRT28S, RCP28, RCP28S, EXP2,
+      RSQRT28, RSQRT28_SAE, RSQRT28S, RSQRT28S_SAE,
+      RCP28, RCP28_SAE, RCP28S, RCP28S_SAE, EXP2, EXP2_SAE,
 
       // Conversions between float and half-float.
-      CVTPS2PH, CVTPH2PS, CVTPH2PS_RND,
+      CVTPS2PH, CVTPH2PS, CVTPH2PS_SAE,
+
+      // Masked version of above.
+      // SRC, RND, PASSTHRU, MASK
+      MCVTPS2PH,
 
       // Galois Field Arithmetic Instructions
       GF2P8AFFINEINVQB, GF2P8AFFINEQB, GF2P8MULB,
@@ -588,7 +588,7 @@ namespace llvm {
 
       /// LOCK-prefixed arithmetic read-modify-write instructions.
       /// EFLAGS, OUTCHAIN = LADD(INCHAIN, PTR, RHS)
-      LADD, LSUB, LOR, LXOR, LAND, LINC, LDEC,
+      LADD, LSUB, LOR, LXOR, LAND,
 
       // Load, scalar_to_vector, and zero extend.
       VZEXT_LOAD,
@@ -600,29 +600,27 @@ namespace llvm {
       /// integer destination in memory and a FP reg source.  This corresponds
       /// to the X86::FIST*m instructions and the rounding mode change stuff. It
       /// has two inputs (token chain and address) and two outputs (int value
-      /// and token chain).
-      FP_TO_INT16_IN_MEM,
-      FP_TO_INT32_IN_MEM,
-      FP_TO_INT64_IN_MEM,
+      /// and token chain). Memory VT specifies the type to store to.
+      FP_TO_INT_IN_MEM,
 
       /// This instruction implements SINT_TO_FP with the
       /// integer source in memory and FP reg result.  This corresponds to the
-      /// X86::FILD*m instructions. It has three inputs (token chain, address,
-      /// and source type) and two outputs (FP value and token chain). FILD_FLAG
-      /// also produces a flag).
+      /// X86::FILD*m instructions. It has two inputs (token chain and address)
+      /// and two outputs (FP value and token chain). FILD_FLAG also produces a
+      /// flag). The integer source type is specified by the memory VT.
       FILD,
       FILD_FLAG,
 
       /// This instruction implements an extending load to FP stack slots.
       /// This corresponds to the X86::FLD32m / X86::FLD64m. It takes a chain
-      /// operand, ptr to load from, and a ValueType node indicating the type
-      /// to load to.
+      /// operand, and ptr to load from. The memory VT specifies the type to
+      /// load from.
       FLD,
 
       /// This instruction implements a truncating store to FP stack
       /// slots. This corresponds to the X86::FST32m / X86::FST64m. It takes a
-      /// chain operand, value to store, address, and a ValueType to store it
-      /// as.
+      /// chain operand, value to store, and address. The memory VT specifies
+      /// the type to store as.
       FST,
 
       /// This instruction grabs the address of the next argument
@@ -815,6 +813,32 @@ namespace llvm {
 
     bool preferShiftsToClearExtremeBits(SDValue Y) const override;
 
+    bool
+    shouldTransformSignedTruncationCheck(EVT XVT,
+                                         unsigned KeptBits) const override {
+      // For vectors, we don't have a preference..
+      if (XVT.isVector())
+        return false;
+
+      auto VTIsOk = [](EVT VT) -> bool {
+        return VT == MVT::i8 || VT == MVT::i16 || VT == MVT::i32 ||
+               VT == MVT::i64;
+      };
+
+      // We are ok with KeptBitsVT being byte/word/dword, what MOVS supports.
+      // XVT will be larger than KeptBitsVT.
+      MVT KeptBitsVT = MVT::getIntegerVT(KeptBits);
+      return VTIsOk(XVT) && VTIsOk(KeptBitsVT);
+    }
+
+    bool shouldExpandShift(SelectionDAG &DAG, SDNode *N) const override {
+      if (DAG.getMachineFunction().getFunction().optForMinSize())
+        return false;
+      return true;
+    }
+
+    bool shouldSplatInsEltVarIndex(EVT VT) const override;
+
     bool convertSetCCLogicToBitwiseLogic(EVT VT) const override {
       return VT.isScalarInteger();
     }
@@ -848,10 +872,21 @@ namespace llvm {
                                              const SelectionDAG &DAG,
                                              unsigned Depth) const override;
 
-    SDValue unwrapAddress(SDValue N) const override;
+    bool SimplifyDemandedVectorEltsForTargetNode(SDValue Op,
+                                                 const APInt &DemandedElts,
+                                                 APInt &KnownUndef,
+                                                 APInt &KnownZero,
+                                                 TargetLoweringOpt &TLO,
+                                                 unsigned Depth) const override;
 
-    bool isGAPlusOffset(SDNode *N, const GlobalValue* &GA,
-                        int64_t &Offset) const override;
+    bool SimplifyDemandedBitsForTargetNode(SDValue Op,
+                                           const APInt &DemandedBits,
+                                           const APInt &DemandedElts,
+                                           KnownBits &Known,
+                                           TargetLoweringOpt &TLO,
+                                           unsigned Depth) const override;
+
+    SDValue unwrapAddress(SDValue N) const override;
 
     SDValue getReturnAddressFrameIndex(SelectionDAG &DAG) const;
 
@@ -888,6 +923,11 @@ namespace llvm {
       return TargetLowering::getInlineAsmMemConstraint(ConstraintCode);
     }
 
+    /// Handle Lowering flag assembly outputs.
+    SDValue LowerAsmOutputForConstraint(SDValue &Chain, SDValue &Flag, SDLoc DL,
+                                        const AsmOperandInfo &Constraint,
+                                        SelectionDAG &DAG) const override;
+
     /// Given a physical register constraint
     /// (e.g. {edx}), return the register number and the register class for the
     /// register.  This should only be used for C_Register constraints.  On
@@ -913,6 +953,8 @@ namespace llvm {
     /// add a register and the immediate without having to materialize
     /// the immediate into a register.
     bool isLegalAddImmediate(int64_t Imm) const override;
+
+    bool isLegalStoreImmediate(int64_t Imm) const override;
 
     /// Return the cost of the scaling factor used in the addressing
     /// mode represented by AM for this target, for a load/store
@@ -1012,12 +1054,29 @@ namespace llvm {
     bool shouldConvertConstantLoadToIntImm(const APInt &Imm,
                                            Type *Ty) const override;
 
+    bool reduceSelectOfFPConstantLoads(bool IsFPSetCC) const override;
+
     bool convertSelectOfConstantsToMath(EVT VT) const override;
+
+    bool decomposeMulByConstant(EVT VT, SDValue C) const override;
+
+    bool shouldUseStrictFP_TO_INT(EVT FpVT, EVT IntVT,
+                                  bool IsSigned) const override;
 
     /// Return true if EXTRACT_SUBVECTOR is cheap for this result type
     /// with this index.
     bool isExtractSubvectorCheap(EVT ResVT, EVT SrcVT,
                                  unsigned Index) const override;
+
+    /// Scalar ops always have equal or better analysis/performance/power than
+    /// the vector equivalent, so this always makes sense if the scalar op is
+    /// supported.
+    bool shouldScalarizeBinop(SDValue) const override;
+
+    /// Overflow nodes should get combined/lowered to optimal instructions
+    /// (they should allow eliminating explicit compares by getting flags from
+    /// math ops).
+    bool shouldFormOverflowOp(unsigned Opcode, EVT VT) const override;
 
     bool storeOfVectorConstantIsCheap(EVT MemVT, unsigned NumElem,
                                       unsigned AddrSpace) const override {
@@ -1061,7 +1120,7 @@ namespace llvm {
     bool useStackGuardXorFP() const override;
     void insertSSPDeclarations(Module &M) const override;
     Value *getSDagStackGuard(const Module &M) const override;
-    Value *getSSPStackGuardCheck(const Module &M) const override;
+    Function *getSSPStackGuardCheck(const Module &M) const override;
     SDValue emitStackGuardXorFP(SelectionDAG &DAG, SDValue Val,
                                 const SDLoc &DL) const override;
 
@@ -1077,12 +1136,13 @@ namespace llvm {
     bool isNoopAddrSpaceCast(unsigned SrcAS, unsigned DestAS) const override;
 
     /// Customize the preferred legalization strategy for certain types.
-    LegalizeTypeAction getPreferredVectorAction(EVT VT) const override;
+    LegalizeTypeAction getPreferredVectorAction(MVT VT) const override;
 
-    MVT getRegisterTypeForCallingConv(LLVMContext &Context,
+    MVT getRegisterTypeForCallingConv(LLVMContext &Context, CallingConv::ID CC,
                                       EVT VT) const override;
 
     unsigned getNumRegistersForCallingConv(LLVMContext &Context,
+                                           CallingConv::ID CC,
                                            EVT VT) const override;
 
     bool isIntDivCheap(EVT VT, AttributeList Attr) const override;
@@ -1107,8 +1167,8 @@ namespace llvm {
     bool lowerInterleavedStore(StoreInst *SI, ShuffleVectorInst *SVI,
                                unsigned Factor) const override;
 
-    SDValue expandIndirectJTBranch(const SDLoc& dl, SDValue Value, 
-                                   SDValue Addr, SelectionDAG &DAG) 
+    SDValue expandIndirectJTBranch(const SDLoc& dl, SDValue Value,
+                                   SDValue Addr, SelectionDAG &DAG)
                                    const override;
 
   protected:
@@ -1176,9 +1236,7 @@ namespace llvm {
 
     unsigned getAddressSpace(void) const;
 
-    std::pair<SDValue,SDValue> FP_TO_INTHelper(SDValue Op, SelectionDAG &DAG,
-                                               bool isSigned,
-                                               bool isReplace) const;
+    SDValue FP_TO_INTHelper(SDValue Op, SelectionDAG &DAG, bool isSigned) const;
 
     SDValue LowerBUILD_VECTOR(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerVSELECT(SDValue Op, SelectionDAG &DAG) const;
@@ -1328,11 +1386,6 @@ namespace llvm {
     MachineBasicBlock *EmitSjLjDispatchBlock(MachineInstr &MI,
                                              MachineBasicBlock *MBB) const;
 
-    /// Emit nodes that will be selected as "test Op0,Op0", or something
-    /// equivalent, for use with the given x86 condition code.
-    SDValue EmitTest(SDValue Op0, unsigned X86CC, const SDLoc &dl,
-                     SelectionDAG &DAG) const;
-
     /// Emit nodes that will be selected as "cmp Op0,Op1", or something
     /// equivalent, for use with the given x86 condition code.
     SDValue EmitCmp(SDValue Op0, SDValue Op1, unsigned X86CC, const SDLoc &dl,
@@ -1340,6 +1393,13 @@ namespace llvm {
 
     /// Convert a comparison if required by the subtarget.
     SDValue ConvertCmpIfNecessary(SDValue Cmp, SelectionDAG &DAG) const;
+
+    /// Emit flags for the given setcc condition and operands. Also returns the
+    /// corresponding X86 condition code constant in X86CC.
+    SDValue emitFlagsForSetcc(SDValue Op0, SDValue Op1,
+                              ISD::CondCode CC, const SDLoc &dl,
+                              SelectionDAG &DAG,
+                              SDValue &X86CC) const;
 
     /// Check if replacement of SQRT with RSQRT should be disabled.
     bool isFsqrtCheap(SDValue Operand, SelectionDAG &DAG) const override;
@@ -1388,9 +1448,9 @@ namespace llvm {
                          MachineMemOperand *MMO)
       : MemSDNode(Opcode, Order, dl, VTs, MemVT, MMO) {}
 
-    const SDValue &getBasePtr() const { return getOperand(1); }
-    const SDValue &getMask()    const { return getOperand(2); }
-    const SDValue &getValue()   const { return getOperand(3); }
+    const SDValue &getValue()   const { return getOperand(1); }
+    const SDValue &getBasePtr() const { return getOperand(2); }
+    const SDValue &getMask()    const { return getOperand(3); }
 
     static bool classof(const SDNode *N) {
       return N->getOpcode() == X86ISD::VMTRUNCSTORES ||
@@ -1461,7 +1521,6 @@ namespace llvm {
     const SDValue &getBasePtr() const { return getOperand(3); }
     const SDValue &getIndex()   const { return getOperand(4); }
     const SDValue &getMask()    const { return getOperand(2); }
-    const SDValue &getValue()   const { return getOperand(1); }
     const SDValue &getScale()   const { return getOperand(5); }
 
     static bool classof(const SDNode *N) {
@@ -1477,6 +1536,8 @@ namespace llvm {
         : X86MaskedGatherScatterSDNode(X86ISD::MGATHER, Order, dl, VTs, MemVT,
                                        MMO) {}
 
+    const SDValue &getPassThru() const { return getOperand(1); }
+
     static bool classof(const SDNode *N) {
       return N->getOpcode() == X86ISD::MGATHER;
     }
@@ -1488,6 +1549,8 @@ namespace llvm {
                            EVT MemVT, MachineMemOperand *MMO)
         : X86MaskedGatherScatterSDNode(X86ISD::MSCATTER, Order, dl, VTs, MemVT,
                                        MMO) {}
+
+    const SDValue &getValue() const { return getOperand(1); }
 
     static bool classof(const SDNode *N) {
       return N->getOpcode() == X86ISD::MSCATTER;

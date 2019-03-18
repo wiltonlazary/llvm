@@ -1,9 +1,8 @@
 //===- GlobalISelEmitter.cpp - Generate an instruction selector -----------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -200,7 +199,8 @@ static Optional<LLTCodeGen> MVTToLLT(MVT::SimpleValueType SVT) {
 static std::string explainPredicates(const TreePatternNode *N) {
   std::string Explanation = "";
   StringRef Separator = "";
-  for (const auto &P : N->getPredicateFns()) {
+  for (const TreePredicateCall &Call : N->getPredicateCalls()) {
+    const TreePredicateFn &P = Call.Fn;
     Explanation +=
         (Separator + P.getOrigPatFragRecord()->getRecord()->getName()).str();
     Separator = ", ";
@@ -284,7 +284,9 @@ static Error isTrivialOperatorNode(const TreePatternNode *N) {
   std::string Separator = "";
 
   bool HasUnsupportedPredicate = false;
-  for (const auto &Predicate : N->getPredicateFns()) {
+  for (const TreePredicateCall &Call : N->getPredicateCalls()) {
+    const TreePredicateFn &Predicate = Call.Fn;
+
     if (Predicate.isAlwaysTrue())
       continue;
 
@@ -879,12 +881,19 @@ public:
 
   void defineOperand(StringRef SymbolicName, OperandMatcher &OM);
 
-  void defineComplexSubOperand(StringRef SymbolicName, Record *ComplexPattern,
-                               unsigned RendererID, unsigned SubOperandID) {
-    assert(ComplexSubOperands.count(SymbolicName) == 0 && "Already defined");
+  Error defineComplexSubOperand(StringRef SymbolicName, Record *ComplexPattern,
+                                unsigned RendererID, unsigned SubOperandID) {
+    if (ComplexSubOperands.count(SymbolicName))
+      return failedImport(
+          "Complex suboperand referenced more than once (Operand: " +
+          SymbolicName + ")");
+
     ComplexSubOperands[SymbolicName] =
         std::make_tuple(ComplexPattern, RendererID, SubOperandID);
+
+    return Error::success();
   }
+
   Optional<DefinedComplexPatternSubOperand>
   getComplexSubOperand(StringRef SymbolicName) const {
     const auto &I = ComplexSubOperands.find(SymbolicName);
@@ -1504,6 +1513,9 @@ Error OperandMatcher::addTypeCheckPredicate(const TypeSetByHwMode &VTy,
 
   if (OperandIsAPointer)
     addPredicate<PointerToAnyOperandMatcher>(OpTyOrNone->get().getSizeInBits());
+  else if (VTy.isPointer())
+    addPredicate<LLTOperandMatcher>(LLT::pointer(VTy.getPtrAddrSpace(),
+                                                 OpTyOrNone->get().getSizeInBits()));
   else
     addPredicate<LLTOperandMatcher>(*OpTyOrNone);
   return Error::success();
@@ -1836,6 +1848,12 @@ public:
 
   static bool classof(const InstructionPredicateMatcher *P) {
     return P->getKind() == IPM_GenericPredicate;
+  }
+  bool isIdentical(const PredicateMatcher &B) const override {
+    return InstructionPredicateMatcher::isIdentical(B) &&
+           Predicate ==
+               static_cast<const GenericInstructionPredicateMatcher &>(B)
+                   .Predicate;
   }
   void emitPredicateOpcodes(MatchTable &Table,
                             RuleMatcher &Rule) const override {
@@ -2607,7 +2625,7 @@ public:
       std::vector<unsigned> MergeInsnIDs;
       for (const auto &IDMatcherPair : Rule.defined_insn_vars())
         MergeInsnIDs.push_back(IDMatcherPair.second);
-      llvm::sort(MergeInsnIDs.begin(), MergeInsnIDs.end());
+      llvm::sort(MergeInsnIDs);
       for (const auto &MergeInsnID : MergeInsnIDs)
         Table << MatchTable::IntValue(MergeInsnID);
       Table << MatchTable::NamedValue("GIU_MergeMemOperands_EndOfList")
@@ -2806,7 +2824,7 @@ void RuleMatcher::emit(MatchTable &Table) {
 
       InsnIDs.push_back(Pair.second);
     }
-    llvm::sort(InsnIDs.begin(), InsnIDs.end());
+    llvm::sort(InsnIDs);
 
     for (const auto &InsnID : InsnIDs) {
       // Reject the difficult cases until we have a more accurate check.
@@ -2984,9 +3002,6 @@ private:
   void gatherOpcodeValues();
   void gatherTypeIDValues();
   void gatherNodeEquivs();
-  // Instruction predicate code that will be emitted in generated functions.
-  SmallVector<std::string, 2> InstructionPredicateCodes;
-  unsigned getOrCreateInstructionPredicateFnId(StringRef Code);
 
   Record *findNodeEquiv(Record *N) const;
   const CodeGenInstruction *getEquivNode(Record &Equiv,
@@ -3085,20 +3100,6 @@ void GlobalISelEmitter::gatherOpcodeValues() {
 void GlobalISelEmitter::gatherTypeIDValues() {
   LLTOperandMatcher::initTypeIDValuesMap();
 }
-unsigned GlobalISelEmitter::getOrCreateInstructionPredicateFnId(StringRef Code) {
-  // There's not very many predicates that need to be here at the moment so we
-  // just maintain a simple set-like vector. If it grows then we'll need to do
-  // something more efficient.
-  const auto &I = std::find(InstructionPredicateCodes.begin(),
-                            InstructionPredicateCodes.end(),
-                            Code);
-  if (I == InstructionPredicateCodes.end()) {
-    unsigned ID = InstructionPredicateCodes.size();
-    InstructionPredicateCodes.push_back(Code);
-    return ID;
-  }
-  return std::distance(InstructionPredicateCodes.begin(), I);
-}
 
 void GlobalISelEmitter::gatherNodeEquivs() {
   assert(NodeEquivs.empty());
@@ -3128,7 +3129,8 @@ Record *GlobalISelEmitter::findNodeEquiv(Record *N) const {
 
 const CodeGenInstruction *
 GlobalISelEmitter::getEquivNode(Record &Equiv, const TreePatternNode *N) const {
-  for (const auto &Predicate : N->getPredicateFns()) {
+  for (const TreePredicateCall &Call : N->getPredicateCalls()) {
+    const TreePredicateFn &Predicate = Call.Fn;
     if (!Equiv.isValueUnset("IfSignExtend") && Predicate.isLoad() &&
         Predicate.isSignExtLoad())
       return &Target.getInstruction(Equiv.getValueAsDef("IfSignExtend"));
@@ -3197,7 +3199,8 @@ Expected<InstructionMatcher &> GlobalISelEmitter::createAndImportSelDAGMatcher(
                           " for result of Src pattern operator");
   }
 
-  for (const auto &Predicate : Src->getPredicateFns()) {
+  for (const TreePredicateCall &Call : Src->getPredicateCalls()) {
+    const TreePredicateFn &Predicate = Call.Fn;
     if (Predicate.isAlwaysTrue())
       continue;
 
@@ -3428,9 +3431,12 @@ Error GlobalISelEmitter::importChildMatcher(RuleMatcher &Rule,
 
       for (unsigned i = 0, e = SrcChild->getNumChildren(); i != e; ++i) {
         auto *SubOperand = SrcChild->getChild(i);
-        if (!SubOperand->getName().empty())
-          Rule.defineComplexSubOperand(SubOperand->getName(),
-                                       SrcChild->getOperator(), RendererID, i);
+        if (!SubOperand->getName().empty()) {
+          if (auto Error = Rule.defineComplexSubOperand(SubOperand->getName(),
+                                                        SrcChild->getOperator(),
+                                                        RendererID, i))
+            return Error;
+        }
       }
 
       return Error::success();
@@ -4299,11 +4305,11 @@ void GlobalISelEmitter::run(raw_ostream &OS) {
 
   std::vector<Record *> ComplexPredicates =
       RK.getAllDerivedDefinitions("GIComplexOperandMatcher");
-  llvm::sort(ComplexPredicates.begin(), ComplexPredicates.end(), orderByName);
+  llvm::sort(ComplexPredicates, orderByName);
 
   std::vector<Record *> CustomRendererFns =
       RK.getAllDerivedDefinitions("GICustomOperandRenderer");
-  llvm::sort(CustomRendererFns.begin(), CustomRendererFns.end(), orderByName);
+  llvm::sort(CustomRendererFns, orderByName);
 
   unsigned MaxTemporaries = 0;
   for (const auto &Rule : Rules)
@@ -4382,7 +4388,7 @@ void GlobalISelEmitter::run(raw_ostream &OS) {
   std::vector<LLTCodeGen> TypeObjects;
   for (const auto &Ty : KnownTypes)
     TypeObjects.push_back(Ty);
-  llvm::sort(TypeObjects.begin(), TypeObjects.end());
+  llvm::sort(TypeObjects);
   OS << "// LLT Objects.\n"
      << "enum {\n";
   for (const auto &TypeObject : TypeObjects) {
@@ -4405,21 +4411,20 @@ void GlobalISelEmitter::run(raw_ostream &OS) {
   std::vector<std::vector<Record *>> FeatureBitsets;
   for (auto &Rule : Rules)
     FeatureBitsets.push_back(Rule.getRequiredFeatures());
-  llvm::sort(
-      FeatureBitsets.begin(), FeatureBitsets.end(),
-      [&](const std::vector<Record *> &A, const std::vector<Record *> &B) {
-        if (A.size() < B.size())
-          return true;
-        if (A.size() > B.size())
-          return false;
-        for (const auto &Pair : zip(A, B)) {
-          if (std::get<0>(Pair)->getName() < std::get<1>(Pair)->getName())
-            return true;
-          if (std::get<0>(Pair)->getName() > std::get<1>(Pair)->getName())
-            return false;
-        }
+  llvm::sort(FeatureBitsets, [&](const std::vector<Record *> &A,
+                                 const std::vector<Record *> &B) {
+    if (A.size() < B.size())
+      return true;
+    if (A.size() > B.size())
+      return false;
+    for (const auto &Pair : zip(A, B)) {
+      if (std::get<0>(Pair)->getName() < std::get<1>(Pair)->getName())
+        return true;
+      if (std::get<0>(Pair)->getName() > std::get<1>(Pair)->getName())
         return false;
-      });
+    }
+    return false;
+  });
   FeatureBitsets.erase(
       std::unique(FeatureBitsets.begin(), FeatureBitsets.end()),
       FeatureBitsets.end());
@@ -4588,13 +4593,11 @@ void RuleMatcher::optimize() {
     }
     InsnMatcher.optimize();
   }
-  llvm::sort(
-      EpilogueMatchers.begin(), EpilogueMatchers.end(),
-      [](const std::unique_ptr<PredicateMatcher> &L,
-         const std::unique_ptr<PredicateMatcher> &R) {
-        return std::make_tuple(L->getKind(), L->getInsnVarID(), L->getOpIdx()) <
-               std::make_tuple(R->getKind(), R->getInsnVarID(), R->getOpIdx());
-      });
+  llvm::sort(EpilogueMatchers, [](const std::unique_ptr<PredicateMatcher> &L,
+                                  const std::unique_ptr<PredicateMatcher> &R) {
+    return std::make_tuple(L->getKind(), L->getInsnVarID(), L->getOpIdx()) <
+           std::make_tuple(R->getKind(), R->getInsnVarID(), R->getOpIdx());
+  });
 }
 
 bool RuleMatcher::hasFirstCondition() const {

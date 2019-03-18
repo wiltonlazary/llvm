@@ -1,9 +1,8 @@
-//===-- llvm/CodeGen/GlobalISel/LegalizationArtifactCombiner.h --===========//
+//===-- llvm/CodeGen/GlobalISel/LegalizationArtifactCombiner.h -----*- C++ -*-//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 // This file contains some helper functions which try to cleanup artifacts
@@ -14,12 +13,14 @@
 
 #include "llvm/CodeGen/GlobalISel/Legalizer.h"
 #include "llvm/CodeGen/GlobalISel/LegalizerInfo.h"
+#include "llvm/CodeGen/GlobalISel/MIPatternMatch.h"
 #include "llvm/CodeGen/GlobalISel/MachineIRBuilder.h"
 #include "llvm/CodeGen/GlobalISel/Utils.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "legalizer"
+using namespace llvm::MIPatternMatch;
 
 namespace llvm {
 class LegalizationArtifactCombiner {
@@ -36,15 +37,29 @@ public:
                         SmallVectorImpl<MachineInstr *> &DeadInsts) {
     if (MI.getOpcode() != TargetOpcode::G_ANYEXT)
       return false;
-    if (MachineInstr *DefMI = getOpcodeDef(TargetOpcode::G_TRUNC,
-                                           MI.getOperand(1).getReg(), MRI)) {
+
+    Builder.setInstr(MI);
+    unsigned DstReg = MI.getOperand(0).getReg();
+    unsigned SrcReg = lookThroughCopyInstrs(MI.getOperand(1).getReg());
+
+    // aext(trunc x) - > aext/copy/trunc x
+    unsigned TruncSrc;
+    if (mi_match(SrcReg, MRI, m_GTrunc(m_Reg(TruncSrc)))) {
       LLVM_DEBUG(dbgs() << ".. Combine MI: " << MI;);
-      unsigned DstReg = MI.getOperand(0).getReg();
-      unsigned SrcReg = DefMI->getOperand(1).getReg();
-      Builder.setInstr(MI);
-      // We get a copy/trunc/extend depending on the sizes
-      Builder.buildAnyExtOrTrunc(DstReg, SrcReg);
-      markInstAndDefDead(MI, *DefMI, DeadInsts);
+      Builder.buildAnyExtOrTrunc(DstReg, TruncSrc);
+      markInstAndDefDead(MI, *MRI.getVRegDef(SrcReg), DeadInsts);
+      return true;
+    }
+
+    // aext([asz]ext x) -> [asz]ext x
+    unsigned ExtSrc;
+    MachineInstr *ExtMI;
+    if (mi_match(SrcReg, MRI,
+                 m_all_of(m_MInstr(ExtMI), m_any_of(m_GAnyExt(m_Reg(ExtSrc)),
+                                                    m_GSExt(m_Reg(ExtSrc)),
+                                                    m_GZExt(m_Reg(ExtSrc)))))) {
+      Builder.buildInstr(ExtMI->getOpcode(), {DstReg}, {ExtSrc});
+      markInstAndDefDead(MI, *ExtMI, DeadInsts);
       return true;
     }
     return tryFoldImplicitDef(MI, DeadInsts);
@@ -55,24 +70,25 @@ public:
 
     if (MI.getOpcode() != TargetOpcode::G_ZEXT)
       return false;
-    if (MachineInstr *DefMI = getOpcodeDef(TargetOpcode::G_TRUNC,
-                                           MI.getOperand(1).getReg(), MRI)) {
-      unsigned DstReg = MI.getOperand(0).getReg();
+
+    Builder.setInstr(MI);
+    unsigned DstReg = MI.getOperand(0).getReg();
+    unsigned SrcReg = lookThroughCopyInstrs(MI.getOperand(1).getReg());
+
+    // zext(trunc x) - > and (aext/copy/trunc x), mask
+    unsigned TruncSrc;
+    if (mi_match(SrcReg, MRI, m_GTrunc(m_Reg(TruncSrc)))) {
       LLT DstTy = MRI.getType(DstReg);
       if (isInstUnsupported({TargetOpcode::G_AND, {DstTy}}) ||
-          isInstUnsupported({TargetOpcode::G_CONSTANT, {DstTy}}))
+          isConstantUnsupported(DstTy))
         return false;
       LLVM_DEBUG(dbgs() << ".. Combine MI: " << MI;);
-      Builder.setInstr(MI);
-      unsigned ZExtSrc = MI.getOperand(1).getReg();
-      LLT ZExtSrcTy = MRI.getType(ZExtSrc);
-      APInt Mask = APInt::getAllOnesValue(ZExtSrcTy.getSizeInBits());
-      auto MaskCstMIB = Builder.buildConstant(DstTy, Mask.getZExtValue());
-      unsigned TruncSrc = DefMI->getOperand(1).getReg();
-      // We get a copy/trunc/extend depending on the sizes
-      auto SrcCopyOrTrunc = Builder.buildAnyExtOrTrunc(DstTy, TruncSrc);
-      Builder.buildAnd(DstReg, SrcCopyOrTrunc, MaskCstMIB);
-      markInstAndDefDead(MI, *DefMI, DeadInsts);
+      LLT SrcTy = MRI.getType(SrcReg);
+      APInt Mask = APInt::getAllOnesValue(SrcTy.getScalarSizeInBits());
+      auto MIBMask = Builder.buildConstant(DstTy, Mask.getZExtValue());
+      Builder.buildAnd(DstReg, Builder.buildAnyExtOrTrunc(DstTy, TruncSrc),
+                       MIBMask);
+      markInstAndDefDead(MI, *MRI.getVRegDef(SrcReg), DeadInsts);
       return true;
     }
     return tryFoldImplicitDef(MI, DeadInsts);
@@ -83,33 +99,36 @@ public:
 
     if (MI.getOpcode() != TargetOpcode::G_SEXT)
       return false;
-    if (MachineInstr *DefMI = getOpcodeDef(TargetOpcode::G_TRUNC,
-                                           MI.getOperand(1).getReg(), MRI)) {
-      unsigned DstReg = MI.getOperand(0).getReg();
+
+    Builder.setInstr(MI);
+    unsigned DstReg = MI.getOperand(0).getReg();
+    unsigned SrcReg = lookThroughCopyInstrs(MI.getOperand(1).getReg());
+
+    // sext(trunc x) - > ashr (shl (aext/copy/trunc x), c), c
+    unsigned TruncSrc;
+    if (mi_match(SrcReg, MRI, m_GTrunc(m_Reg(TruncSrc)))) {
       LLT DstTy = MRI.getType(DstReg);
-      if (isInstUnsupported({TargetOpcode::G_SHL, {DstTy}}) ||
-          isInstUnsupported({TargetOpcode::G_ASHR, {DstTy}}) ||
-          isInstUnsupported({TargetOpcode::G_CONSTANT, {DstTy}}))
+      // Guess on the RHS shift amount type, which should be re-legalized if
+      // applicable.
+      if (isInstUnsupported({TargetOpcode::G_SHL, {DstTy, DstTy}}) ||
+          isInstUnsupported({TargetOpcode::G_ASHR, {DstTy, DstTy}}) ||
+          isConstantUnsupported(DstTy))
         return false;
       LLVM_DEBUG(dbgs() << ".. Combine MI: " << MI;);
-      Builder.setInstr(MI);
-      unsigned SExtSrc = MI.getOperand(1).getReg();
-      LLT SExtSrcTy = MRI.getType(SExtSrc);
-      unsigned SizeDiff = DstTy.getSizeInBits() - SExtSrcTy.getSizeInBits();
-      auto SizeDiffMIB = Builder.buildConstant(DstTy, SizeDiff);
-      unsigned TruncSrcReg = DefMI->getOperand(1).getReg();
-      // We get a copy/trunc/extend depending on the sizes
-      auto SrcCopyExtOrTrunc = Builder.buildAnyExtOrTrunc(DstTy, TruncSrcReg);
-      auto ShlMIB = Builder.buildInstr(TargetOpcode::G_SHL, DstTy,
-                                       SrcCopyExtOrTrunc, SizeDiffMIB);
-      Builder.buildInstr(TargetOpcode::G_ASHR, DstReg, ShlMIB, SizeDiffMIB);
-      markInstAndDefDead(MI, *DefMI, DeadInsts);
+      LLT SrcTy = MRI.getType(SrcReg);
+      unsigned ShAmt = DstTy.getScalarSizeInBits() - SrcTy.getScalarSizeInBits();
+      auto MIBShAmt = Builder.buildConstant(DstTy, ShAmt);
+      auto MIBShl = Builder.buildInstr(
+          TargetOpcode::G_SHL, {DstTy},
+          {Builder.buildAnyExtOrTrunc(DstTy, TruncSrc), MIBShAmt});
+      Builder.buildInstr(TargetOpcode::G_ASHR, {DstReg}, {MIBShl, MIBShAmt});
+      markInstAndDefDead(MI, *MRI.getVRegDef(SrcReg), DeadInsts);
       return true;
     }
     return tryFoldImplicitDef(MI, DeadInsts);
   }
 
-  /// Try to fold sb = EXTEND (G_IMPLICIT_DEF sa) -> sb = G_IMPLICIT_DEF
+  /// Try to fold G_[ASZ]EXT (G_IMPLICIT_DEF).
   bool tryFoldImplicitDef(MachineInstr &MI,
                           SmallVectorImpl<MachineInstr *> &DeadInsts) {
     unsigned Opcode = MI.getOpcode();
@@ -119,17 +138,39 @@ public:
 
     if (MachineInstr *DefMI = getOpcodeDef(TargetOpcode::G_IMPLICIT_DEF,
                                            MI.getOperand(1).getReg(), MRI)) {
+      Builder.setInstr(MI);
       unsigned DstReg = MI.getOperand(0).getReg();
       LLT DstTy = MRI.getType(DstReg);
-      if (isInstUnsupported({TargetOpcode::G_IMPLICIT_DEF, {DstTy}}))
-        return false;
-      LLVM_DEBUG(dbgs() << ".. Combine EXT(IMPLICIT_DEF) " << MI;);
-      Builder.setInstr(MI);
-      Builder.buildInstr(TargetOpcode::G_IMPLICIT_DEF, DstReg);
+
+      if (Opcode == TargetOpcode::G_ANYEXT) {
+        // G_ANYEXT (G_IMPLICIT_DEF) -> G_IMPLICIT_DEF
+        if (isInstUnsupported({TargetOpcode::G_IMPLICIT_DEF, {DstTy}}))
+          return false;
+        LLVM_DEBUG(dbgs() << ".. Combine G_ANYEXT(G_IMPLICIT_DEF): " << MI;);
+        Builder.buildInstr(TargetOpcode::G_IMPLICIT_DEF, {DstReg}, {});
+      } else {
+        // G_[SZ]EXT (G_IMPLICIT_DEF) -> G_CONSTANT 0 because the top
+        // bits will be 0 for G_ZEXT and 0/1 for the G_SEXT.
+        if (isConstantUnsupported(DstTy))
+          return false;
+        LLVM_DEBUG(dbgs() << ".. Combine G_[SZ]EXT(G_IMPLICIT_DEF): " << MI;);
+        Builder.buildConstant(DstReg, 0);
+      }
+
       markInstAndDefDead(MI, *DefMI, DeadInsts);
       return true;
     }
     return false;
+  }
+
+  static unsigned getMergeOpcode(LLT OpTy, LLT DestTy) {
+    if (OpTy.isVector() && DestTy.isVector())
+      return TargetOpcode::G_CONCAT_VECTORS;
+
+    if (OpTy.isVector() && !DestTy.isVector())
+      return TargetOpcode::G_BUILD_VECTOR;
+
+    return TargetOpcode::G_MERGE_VALUES;
   }
 
   bool tryCombineMerges(MachineInstr &MI,
@@ -139,8 +180,14 @@ public:
       return false;
 
     unsigned NumDefs = MI.getNumOperands() - 1;
-    MachineInstr *MergeI = getOpcodeDef(TargetOpcode::G_MERGE_VALUES,
-                                        MI.getOperand(NumDefs).getReg(), MRI);
+
+    LLT OpTy = MRI.getType(MI.getOperand(NumDefs).getReg());
+    LLT DestTy = MRI.getType(MI.getOperand(0).getReg());
+
+    unsigned MergingOpcode = getMergeOpcode(OpTy, DestTy);
+    MachineInstr *MergeI =
+        getOpcodeDef(MergingOpcode, MI.getOperand(NumDefs).getReg(), MRI);
+
     if (!MergeI)
       return false;
 
@@ -206,6 +253,65 @@ public:
     return true;
   }
 
+  static bool isMergeLikeOpcode(unsigned Opc) {
+    switch (Opc) {
+    case TargetOpcode::G_MERGE_VALUES:
+    case TargetOpcode::G_BUILD_VECTOR:
+    case TargetOpcode::G_CONCAT_VECTORS:
+      return true;
+    default:
+      return false;
+    }
+  }
+
+  bool tryCombineExtract(MachineInstr &MI,
+                         SmallVectorImpl<MachineInstr *> &DeadInsts) {
+    assert(MI.getOpcode() == TargetOpcode::G_EXTRACT);
+
+    // Try to use the source registers from a G_MERGE_VALUES
+    //
+    // %2 = G_MERGE_VALUES %0, %1
+    // %3 = G_EXTRACT %2, N
+    // =>
+    //
+    // for N < %2.getSizeInBits() / 2
+    //     %3 = G_EXTRACT %0, N
+    //
+    // for N >= %2.getSizeInBits() / 2
+    //    %3 = G_EXTRACT %1, (N - %0.getSizeInBits()
+
+    unsigned Src = lookThroughCopyInstrs(MI.getOperand(1).getReg());
+    MachineInstr *MergeI = MRI.getVRegDef(Src);
+    if (!MergeI || !isMergeLikeOpcode(MergeI->getOpcode()))
+      return false;
+
+    LLT DstTy = MRI.getType(MI.getOperand(0).getReg());
+    LLT SrcTy = MRI.getType(Src);
+
+    // TODO: Do we need to check if the resulting extract is supported?
+    unsigned ExtractDstSize = DstTy.getSizeInBits();
+    unsigned Offset = MI.getOperand(2).getImm();
+    unsigned NumMergeSrcs = MergeI->getNumOperands() - 1;
+    unsigned MergeSrcSize = SrcTy.getSizeInBits() / NumMergeSrcs;
+    unsigned MergeSrcIdx = Offset / MergeSrcSize;
+
+    // Compute the offset of the last bit the extract needs.
+    unsigned EndMergeSrcIdx = (Offset + ExtractDstSize - 1) / MergeSrcSize;
+
+    // Can't handle the case where the extract spans multiple inputs.
+    if (MergeSrcIdx != EndMergeSrcIdx)
+      return false;
+
+    // TODO: We could modify MI in place in most cases.
+    Builder.setInstr(MI);
+    Builder.buildExtract(
+      MI.getOperand(0).getReg(),
+      MergeI->getOperand(MergeSrcIdx + 1).getReg(),
+      Offset - MergeSrcIdx * MergeSrcSize);
+    markInstAndDefDead(MI, *MergeI, DeadInsts);
+    return true;
+  }
+
   /// Try to combine away MI.
   /// Returns true if it combined away the MI.
   /// Adds instructions that are dead as a result of the combine
@@ -223,6 +329,8 @@ public:
       return tryCombineSExt(MI, DeadInsts);
     case TargetOpcode::G_UNMERGE_VALUES:
       return tryCombineMerges(MI, DeadInsts);
+    case TargetOpcode::G_EXTRACT:
+      return tryCombineExtract(MI, DeadInsts);
     case TargetOpcode::G_TRUNC: {
       bool Changed = false;
       for (auto &Use : MRI.use_instructions(MI.getOperand(0).getReg()))
@@ -233,6 +341,23 @@ public:
   }
 
 private:
+
+  static unsigned getArtifactSrcReg(const MachineInstr &MI) {
+    switch (MI.getOpcode()) {
+    case TargetOpcode::COPY:
+    case TargetOpcode::G_TRUNC:
+    case TargetOpcode::G_ZEXT:
+    case TargetOpcode::G_ANYEXT:
+    case TargetOpcode::G_SEXT:
+    case TargetOpcode::G_UNMERGE_VALUES:
+      return MI.getOperand(MI.getNumOperands() - 1).getReg();
+    case TargetOpcode::G_EXTRACT:
+      return MI.getOperand(1).getReg();
+    default:
+      llvm_unreachable("Not a legalization artifact happen");
+    }
+  }
+
   /// Mark MI as dead. If a def of one of MI's operands, DefMI, would also be
   /// dead due to MI being killed, then mark DefMI as dead too.
   /// Some of the combines (extends(trunc)), try to walk through redundant
@@ -253,8 +378,8 @@ private:
     // and as a result, %3, %2, %1 are dead.
     MachineInstr *PrevMI = &MI;
     while (PrevMI != &DefMI) {
-      unsigned PrevRegSrc =
-          PrevMI->getOperand(PrevMI->getNumOperands() - 1).getReg();
+      unsigned PrevRegSrc = getArtifactSrcReg(*PrevMI);
+
       MachineInstr *TmpDef = MRI.getVRegDef(PrevRegSrc);
       if (MRI.hasOneUse(PrevRegSrc)) {
         if (TmpDef != &DefMI) {
@@ -276,6 +401,28 @@ private:
     using namespace LegalizeActions;
     auto Step = LI.getAction(Query);
     return Step.Action == Unsupported || Step.Action == NotFound;
+  }
+
+  bool isConstantUnsupported(LLT Ty) const {
+    if (!Ty.isVector())
+      return isInstUnsupported({TargetOpcode::G_CONSTANT, {Ty}});
+
+    LLT EltTy = Ty.getElementType();
+    return isInstUnsupported({TargetOpcode::G_CONSTANT, {EltTy}}) ||
+           isInstUnsupported({TargetOpcode::G_BUILD_VECTOR, {Ty, EltTy}});
+  }
+
+  /// Looks through copy instructions and returns the actual
+  /// source register.
+  unsigned lookThroughCopyInstrs(unsigned Reg) {
+    unsigned TmpReg;
+    while (mi_match(Reg, MRI, m_Copy(m_Reg(TmpReg)))) {
+      if (MRI.getType(TmpReg).isValid())
+        Reg = TmpReg;
+      else
+        break;
+    }
+    return Reg;
   }
 };
 

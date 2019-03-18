@@ -18,9 +18,9 @@ target datalayout = "e-m:o-i64:64-f80:128-n8:16:32:64-S128"
 define void @test(<4 x i16>* %a, <4 x i16>* %b) {
 ; AVX-LABEL: test:
 ; AVX:       ## %bb.0: ## %body
-; AVX-NEXT:    movq {{.*}}(%rip), %rax
+; AVX-NEXT:    movabsq $4167800517033787389, %rax ## imm = 0x39D7007D007CFFFD
 ; AVX-NEXT:    movq %rax, (%rdi)
-; AVX-NEXT:    movq {{.*}}(%rip), %rax
+; AVX-NEXT:    movabsq $-281474976645121, %rax ## imm = 0xFFFF00000000FFFF
 ; AVX-NEXT:    movq %rax, (%rsi)
 ; AVX-NEXT:    retq
 body:
@@ -41,13 +41,12 @@ define void @test2(double** %call1559, i64 %indvars.iv4198, <4 x i1> %tmp1895) {
 ; AVX1-LABEL: test2:
 ; AVX1:       ## %bb.0: ## %bb
 ; AVX1-NEXT:    vpslld $31, %xmm0, %xmm0
-; AVX1-NEXT:    vpsrad $31, %xmm0, %xmm0
 ; AVX1-NEXT:    vpmovsxdq %xmm0, %xmm1
 ; AVX1-NEXT:    vpshufd {{.*#+}} xmm0 = xmm0[2,3,0,1]
 ; AVX1-NEXT:    vpmovsxdq %xmm0, %xmm0
 ; AVX1-NEXT:    vinsertf128 $1, %xmm0, %ymm1, %ymm0
 ; AVX1-NEXT:    movq (%rdi,%rsi,8), %rax
-; AVX1-NEXT:    vmovapd {{.*#+}} ymm1 = [5.000000e-01,5.000000e-01,5.000000e-01,5.000000e-01]
+; AVX1-NEXT:    vmovapd {{.*#+}} ymm1 = [5.0E-1,5.0E-1,5.0E-1,5.0E-1]
 ; AVX1-NEXT:    vblendvpd %ymm0, {{.*}}(%rip), %ymm1, %ymm0
 ; AVX1-NEXT:    vmovupd %ymm0, (%rax)
 ; AVX1-NEXT:    vzeroupper
@@ -58,8 +57,8 @@ define void @test2(double** %call1559, i64 %indvars.iv4198, <4 x i1> %tmp1895) {
 ; AVX2-NEXT:    vpslld $31, %xmm0, %xmm0
 ; AVX2-NEXT:    vpmovsxdq %xmm0, %ymm0
 ; AVX2-NEXT:    movq (%rdi,%rsi,8), %rax
-; AVX2-NEXT:    vbroadcastsd {{.*#+}} ymm1 = [-0.5,-0.5,-0.5,-0.5]
-; AVX2-NEXT:    vbroadcastsd {{.*#+}} ymm2 = [0.5,0.5,0.5,0.5]
+; AVX2-NEXT:    vbroadcastsd {{.*#+}} ymm1 = [-5.0E-1,-5.0E-1,-5.0E-1,-5.0E-1]
+; AVX2-NEXT:    vbroadcastsd {{.*#+}} ymm2 = [5.0E-1,5.0E-1,5.0E-1,5.0E-1]
 ; AVX2-NEXT:    vblendvpd %ymm0, %ymm1, %ymm2, %ymm0
 ; AVX2-NEXT:    vmovupd %ymm0, (%rax)
 ; AVX2-NEXT:    vzeroupper
@@ -106,13 +105,12 @@ define void @test3(<4 x i32> %induction30, <4 x i16>* %tmp16, <4 x i16>* %tmp17,
 ;
 ; AVX2-LABEL: test3:
 ; AVX2:       ## %bb.0:
-; AVX2-NEXT:    vpbroadcastd {{.*#+}} xmm3 = [1431655766,1431655766,1431655766,1431655766]
-; AVX2-NEXT:    vpshufd {{.*#+}} xmm4 = xmm3[1,1,3,3]
-; AVX2-NEXT:    vpshufd {{.*#+}} xmm5 = xmm0[1,1,3,3]
-; AVX2-NEXT:    vpmuldq %xmm4, %xmm5, %xmm4
-; AVX2-NEXT:    vpmuldq %xmm3, %xmm0, %xmm3
-; AVX2-NEXT:    vpshufd {{.*#+}} xmm3 = xmm3[1,1,3,3]
-; AVX2-NEXT:    vpblendd {{.*#+}} xmm3 = xmm3[0],xmm4[1],xmm3[2],xmm4[3]
+; AVX2-NEXT:    vpshufd {{.*#+}} xmm3 = xmm0[1,1,3,3]
+; AVX2-NEXT:    vpbroadcastd {{.*#+}} xmm4 = [1431655766,1431655766,1431655766,1431655766]
+; AVX2-NEXT:    vpmuldq %xmm4, %xmm3, %xmm3
+; AVX2-NEXT:    vpmuldq %xmm4, %xmm0, %xmm4
+; AVX2-NEXT:    vpshufd {{.*#+}} xmm4 = xmm4[1,1,3,3]
+; AVX2-NEXT:    vpblendd {{.*#+}} xmm3 = xmm4[0],xmm3[1],xmm4[2],xmm3[3]
 ; AVX2-NEXT:    vpsrld $31, %xmm3, %xmm4
 ; AVX2-NEXT:    vpaddd %xmm4, %xmm3, %xmm3
 ; AVX2-NEXT:    vpbroadcastd {{.*#+}} xmm4 = [3,3,3,3]

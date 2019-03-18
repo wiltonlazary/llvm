@@ -1,9 +1,8 @@
 //===-- X86BaseInfo.h - Top level definitions for X86 -------- --*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -49,7 +48,8 @@ namespace X86 {
     TO_NEG_INF = 1,
     TO_POS_INF = 2,
     TO_ZERO = 3,
-    CUR_DIRECTION = 4
+    CUR_DIRECTION = 4,
+    NO_EXC = 8
   };
 
   /// The constants to describe instr prefixes if there are
@@ -60,9 +60,7 @@ namespace X86 {
     IP_HAS_REPEAT_NE = 4,
     IP_HAS_REPEAT = 8,
     IP_HAS_LOCK = 16,
-    NO_SCHED_INFO = 32, // Don't add sched comment to the current instr because
-                        // it was already added
-    IP_HAS_NOTRACK = 64
+    IP_HAS_NOTRACK = 32
   };
 } // end namespace X86;
 
@@ -231,6 +229,11 @@ namespace X86II {
     /// to be an absolute symbol in range [0,128), so we can use the @ABS8
     /// symbol modifier.
     MO_ABS8,
+
+    /// MO_COFFSTUB - On a symbol operand "FOO", this indicates that the
+    /// reference is actually to the ".refptr.FOO" symbol.  This is used for
+    /// stub symbols on windows.
+    MO_COFFSTUB,
   };
 
   enum : uint64_t {
@@ -261,12 +264,12 @@ namespace X86II {
     RawFrmSrc      = 4,
 
     /// RawFrmDst - This form is for instructions that use the destination index
-    /// register DI/EDI/ESI.
+    /// register DI/EDI/RDI.
     RawFrmDst      = 5,
 
-    /// RawFrmSrc - This form is for instructions that use the source index
-    /// register SI/ESI/ERI with a possible segment override, and also the
-    /// destination index register DI/ESI/RDI.
+    /// RawFrmDstSrc - This form is for instructions that use the source index
+    /// register SI/ESI/RSI with a possible segment override, and also the
+    /// destination index register DI/EDI/RDI.
     RawFrmDstSrc   = 6,
 
     /// RawFrmImm8 - This is used for the ENTER instruction, which has two

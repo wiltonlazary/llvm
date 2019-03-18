@@ -1,4 +1,4 @@
-; RUN: llc -mtriple=thumbv6m-eabi -disable-fp-elim=false %s -o - | FileCheck %s
+; RUN: llc -mtriple=thumbv6m-eabi -frame-pointer=none %s -o - | FileCheck %s
 
 ; struct S { int x[128]; } s;
 ; int f(int *, int, int, int, struct S);
@@ -126,10 +126,9 @@ entry:
 ; CHECK-NEXT:  lsls r4, r4, #4
 ; CHECK-NEXT:  mov  sp, r4
 ; Incoming register varargs stored via FP
-; CHECK:       str r3, [r7, #16]
-; CHECK-NEXT:  str r2, [r7, #12]
-; CHECK-NEXT:  str r1, [r7, #8]
-
+; CHECK: mov	r0, r7
+; CHECK-NEXT: adds r0, #8
+; CHECK-NEXT: stm r0!, {r1, r2, r3}
 ; VLAs present, access via FP
 ; int test_args_vla(int a, int b, int c, int d, int e) {
 ;   int v[a];
@@ -174,9 +173,9 @@ entry:
 ; Setup frame pointer
 ; CHECK:       add r7, sp, #8
 ; Register varargs stored via FP
-; CHECK:       str r3, [r7, #16]
-; CHECK-NEXT:  str r2, [r7, #12]
-; CHECK-NEXT:  str r1, [r7, #8]
+; CHECK-DAG:  str r3, [r7, #16]
+; CHECK-DAG:  str r2, [r7, #12]
+; CHECK-DAG:  str r1, [r7, #8]
 
 ; Moving SP, access via SP
 ; int test_args_moving_sp(int a, int b, int c, int d, int e) {

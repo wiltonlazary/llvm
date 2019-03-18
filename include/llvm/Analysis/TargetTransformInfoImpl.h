@@ -1,9 +1,8 @@
 //===- TargetTransformInfoImpl.h --------------------------------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 /// \file
@@ -124,7 +123,7 @@ public:
     return TTI::TCC_Basic;
   }
 
-  unsigned getCallCost(FunctionType *FTy, int NumArgs) {
+  unsigned getCallCost(FunctionType *FTy, int NumArgs, const User *U) {
     assert(FTy && "FunctionType must be provided to this routine.");
 
     // The target-independent implementation just measures the size of the
@@ -142,7 +141,7 @@ public:
   unsigned getInliningThresholdMultiplier() { return 1; }
 
   unsigned getIntrinsicCost(Intrinsic::ID IID, Type *RetTy,
-                            ArrayRef<Type *> ParamTys) {
+                            ArrayRef<Type *> ParamTys, const User *U) {
     switch (IID) {
     default:
       // Intrinsics rarely (if ever) have normal argument setup constraints.
@@ -158,6 +157,9 @@ public:
     case Intrinsic::dbg_label:
     case Intrinsic::invariant_start:
     case Intrinsic::invariant_end:
+    case Intrinsic::launder_invariant_group:
+    case Intrinsic::strip_invariant_group:
+    case Intrinsic::is_constant:
     case Intrinsic::lifetime_start:
     case Intrinsic::lifetime_end:
     case Intrinsic::objectsize:
@@ -251,6 +253,8 @@ public:
 
   bool shouldFavorPostInc() const { return false; }
 
+  bool shouldFavorBackedgeIndex(const Loop *L) const { return false; }
+
   bool isLegalMaskedStore(Type *DataType) { return false; }
 
   bool isLegalMaskedLoad(Type *DataType) { return false; }
@@ -311,6 +315,8 @@ public:
 
   bool enableInterleavedAccessVectorization() { return false; }
 
+  bool enableMaskedInterleavedAccessVectorization() { return false; }
+
   bool isFPVectorizationPotentiallyUnsafe() { return false; }
 
   bool allowsMisalignedMemoryAccesses(LLVMContext &Context,
@@ -326,7 +332,7 @@ public:
   bool haveFastSqrt(Type *Ty) { return false; }
 
   bool isFCmpOrdCheaperThanFCmpZero(Type *Ty) { return true; }
-  
+
   unsigned getFPOpCost(Type *Ty) { return TargetTransformInfo::TCC_Basic; }
 
   int getIntImmCodeSizeCost(unsigned Opcode, unsigned Idx, const APInt &Imm,
@@ -448,8 +454,9 @@ public:
   unsigned getInterleavedMemoryOpCost(unsigned Opcode, Type *VecTy,
                                       unsigned Factor,
                                       ArrayRef<unsigned> Indices,
-                                      unsigned Alignment,
-                                      unsigned AddressSpace) {
+                                      unsigned Alignment, unsigned AddressSpace,
+                                      bool UseMaskForCond = false,
+                                      bool UseMaskForGaps = false) {
     return 1;
   }
 
@@ -514,6 +521,14 @@ public:
 
   bool areInlineCompatible(const Function *Caller,
                            const Function *Callee) const {
+    return (Caller->getFnAttribute("target-cpu") ==
+            Callee->getFnAttribute("target-cpu")) &&
+           (Caller->getFnAttribute("target-features") ==
+            Callee->getFnAttribute("target-features"));
+  }
+
+  bool areFunctionArgsABICompatible(const Function *Caller, const Function *Callee,
+                                    SmallPtrSetImpl<Argument *> &Args) const {
     return (Caller->getFnAttribute("target-cpu") ==
             Callee->getFnAttribute("target-cpu")) &&
            (Caller->getFnAttribute("target-features") ==
@@ -665,7 +680,7 @@ protected:
 public:
   using BaseT::getCallCost;
 
-  unsigned getCallCost(const Function *F, int NumArgs) {
+  unsigned getCallCost(const Function *F, int NumArgs, const User *U) {
     assert(F && "A concrete function must be provided to this routine.");
 
     if (NumArgs < 0)
@@ -677,21 +692,22 @@ public:
       FunctionType *FTy = F->getFunctionType();
       SmallVector<Type *, 8> ParamTys(FTy->param_begin(), FTy->param_end());
       return static_cast<T *>(this)
-          ->getIntrinsicCost(IID, FTy->getReturnType(), ParamTys);
+          ->getIntrinsicCost(IID, FTy->getReturnType(), ParamTys, U);
     }
 
     if (!static_cast<T *>(this)->isLoweredToCall(F))
       return TTI::TCC_Basic; // Give a basic cost if it will be lowered
                              // directly.
 
-    return static_cast<T *>(this)->getCallCost(F->getFunctionType(), NumArgs);
+    return static_cast<T *>(this)->getCallCost(F->getFunctionType(), NumArgs, U);
   }
 
-  unsigned getCallCost(const Function *F, ArrayRef<const Value *> Arguments) {
+  unsigned getCallCost(const Function *F, ArrayRef<const Value *> Arguments,
+                       const User *U) {
     // Simply delegate to generic handling of the call.
     // FIXME: We should use instsimplify or something else to catch calls which
     // will constant fold with these arguments.
-    return static_cast<T *>(this)->getCallCost(F, Arguments.size());
+    return static_cast<T *>(this)->getCallCost(F, Arguments.size(), U);
   }
 
   using BaseT::getGEPCost;
@@ -762,7 +778,7 @@ public:
   using BaseT::getIntrinsicCost;
 
   unsigned getIntrinsicCost(Intrinsic::ID IID, Type *RetTy,
-                            ArrayRef<const Value *> Arguments) {
+                            ArrayRef<const Value *> Arguments, const User *U) {
     // Delegate to the generic intrinsic handling code. This mostly provides an
     // opportunity for targets to (for example) special case the cost of
     // certain intrinsics based on constants used as arguments.
@@ -770,7 +786,7 @@ public:
     ParamTys.reserve(Arguments.size());
     for (unsigned Idx = 0, Size = Arguments.size(); Idx != Size; ++Idx)
       ParamTys.push_back(Arguments[Idx]->getType());
-    return static_cast<T *>(this)->getIntrinsicCost(IID, RetTy, ParamTys);
+    return static_cast<T *>(this)->getIntrinsicCost(IID, RetTy, ParamTys, U);
   }
 
   unsigned getUserCost(const User *U, ArrayRef<const Value *> Operands) {
@@ -794,11 +810,11 @@ public:
         // Just use the called value type.
         Type *FTy = CS.getCalledValue()->getType()->getPointerElementType();
         return static_cast<T *>(this)
-            ->getCallCost(cast<FunctionType>(FTy), CS.arg_size());
+            ->getCallCost(cast<FunctionType>(FTy), CS.arg_size(), U);
       }
 
       SmallVector<const Value *, 8> Arguments(CS.arg_begin(), CS.arg_end());
-      return static_cast<T *>(this)->getCallCost(F, Arguments);
+      return static_cast<T *>(this)->getCallCost(F, Arguments, U);
     }
 
     if (const CastInst *CI = dyn_cast<CastInst>(U)) {

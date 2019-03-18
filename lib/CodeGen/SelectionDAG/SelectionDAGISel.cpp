@@ -1,9 +1,8 @@
 //===- SelectionDAGISel.cpp - Implement the SelectionDAGISel class --------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -27,6 +26,7 @@
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/BranchProbabilityInfo.h"
 #include "llvm/Analysis/CFG.h"
+#include "llvm/Analysis/EHPersonalities.h"
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
@@ -41,6 +41,7 @@
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineMemOperand.h"
+#include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/CodeGen/MachineOperand.h"
 #include "llvm/CodeGen/MachinePassRegistry.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
@@ -62,6 +63,7 @@
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
@@ -176,7 +178,8 @@ static const bool ViewDAGCombine1 = false,
 /// RegisterScheduler class - Track the registration of instruction schedulers.
 ///
 //===---------------------------------------------------------------------===//
-MachinePassRegistry RegisterScheduler::Registry;
+MachinePassRegistry<RegisterScheduler::FunctionPassCtor>
+    RegisterScheduler::Registry;
 
 //===---------------------------------------------------------------------===//
 ///
@@ -377,6 +380,30 @@ static void SplitCriticalSideEffectEdges(Function &Fn, DominatorTree *DT,
   }
 }
 
+static void computeUsesMSVCFloatingPoint(const Triple &TT, const Function &F,
+                                         MachineModuleInfo &MMI) {
+  // Only needed for MSVC
+  if (!TT.isKnownWindowsMSVCEnvironment())
+    return;
+
+  // If it's already set, nothing to do.
+  if (MMI.usesMSVCFloatingPoint())
+    return;
+
+  for (const Instruction &I : instructions(F)) {
+    if (I.getType()->isFPOrFPVectorTy()) {
+      MMI.setUsesMSVCFloatingPoint(true);
+      return;
+    }
+    for (const auto &Op : I.operands()) {
+      if (Op->getType()->isFPOrFPVectorTy()) {
+        MMI.setUsesMSVCFloatingPoint(true);
+        return;
+      }
+    }
+  }
+}
+
 bool SelectionDAGISel::runOnMachineFunction(MachineFunction &mf) {
   // If we already selected that function, we do not need to run SDISel.
   if (mf.getProperties().hasProperty(
@@ -417,7 +444,7 @@ bool SelectionDAGISel::runOnMachineFunction(MachineFunction &mf) {
   SplitCriticalSideEffectEdges(const_cast<Function &>(Fn), DT, LI);
 
   CurDAG->init(*MF, *ORE, this, LibInfo,
-   getAnalysisIfAvailable<DivergenceAnalysis>());
+   getAnalysisIfAvailable<LegacyDivergenceAnalysis>());
   FuncInfo->set(Fn, *MF, CurDAG);
 
   // Now get the optional analyzes if we want to.
@@ -451,7 +478,7 @@ bool SelectionDAGISel::runOnMachineFunction(MachineFunction &mf) {
       if (!succ_empty(&BB))
         continue;
 
-      const TerminatorInst *Term = BB.getTerminator();
+      const Instruction *Term = BB.getTerminator();
       if (isa<UnreachableInst>(Term) || isa<ReturnInst>(Term))
         continue;
 
@@ -588,6 +615,9 @@ bool SelectionDAGISel::runOnMachineFunction(MachineFunction &mf) {
   // Determine if there is a call to setjmp in the machine function.
   MF->setExposesReturnsTwice(Fn.callsFunctionThatReturnsTwice());
 
+  // Determine if floating point is used for msvc
+  computeUsesMSVCFloatingPoint(TM.getTargetTriple(), Fn, MF->getMMI());
+
   // Replace forward-declared registers with the registers containing
   // the desired value.
   MachineRegisterInfo &MRI = MF->getRegInfo();
@@ -661,6 +691,7 @@ void SelectionDAGISel::SelectBasicBlock(BasicBlock::const_iterator Begin,
   // Make sure the root of the DAG is up-to-date.
   CurDAG->setRoot(SDB->getControlRoot());
   HadTailCall = SDB->HasTailCall;
+  SDB->resolveOrClearDbgInfo();
   SDB->clear();
 
   // Final step, emit the lowered DAG as machine code.
@@ -695,14 +726,14 @@ void SelectionDAGISel::ComputeLiveOutVRegInfo() {
     if (!TargetRegisterInfo::isVirtualRegister(DestReg))
       continue;
 
-    // Ignore non-scalar or non-integer values.
+    // Ignore non-integer values.
     SDValue Src = N->getOperand(2);
     EVT SrcVT = Src.getValueType();
-    if (!SrcVT.isInteger() || SrcVT.isVector())
+    if (!SrcVT.isInteger())
       continue;
 
     unsigned NumSignBits = CurDAG->ComputeNumSignBits(Src);
-    CurDAG->computeKnownBits(Src, Known);
+    Known = CurDAG->computeKnownBits(Src);
     FuncInfo->AddLiveOutRegInfo(DestReg, NumSignBits, Known);
   } while (!Worklist.empty());
 }
@@ -714,8 +745,10 @@ void SelectionDAGISel::CodeGenAndEmitDAG() {
   int BlockNumber = -1;
   (void)BlockNumber;
   bool MatchFilterBB = false; (void)MatchFilterBB;
+#ifndef NDEBUG
   TargetTransformInfo &TTI =
       getAnalysis<TargetTransformInfoWrapperPass>().getTTI(*FuncInfo->Fn);
+#endif
 
   // Pre-type legalization allow creation of any node types.
   CurDAG->NewNodesMustHaveLegalTypes = false;
@@ -723,7 +756,7 @@ void SelectionDAGISel::CodeGenAndEmitDAG() {
 #ifndef NDEBUG
   MatchFilterBB = (FilterDAGBasicBlockName.empty() ||
                    FilterDAGBasicBlockName ==
-                       FuncInfo->MBB->getBasicBlock()->getName().str());
+                       FuncInfo->MBB->getBasicBlock()->getName());
 #endif
 #ifdef NDEBUG
   if (ViewDAGCombine1 || ViewLegalizeTypesDAGs || ViewLegalizeDAGs ||
@@ -750,8 +783,10 @@ void SelectionDAGISel::CodeGenAndEmitDAG() {
     CurDAG->Combine(BeforeLegalizeTypes, AA, OptLevel);
   }
 
+#ifndef NDEBUG
   if (TTI.hasBranchDivergence())
     CurDAG->VerifyDAGDiverence();
+#endif
 
   LLVM_DEBUG(dbgs() << "Optimized lowered selection DAG: "
                     << printMBBReference(*FuncInfo->MBB) << " '" << BlockName
@@ -770,8 +805,10 @@ void SelectionDAGISel::CodeGenAndEmitDAG() {
     Changed = CurDAG->LegalizeTypes();
   }
 
+#ifndef NDEBUG
   if (TTI.hasBranchDivergence())
     CurDAG->VerifyDAGDiverence();
+#endif
 
   LLVM_DEBUG(dbgs() << "Type-legalized selection DAG: "
                     << printMBBReference(*FuncInfo->MBB) << " '" << BlockName
@@ -792,8 +829,10 @@ void SelectionDAGISel::CodeGenAndEmitDAG() {
       CurDAG->Combine(AfterLegalizeTypes, AA, OptLevel);
     }
 
+#ifndef NDEBUG
     if (TTI.hasBranchDivergence())
       CurDAG->VerifyDAGDiverence();
+#endif
 
     LLVM_DEBUG(dbgs() << "Optimized type-legalized selection DAG: "
                       << printMBBReference(*FuncInfo->MBB) << " '" << BlockName
@@ -839,8 +878,10 @@ void SelectionDAGISel::CodeGenAndEmitDAG() {
                       << "'\n";
                CurDAG->dump());
 
+#ifndef NDEBUG
     if (TTI.hasBranchDivergence())
       CurDAG->VerifyDAGDiverence();
+#endif
   }
 
   if (ViewLegalizeDAGs && MatchFilterBB)
@@ -852,8 +893,10 @@ void SelectionDAGISel::CodeGenAndEmitDAG() {
     CurDAG->Legalize();
   }
 
+#ifndef NDEBUG
   if (TTI.hasBranchDivergence())
     CurDAG->VerifyDAGDiverence();
+#endif
 
   LLVM_DEBUG(dbgs() << "Legalized selection DAG: "
                     << printMBBReference(*FuncInfo->MBB) << " '" << BlockName
@@ -870,8 +913,10 @@ void SelectionDAGISel::CodeGenAndEmitDAG() {
     CurDAG->Combine(AfterLegalizeDAG, AA, OptLevel);
   }
 
+#ifndef NDEBUG
   if (TTI.hasBranchDivergence())
     CurDAG->VerifyDAGDiverence();
+#endif
 
   LLVM_DEBUG(dbgs() << "Optimized legalized selection DAG: "
                     << printMBBReference(*FuncInfo->MBB) << " '" << BlockName
@@ -1114,6 +1159,37 @@ static bool hasExceptionPointerOrCodeUser(const CatchPadInst *CPI) {
   return false;
 }
 
+// wasm.landingpad.index intrinsic is for associating a landing pad index number
+// with a catchpad instruction. Retrieve the landing pad index in the intrinsic
+// and store the mapping in the function.
+static void mapWasmLandingPadIndex(MachineBasicBlock *MBB,
+                                   const CatchPadInst *CPI) {
+  MachineFunction *MF = MBB->getParent();
+  // In case of single catch (...), we don't emit LSDA, so we don't need
+  // this information.
+  bool IsSingleCatchAllClause =
+      CPI->getNumArgOperands() == 1 &&
+      cast<Constant>(CPI->getArgOperand(0))->isNullValue();
+  if (!IsSingleCatchAllClause) {
+    // Create a mapping from landing pad label to landing pad index.
+    bool IntrFound = false;
+    for (const User *U : CPI->users()) {
+      if (const auto *Call = dyn_cast<IntrinsicInst>(U)) {
+        Intrinsic::ID IID = Call->getIntrinsicID();
+        if (IID == Intrinsic::wasm_landingpad_index) {
+          Value *IndexArg = Call->getArgOperand(1);
+          int Index = cast<ConstantInt>(IndexArg)->getZExtValue();
+          MF->setWasmLandingPadIndex(MBB, Index);
+          IntrFound = true;
+          break;
+        }
+      }
+    }
+    assert(IntrFound && "wasm.landingpad.index intrinsic not found!");
+    (void)IntrFound;
+  }
+}
+
 /// PrepareEHLandingPad - Emit an EH_LABEL, set up live-in registers, and
 /// do other setup for EH landing-pad blocks.
 bool SelectionDAGISel::PrepareEHLandingPad() {
@@ -1123,44 +1199,48 @@ bool SelectionDAGISel::PrepareEHLandingPad() {
   const TargetRegisterClass *PtrRC =
       TLI->getRegClassFor(TLI->getPointerTy(CurDAG->getDataLayout()));
 
+  auto Pers = classifyEHPersonality(PersonalityFn);
+
   // Catchpads have one live-in register, which typically holds the exception
   // pointer or code.
-  if (const auto *CPI = dyn_cast<CatchPadInst>(LLVMBB->getFirstNonPHI())) {
-    if (hasExceptionPointerOrCodeUser(CPI)) {
-      // Get or create the virtual register to hold the pointer or code.  Mark
-      // the live in physreg and copy into the vreg.
-      MCPhysReg EHPhysReg = TLI->getExceptionPointerRegister(PersonalityFn);
-      assert(EHPhysReg && "target lacks exception pointer register");
-      MBB->addLiveIn(EHPhysReg);
-      unsigned VReg = FuncInfo->getCatchPadExceptionPointerVReg(CPI, PtrRC);
-      BuildMI(*MBB, FuncInfo->InsertPt, SDB->getCurDebugLoc(),
-              TII->get(TargetOpcode::COPY), VReg)
-          .addReg(EHPhysReg, RegState::Kill);
+  if (isFuncletEHPersonality(Pers)) {
+    if (const auto *CPI = dyn_cast<CatchPadInst>(LLVMBB->getFirstNonPHI())) {
+      if (hasExceptionPointerOrCodeUser(CPI)) {
+        // Get or create the virtual register to hold the pointer or code.  Mark
+        // the live in physreg and copy into the vreg.
+        MCPhysReg EHPhysReg = TLI->getExceptionPointerRegister(PersonalityFn);
+        assert(EHPhysReg && "target lacks exception pointer register");
+        MBB->addLiveIn(EHPhysReg);
+        unsigned VReg = FuncInfo->getCatchPadExceptionPointerVReg(CPI, PtrRC);
+        BuildMI(*MBB, FuncInfo->InsertPt, SDB->getCurDebugLoc(),
+                TII->get(TargetOpcode::COPY), VReg)
+            .addReg(EHPhysReg, RegState::Kill);
+      }
     }
     return true;
   }
-
-  if (!LLVMBB->isLandingPad())
-    return true;
 
   // Add a label to mark the beginning of the landing pad.  Deletion of the
   // landing pad can thus be detected via the MachineModuleInfo.
   MCSymbol *Label = MF->addLandingPad(MBB);
 
-  // Assign the call site to the landing pad's begin label.
-  MF->setCallSiteLandingPad(Label, SDB->LPadToCallSiteMap[MBB]);
-
   const MCInstrDesc &II = TII->get(TargetOpcode::EH_LABEL);
   BuildMI(*MBB, FuncInfo->InsertPt, SDB->getCurDebugLoc(), II)
     .addSym(Label);
 
-  // Mark exception register as live in.
-  if (unsigned Reg = TLI->getExceptionPointerRegister(PersonalityFn))
-    FuncInfo->ExceptionPointerVirtReg = MBB->addLiveIn(Reg, PtrRC);
-
-  // Mark exception selector register as live in.
-  if (unsigned Reg = TLI->getExceptionSelectorRegister(PersonalityFn))
-    FuncInfo->ExceptionSelectorVirtReg = MBB->addLiveIn(Reg, PtrRC);
+  if (Pers == EHPersonality::Wasm_CXX) {
+    if (const auto *CPI = dyn_cast<CatchPadInst>(LLVMBB->getFirstNonPHI()))
+      mapWasmLandingPadIndex(MBB, CPI);
+  } else {
+    // Assign the call site to the landing pad's begin label.
+    MF->setCallSiteLandingPad(Label, SDB->LPadToCallSiteMap[MBB]);
+    // Mark exception register as live in.
+    if (unsigned Reg = TLI->getExceptionPointerRegister(PersonalityFn))
+      FuncInfo->ExceptionPointerVirtReg = MBB->addLiveIn(Reg, PtrRC);
+    // Mark exception selector register as live in.
+    if (unsigned Reg = TLI->getExceptionSelectorRegister(PersonalityFn))
+      FuncInfo->ExceptionSelectorVirtReg = MBB->addLiveIn(Reg, PtrRC);
+  }
 
   return true;
 }
@@ -1171,7 +1251,7 @@ bool SelectionDAGISel::PrepareEHLandingPad() {
 static bool isFoldedOrDeadInstruction(const Instruction *I,
                                       FunctionLoweringInfo *FuncInfo) {
   return !I->mayWriteToMemory() && // Side-effecting instructions aren't folded.
-         !isa<TerminatorInst>(I) &&    // Terminators aren't folded.
+         !I->isTerminator() &&     // Terminators aren't folded.
          !isa<DbgInfoIntrinsic>(I) &&  // Debug instructions aren't folded.
          !I->isEHPad() &&              // EH pad instructions aren't folded.
          !FuncInfo->isExportedInst(I); // Exported instrs must be computed.
@@ -1688,7 +1768,7 @@ void SelectionDAGISel::SelectAllBasicBlocks(const Function &Fn) {
                                    Inst->getDebugLoc(), LLVMBB);
 
         bool ShouldAbort = EnableFastISelAbort;
-        if (isa<TerminatorInst>(Inst)) {
+        if (Inst->isTerminator()) {
           // Use a different message for terminator misses.
           R << "FastISel missed terminator";
           // Don't abort for terminator unless the level is really high
@@ -2160,9 +2240,7 @@ bool SelectionDAGISel::CheckOrMask(SDValue LHS, ConstantSDNode *RHS,
   // Otherwise, the DAG Combiner may have proven that the value coming in is
   // either already zero or is not demanded.  Check for known zero input bits.
   APInt NeededMask = DesiredMask & ~ActualMask;
-
-  KnownBits Known;
-  CurDAG->computeKnownBits(LHS, Known);
+  KnownBits Known = CurDAG->computeKnownBits(LHS);
 
   // If all the missing bits in the or are already known to be set, match!
   if (NeededMask.isSubsetOf(Known.One))
@@ -2364,14 +2442,14 @@ bool SelectionDAGISel::IsLegalToFold(SDValue N, SDNode *U, SDNode *Root,
   return !findNonImmUse(Root, N.getNode(), U, IgnoreChains);
 }
 
-void SelectionDAGISel::Select_INLINEASM(SDNode *N) {
+void SelectionDAGISel::Select_INLINEASM(SDNode *N, bool Branch) {
   SDLoc DL(N);
 
   std::vector<SDValue> Ops(N->op_begin(), N->op_end());
   SelectInlineAsmMemoryOperands(Ops, DL);
 
   const EVT VTs[] = {MVT::Other, MVT::Glue};
-  SDValue New = CurDAG->getNode(ISD::INLINEASM, DL, VTs, Ops);
+  SDValue New = CurDAG->getNode(Branch ? ISD::INLINEASM_BR : ISD::INLINEASM, DL, VTs, Ops);
   New->setNodeId(-1);
   ReplaceUses(N, New.getNode());
   CurDAG->RemoveDeadNode(N);
@@ -2679,6 +2757,14 @@ CheckCondCode(const unsigned char *MatcherTable, unsigned &MatcherIndex,
 }
 
 LLVM_ATTRIBUTE_ALWAYS_INLINE static inline bool
+CheckChild2CondCode(const unsigned char *MatcherTable, unsigned &MatcherIndex,
+                    SDValue N) {
+  if (2 >= N.getNumOperands())
+    return false;
+  return ::CheckCondCode(MatcherTable, MatcherIndex, N.getOperand(2));
+}
+
+LLVM_ATTRIBUTE_ALWAYS_INLINE static inline bool
 CheckValueType(const unsigned char *MatcherTable, unsigned &MatcherIndex,
                SDValue N, const TargetLowering *TLI, const DataLayout &DL) {
   MVT::SimpleValueType VT = (MVT::SimpleValueType)MatcherTable[MatcherIndex++];
@@ -2792,6 +2878,9 @@ static unsigned IsPredicateKnownToFail(const unsigned char *Table,
     return Index;
   case SelectionDAGISel::OPC_CheckCondCode:
     Result = !::CheckCondCode(Table, Index, N);
+    return Index;
+  case SelectionDAGISel::OPC_CheckChild2CondCode:
+    Result = !::CheckChild2CondCode(Table, Index, N);
     return Index;
   case SelectionDAGISel::OPC_CheckValueType:
     Result = !::CheckValueType(Table, Index, N, SDISel.TLI,
@@ -2921,7 +3010,9 @@ void SelectionDAGISel::SelectCodeCommon(SDNode *NodeToMatch,
     CurDAG->RemoveDeadNode(NodeToMatch);
     return;
   case ISD::INLINEASM:
-    Select_INLINEASM(NodeToMatch);
+  case ISD::INLINEASM_BR:
+    Select_INLINEASM(NodeToMatch,
+                     NodeToMatch->getOpcode() == ISD::INLINEASM_BR);
     return;
   case ISD::READ_REGISTER:
     Select_READ_REGISTER(NodeToMatch);
@@ -3156,6 +3247,18 @@ void SelectionDAGISel::SelectCodeCommon(SDNode *NodeToMatch,
                                 N.getNode()))
         break;
       continue;
+    case OPC_CheckPredicateWithOperands: {
+      unsigned OpNum = MatcherTable[MatcherIndex++];
+      SmallVector<SDValue, 8> Operands;
+
+      for (unsigned i = 0; i < OpNum; ++i)
+        Operands.push_back(RecordedNodes[MatcherTable[MatcherIndex++]].first);
+
+      unsigned PredNo = MatcherTable[MatcherIndex++];
+      if (!CheckNodePredicateWithOperands(N.getNode(), PredNo, Operands))
+        break;
+      continue;
+    }
     case OPC_CheckComplexPat: {
       unsigned CPNum = MatcherTable[MatcherIndex++];
       unsigned RecNo = MatcherTable[MatcherIndex++];
@@ -3267,6 +3370,9 @@ void SelectionDAGISel::SelectCodeCommon(SDNode *NodeToMatch,
     case OPC_CheckCondCode:
       if (!::CheckCondCode(MatcherTable, MatcherIndex, N)) break;
       continue;
+    case OPC_CheckChild2CondCode:
+      if (!::CheckChild2CondCode(MatcherTable, MatcherIndex, N)) break;
+      continue;
     case OPC_CheckValueType:
       if (!::CheckValueType(MatcherTable, MatcherIndex, N, TLI,
                             CurDAG->getDataLayout()))
@@ -3286,6 +3392,12 @@ void SelectionDAGISel::SelectCodeCommon(SDNode *NodeToMatch,
       continue;
     case OPC_CheckOrImm:
       if (!::CheckOrImm(MatcherTable, MatcherIndex, N, *this)) break;
+      continue;
+    case OPC_CheckImmAllOnesV:
+      if (!ISD::isBuildVectorAllOnes(N.getNode())) break;
+      continue;
+    case OPC_CheckImmAllZerosV:
+      if (!ISD::isBuildVectorAllZeros(N.getNode())) break;
       continue;
 
     case OPC_CheckFoldableChainNode: {
@@ -3598,38 +3710,22 @@ void SelectionDAGISel::SelectCodeCommon(SDNode *NodeToMatch,
         bool mayLoad = MCID.mayLoad();
         bool mayStore = MCID.mayStore();
 
-        unsigned NumMemRefs = 0;
-        for (SmallVectorImpl<MachineMemOperand *>::const_iterator I =
-               MatchedMemRefs.begin(), E = MatchedMemRefs.end(); I != E; ++I) {
-          if ((*I)->isLoad()) {
+        // We expect to have relatively few of these so just filter them into a
+        // temporary buffer so that we can easily add them to the instruction.
+        SmallVector<MachineMemOperand *, 4> FilteredMemRefs;
+        for (MachineMemOperand *MMO : MatchedMemRefs) {
+          if (MMO->isLoad()) {
             if (mayLoad)
-              ++NumMemRefs;
-          } else if ((*I)->isStore()) {
+              FilteredMemRefs.push_back(MMO);
+          } else if (MMO->isStore()) {
             if (mayStore)
-              ++NumMemRefs;
+              FilteredMemRefs.push_back(MMO);
           } else {
-            ++NumMemRefs;
+            FilteredMemRefs.push_back(MMO);
           }
         }
 
-        MachineSDNode::mmo_iterator MemRefs =
-          MF->allocateMemRefsArray(NumMemRefs);
-
-        MachineSDNode::mmo_iterator MemRefsPos = MemRefs;
-        for (SmallVectorImpl<MachineMemOperand *>::const_iterator I =
-               MatchedMemRefs.begin(), E = MatchedMemRefs.end(); I != E; ++I) {
-          if ((*I)->isLoad()) {
-            if (mayLoad)
-              *MemRefsPos++ = *I;
-          } else if ((*I)->isStore()) {
-            if (mayStore)
-              *MemRefsPos++ = *I;
-          } else {
-            *MemRefsPos++ = *I;
-          }
-        }
-
-        Res->setMemRefs(MemRefs, MemRefs + NumMemRefs);
+        CurDAG->setNodeMemRefs(Res, FilteredMemRefs);
       }
 
       LLVM_DEBUG(if (!MatchedMemRefs.empty() && Res->memoperands_empty()) dbgs()

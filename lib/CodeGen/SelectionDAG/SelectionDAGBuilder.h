@@ -1,9 +1,8 @@
 //===- SelectionDAGBuilder.h - Selection-DAG building -----------*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -47,6 +46,7 @@ class AtomicRMWInst;
 class BasicBlock;
 class BranchInst;
 class CallInst;
+class CallBrInst;
 class CatchPadInst;
 class CatchReturnInst;
 class CatchSwitchInst;
@@ -91,16 +91,16 @@ class Value;
 /// implementation that is parameterized by a TargetLowering object.
 ///
 class SelectionDAGBuilder {
-  /// CurInst - The current instruction being visited
+  /// The current instruction being visited.
   const Instruction *CurInst = nullptr;
 
   DenseMap<const Value*, SDValue> NodeMap;
 
-  /// UnusedArgNodeMap - Maps argument value for unused arguments. This is used
+  /// Maps argument value for unused arguments. This is used
   /// to preserve debug information for incoming arguments.
   DenseMap<const Value*, SDValue> UnusedArgNodeMap;
 
-  /// DanglingDebugInfo - Helper type for DanglingDebugInfoMap.
+  /// Helper type for DanglingDebugInfoMap.
   class DanglingDebugInfo {
     const DbgValueInst* DI = nullptr;
     DebugLoc dl;
@@ -116,18 +116,17 @@ class SelectionDAGBuilder {
     unsigned getSDNodeOrder() { return SDNodeOrder; }
   };
 
-  /// DanglingDebugInfoVector - Helper type for DanglingDebugInfoMap.
+  /// Helper type for DanglingDebugInfoMap.
   typedef std::vector<DanglingDebugInfo> DanglingDebugInfoVector;
 
-  /// DanglingDebugInfoMap - Keeps track of dbg_values for which we have not
-  /// yet seen the referent.  We defer handling these until we do see it.
+  /// Keeps track of dbg_values for which we have not yet seen the referent.
+  /// We defer handling these until we do see it.
   DenseMap<const Value*, DanglingDebugInfoVector> DanglingDebugInfoMap;
 
 public:
-  /// PendingLoads - Loads are not emitted to the program immediately.  We bunch
-  /// them up and then emit token factor nodes when possible.  This allows us to
-  /// get simple disambiguation between loads without worrying about alias
-  /// analysis.
+  /// Loads are not emitted to the program immediately.  We bunch them up and
+  /// then emit token factor nodes when possible.  This allows us to get simple
+  /// disambiguation between loads without worrying about alias analysis.
   SmallVector<SDValue, 8> PendingLoads;
 
   /// State used while lowering a statepoint sequence (gc_statepoint,
@@ -135,15 +134,14 @@ public:
   StatepointLoweringState StatepointLowering;
 
 private:
-  /// PendingExports - CopyToReg nodes that copy values to virtual registers
-  /// for export to other blocks need to be emitted before any terminator
-  /// instruction, but they have no other ordering requirements. We bunch them
-  /// up and the emit a single tokenfactor for them just before terminator
-  /// instructions.
+  /// CopyToReg nodes that copy values to virtual registers for export to other
+  /// blocks need to be emitted before any terminator instruction, but they have
+  /// no other ordering requirements. We bunch them up and the emit a single
+  /// tokenfactor for them just before terminator instructions.
   SmallVector<SDValue, 8> PendingExports;
 
-  /// SDNodeOrder - A unique monotonically increasing number used to order the
-  /// SDNodes we create.
+  /// A unique monotonically increasing number used to order the SDNodes we
+  /// create.
   unsigned SDNodeOrder;
 
   enum CaseClusterKind {
@@ -222,29 +220,29 @@ private:
   /// Sort Clusters and merge adjacent cases.
   void sortAndRangeify(CaseClusterVector &Clusters);
 
-  /// CaseBlock - This structure is used to communicate between
-  /// SelectionDAGBuilder and SDISel for the code generation of additional basic
-  /// blocks needed by multi-case switch statements.
+  /// This structure is used to communicate between SelectionDAGBuilder and
+  /// SDISel for the code generation of additional basic blocks needed by
+  /// multi-case switch statements.
   struct CaseBlock {
-    // CC - the condition code to use for the case block's setcc node
+    // The condition code to use for the case block's setcc node.
     ISD::CondCode CC;
 
-    // CmpLHS/CmpRHS/CmpMHS - The LHS/MHS/RHS of the comparison to emit.
+    // The LHS/MHS/RHS of the comparison to emit.
     // Emit by default LHS op RHS. MHS is used for range comparisons:
     // If MHS is not null: (LHS <= MHS) and (MHS <= RHS).
     const Value *CmpLHS, *CmpMHS, *CmpRHS;
 
-    // TrueBB/FalseBB - the block to branch to if the setcc is true/false.
+    // The block to branch to if the setcc is true/false.
     MachineBasicBlock *TrueBB, *FalseBB;
 
-    // ThisBB - the block into which to emit the code for the setcc and branches
+    // The block into which to emit the code for the setcc and branches.
     MachineBasicBlock *ThisBB;
 
     /// The debug location of the instruction this CaseBlock was
     /// produced from.
     SDLoc DL;
 
-    // TrueProb/FalseProb - branch weights.
+    // Branch weights.
     BranchProbability TrueProb, FalseProb;
 
     CaseBlock(ISD::CondCode cc, const Value *cmplhs, const Value *cmprhs,
@@ -259,14 +257,14 @@ private:
   };
 
   struct JumpTable {
-    /// Reg - the virtual register containing the index of the jump table entry
-    //. to jump to.
+    /// The virtual register containing the index of the jump table entry
+    /// to jump to.
     unsigned Reg;
-    /// JTI - the JumpTableIndex for this jump table in the function.
+    /// The JumpTableIndex for this jump table in the function.
     unsigned JTI;
-    /// MBB - the MBB into which to emit the code for the indirect jump.
+    /// The MBB into which to emit the code for the indirect jump.
     MachineBasicBlock *MBB;
-    /// Default - the MBB of the default bb, which is a successor of the range
+    /// The MBB of the default bb, which is a successor of the range
     /// check MBB.  This is when updating PHI nodes in successors.
     MachineBasicBlock *Default;
 
@@ -588,16 +586,16 @@ public:
   AliasAnalysis *AA = nullptr;
   const TargetLibraryInfo *LibInfo;
 
-  /// SwitchCases - Vector of CaseBlock structures used to communicate
-  /// SwitchInst code generation information.
+  /// Vector of CaseBlock structures used to communicate SwitchInst code
+  /// generation information.
   std::vector<CaseBlock> SwitchCases;
 
-  /// JTCases - Vector of JumpTable structures used to communicate
-  /// SwitchInst code generation information.
+  /// Vector of JumpTable structures used to communicate SwitchInst code
+  /// generation information.
   std::vector<JumpTableBlock> JTCases;
 
-  /// BitTestCases - Vector of BitTestBlock structures used to communicate
-  /// SwitchInst code generation information.
+  /// Vector of BitTestBlock structures used to communicate SwitchInst code
+  /// generation information.
   std::vector<BitTestBlock> BitTestCases;
 
   /// A StackProtectorDescriptor structure used to communicate stack protector
@@ -608,19 +606,17 @@ public:
   // PHI nodes.
   DenseMap<const Constant *, unsigned> ConstantsOut;
 
-  /// FuncInfo - Information about the function as a whole.
-  ///
+  /// Information about the function as a whole.
   FunctionLoweringInfo &FuncInfo;
 
-  /// GFI - Garbage collection metadata for the function.
+  /// Garbage collection metadata for the function.
   GCFunctionInfo *GFI;
 
-  /// LPadToCallSiteMap - Map a landing pad to the call site indexes.
+  /// Map a landing pad to the call site indexes.
   DenseMap<MachineBasicBlock *, SmallVector<unsigned, 4>> LPadToCallSiteMap;
 
-  /// HasTailCall - This is set to true if a call in the current
-  /// block has been translated as a tail call. In this case,
-  /// no subsequent DAG nodes should be created.
+  /// This is set to true if a call in the current block has been translated as
+  /// a tail call. In this case, no subsequent DAG nodes should be created.
   bool HasTailCall = false;
 
   LLVMContext *Context;
@@ -670,19 +666,33 @@ public:
 
   void visit(unsigned Opcode, const User &I);
 
-  /// getCopyFromRegs - If there was virtual register allocated for the value V
-  /// emit CopyFromReg of the specified type Ty. Return empty SDValue() otherwise.
+  /// If there was virtual register allocated for the value V emit CopyFromReg
+  /// of the specified type Ty. Return empty SDValue() otherwise.
   SDValue getCopyFromRegs(const Value *V, Type *Ty);
 
   /// If we have dangling debug info that describes \p Variable, or an
   /// overlapping part of variable considering the \p Expr, then this method
-  /// weill drop that debug info as it isn't valid any longer.
+  /// will drop that debug info as it isn't valid any longer.
   void dropDanglingDebugInfo(const DILocalVariable *Variable,
                              const DIExpression *Expr);
 
-  // resolveDanglingDebugInfo - if we saw an earlier dbg_value referring to V,
-  // generate the debug data structures now that we've seen its definition.
+  /// If we saw an earlier dbg_value referring to V, generate the debug data
+  /// structures now that we've seen its definition.
   void resolveDanglingDebugInfo(const Value *V, SDValue Val);
+
+  /// For the given dangling debuginfo record, perform last-ditch efforts to
+  /// resolve the debuginfo to something that is represented in this DAG. If
+  /// this cannot be done, produce an Undef debug value record.
+  void salvageUnresolvedDbgValue(DanglingDebugInfo &DDI);
+
+  /// For a given Value, attempt to create and record a SDDbgValue in the
+  /// SelectionDAG.
+  bool handleDebugValue(const Value *V, DILocalVariable *Var,
+                        DIExpression *Expr, DebugLoc CurDL,
+                        DebugLoc InstDL, unsigned Order);
+
+  /// Evict any dangling debug information, attempting to salvage it first.
+  void resolveOrClearDbgInfo();
 
   SDValue getValue(const Value *V);
   bool findValue(const Value *V) const;
@@ -712,13 +722,13 @@ public:
   void FindMergedConditions(const Value *Cond, MachineBasicBlock *TBB,
                             MachineBasicBlock *FBB, MachineBasicBlock *CurBB,
                             MachineBasicBlock *SwitchBB,
-                            Instruction::BinaryOps Opc, BranchProbability TW,
-                            BranchProbability FW, bool InvertCond);
+                            Instruction::BinaryOps Opc, BranchProbability TProb,
+                            BranchProbability FProb, bool InvertCond);
   void EmitBranchForMergedCondition(const Value *Cond, MachineBasicBlock *TBB,
                                     MachineBasicBlock *FBB,
                                     MachineBasicBlock *CurBB,
                                     MachineBasicBlock *SwitchBB,
-                                    BranchProbability TW, BranchProbability FW,
+                                    BranchProbability TProb, BranchProbability FProb,
                                     bool InvertCond);
   bool ShouldEmitAsBranches(const std::vector<CaseBlock> &Cases);
   bool isExportableFromCurrentBlock(const Value *V, const BasicBlock *FromBB);
@@ -733,7 +743,7 @@ public:
                                  SDValue Op);
 
   void populateCallLoweringInfo(TargetLowering::CallLoweringInfo &CLI,
-                                ImmutableCallSite CS, unsigned ArgIdx,
+                                const CallBase *Call, unsigned ArgIdx,
                                 unsigned NumArgs, SDValue Callee,
                                 Type *ReturnTy, bool IsPatchPoint);
 
@@ -741,7 +751,7 @@ public:
   lowerInvokable(TargetLowering::CallLoweringInfo &CLI,
                  const BasicBlock *EHPadBB = nullptr);
 
-  /// UpdateSplitBlock - When an MBB was split during scheduling, update the
+  /// When an MBB was split during scheduling, update the
   /// references that need to refer to the last resulting block.
   void UpdateSplitBlock(MachineBasicBlock *First, MachineBasicBlock *Last);
 
@@ -790,20 +800,20 @@ public:
   };
 
   /// Lower \p SLI into a STATEPOINT instruction.
-  SDValue LowerAsSTATEPOINT(StatepointLoweringInfo &SLI);
+  SDValue LowerAsSTATEPOINT(StatepointLoweringInfo &SI);
 
   // This function is responsible for the whole statepoint lowering process.
   // It uniformly handles invoke and call statepoints.
-  void LowerStatepoint(ImmutableStatepoint Statepoint,
+  void LowerStatepoint(ImmutableStatepoint ISP,
                        const BasicBlock *EHPadBB = nullptr);
 
-  void LowerCallSiteWithDeoptBundle(ImmutableCallSite CS, SDValue Callee,
+  void LowerCallSiteWithDeoptBundle(const CallBase *Call, SDValue Callee,
                                     const BasicBlock *EHPadBB);
 
   void LowerDeoptimizeCall(const CallInst *CI);
   void LowerDeoptimizingReturn();
 
-  void LowerCallSiteWithDeoptBundleImpl(ImmutableCallSite CS, SDValue Callee,
+  void LowerCallSiteWithDeoptBundleImpl(const CallBase *Call, SDValue Callee,
                                         const BasicBlock *EHPadBB,
                                         bool VarArgDisallowed,
                                         bool ForceVoidReturnTy);
@@ -852,7 +862,11 @@ public:
 private:
   // These all get lowered before this pass.
   void visitInvoke(const InvokeInst &I);
+  void visitCallBr(const CallBrInst &I);
   void visitResume(const ResumeInst &I);
+
+  void visitUnary(const User &I, unsigned Opcode);
+  void visitFNeg(const User &I) { visitUnary(I, ISD::FNEG); }
 
   void visitBinary(const User &I, unsigned Opcode);
   void visitShift(const User &I, unsigned Opcode);
@@ -897,7 +911,7 @@ private:
 
   void visitExtractValue(const User &I);
   void visitInsertValue(const User &I);
-  void visitLandingPad(const LandingPadInst &I);
+  void visitLandingPad(const LandingPadInst &LP);
 
   void visitGetElementPtr(const User &I);
   void visitSelect(const User &I);
@@ -942,7 +956,7 @@ private:
                        const BasicBlock *EHPadBB = nullptr);
 
   // These two are implemented in StatepointLowering.cpp
-  void visitGCRelocate(const GCRelocateInst &I);
+  void visitGCRelocate(const GCRelocateInst &Relocate);
   void visitGCResult(const GCResultInst &I);
 
   void visitVectorReduce(const CallInst &I, unsigned Intrinsic);
@@ -981,7 +995,7 @@ private:
                           unsigned DbgSDNodeOrder);
 };
 
-/// RegsForValue - This struct represents the registers (physical or virtual)
+/// This struct represents the registers (physical or virtual)
 /// that a particular set of values is assigned, and the type information about
 /// the value. The most common situation is to represent one value at a time,
 /// but struct or array values are handled element-wise as multiple values.  The
@@ -1015,14 +1029,18 @@ struct RegsForValue {
 
   /// Records if this value needs to be treated in an ABI dependant manner,
   /// different to normal type legalization.
-  bool IsABIMangled = false;
+  Optional<CallingConv::ID> CallConv;
 
   RegsForValue() = default;
   RegsForValue(const SmallVector<unsigned, 4> &regs, MVT regvt, EVT valuevt,
-               bool IsABIMangledValue = false);
+               Optional<CallingConv::ID> CC = None);
   RegsForValue(LLVMContext &Context, const TargetLowering &TLI,
                const DataLayout &DL, unsigned Reg, Type *Ty,
-               bool IsABIMangledValue = false);
+               Optional<CallingConv::ID> CC);
+
+  bool isABIMangled() const {
+    return CallConv.hasValue();
+  }
 
   /// Add the specified values to this one.
   void append(const RegsForValue &RHS) {
@@ -1052,7 +1070,7 @@ struct RegsForValue {
   /// Add this value to the specified inlineasm node operand list. This adds the
   /// code marker, matching input operand index (if applicable), and includes
   /// the number of values added into it.
-  void AddInlineAsmOperands(unsigned Kind, bool HasMatching,
+  void AddInlineAsmOperands(unsigned Code, bool HasMatching,
                             unsigned MatchingIdx, const SDLoc &dl,
                             SelectionDAG &DAG, std::vector<SDValue> &Ops) const;
 

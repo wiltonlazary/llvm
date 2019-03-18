@@ -1,9 +1,8 @@
 //===-- FunctionLoweringInfo.cpp ------------------------------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -89,10 +88,12 @@ void FunctionLoweringInfo::set(const Function &fn, MachineFunction &mf,
 
   // Check whether the function can return without sret-demotion.
   SmallVector<ISD::OutputArg, 4> Outs;
-  GetReturnInfo(Fn->getReturnType(), Fn->getAttributes(), Outs, *TLI,
+  CallingConv::ID CC = Fn->getCallingConv();
+
+  GetReturnInfo(CC, Fn->getReturnType(), Fn->getAttributes(), Outs, *TLI,
                 mf.getDataLayout());
-  CanLowerReturn = TLI->CanLowerReturn(Fn->getCallingConv(), *MF,
-                                       Fn->isVarArg(), Outs, Fn->getContext());
+  CanLowerReturn =
+      TLI->CanLowerReturn(CC, *MF, Fn->isVarArg(), Outs, Fn->getContext());
 
   // If this personality uses funclets, we need to do a bit more work.
   DenseMap<const AllocaInst *, TinyPtrVector<int *>> CatchObjects;
@@ -320,13 +321,6 @@ void FunctionLoweringInfo::set(const Function &fn, MachineFunction &mf,
       NewMap[MBBMap[Src]] = MBBMap[Dst];
     }
     EHInfo.EHPadUnwindMap = std::move(NewMap);
-    NewMap.clear();
-    for (auto &KV : EHInfo.ThrowUnwindMap) {
-      const auto *Src = KV.first.get<const BasicBlock *>();
-      const auto *Dst = KV.second.get<const BasicBlock *>();
-      NewMap[MBBMap[Src]] = MBBMap[Dst];
-    }
-    EHInfo.ThrowUnwindMap = std::move(NewMap);
   }
 }
 
@@ -341,6 +335,7 @@ void FunctionLoweringInfo::clear() {
   LiveOutRegInfo.clear();
   VisitedBBs.clear();
   ArgDbgValues.clear();
+  DescribedArgs.clear();
   ByValArgFrameIndexMap.clear();
   RegFixups.clear();
   RegsWithFixups.clear();
@@ -398,7 +393,7 @@ FunctionLoweringInfo::GetLiveOutRegInfo(unsigned Reg, unsigned BitWidth) {
 
   if (BitWidth > LOI->Known.getBitWidth()) {
     LOI->NumSignBits = 1;
-    LOI->Known = LOI->Known.zextOrTrunc(BitWidth);
+    LOI->Known = LOI->Known.zext(BitWidth, false /* => any extend */);
   }
 
   return LOI;
@@ -577,9 +572,18 @@ FunctionLoweringInfo::getOrCreateSwiftErrorVRegUseAt(const Instruction *I, const
 const Value *
 FunctionLoweringInfo::getValueFromVirtualReg(unsigned Vreg) {
   if (VirtReg2Value.empty()) {
+    SmallVector<EVT, 4> ValueVTs;
     for (auto &P : ValueMap) {
-      VirtReg2Value[P.second] = P.first;
+      ValueVTs.clear();
+      ComputeValueVTs(*TLI, Fn->getParent()->getDataLayout(),
+                      P.first->getType(), ValueVTs);
+      unsigned Reg = P.second;
+      for (EVT VT : ValueVTs) {
+        unsigned NumRegisters = TLI->getNumRegisters(Fn->getContext(), VT);
+        for (unsigned i = 0, e = NumRegisters; i != e; ++i)
+          VirtReg2Value[Reg++] = P.first;
+      }
     }
   }
-  return VirtReg2Value[Vreg];
+  return VirtReg2Value.lookup(Vreg);
 }

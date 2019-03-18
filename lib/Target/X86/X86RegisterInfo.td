@@ -1,9 +1,8 @@
 //===- X86RegisterInfo.td - Describe the X86 Register File --*- tablegen -*-==//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -278,7 +277,7 @@ def K7 : X86Reg<"k7", 7>, DwarfRegNum<[125, 100, 100]>;
 // pseudo registers, but we still mark them as aliasing FP registers. That
 // way both kinds can be live without exceeding the stack depth. ST registers
 // are only live around inline assembly.
-def ST0 : X86Reg<"st(0)", 0>, DwarfRegNum<[33, 12, 11]>;
+def ST0 : X86Reg<"st", 0>, DwarfRegNum<[33, 12, 11]>;
 def ST1 : X86Reg<"st(1)", 1>, DwarfRegNum<[34, 13, 12]>;
 def ST2 : X86Reg<"st(2)", 2>, DwarfRegNum<[35, 14, 13]>;
 def ST3 : X86Reg<"st(3)", 3>, DwarfRegNum<[36, 15, 14]>;
@@ -288,7 +287,10 @@ def ST6 : X86Reg<"st(6)", 6>, DwarfRegNum<[39, 18, 17]>;
 def ST7 : X86Reg<"st(7)", 7>, DwarfRegNum<[40, 19, 18]>;
 
 // Floating-point status word
-def FPSW : X86Reg<"fpsw", 0>;
+def FPSW : X86Reg<"fpsr", 0>;
+
+// Floating-point control word
+def FPCW : X86Reg<"fpcr", 0>;
 
 // Status flags register.
 //
@@ -436,11 +438,12 @@ def GR8_ABCD_H : RegisterClass<"X86", [i8], 8, (add AH, CH, DH, BH)>;
 def GR16_ABCD : RegisterClass<"X86", [i16], 16, (add AX, CX, DX, BX)>;
 def GR32_ABCD : RegisterClass<"X86", [i32], 32, (add EAX, ECX, EDX, EBX)>;
 def GR64_ABCD : RegisterClass<"X86", [i64], 64, (add RAX, RCX, RDX, RBX)>;
-def GR32_TC   : RegisterClass<"X86", [i32], 32, (add EAX, ECX, EDX)>;
+def GR32_TC   : RegisterClass<"X86", [i32], 32, (add EAX, ECX, EDX, ESP)>;
 def GR64_TC   : RegisterClass<"X86", [i64], 64, (add RAX, RCX, RDX, RSI, RDI,
-                                                     R8, R9, R11, RIP)>;
+                                                     R8, R9, R11, RIP, RSP)>;
 def GR64_TCW64 : RegisterClass<"X86", [i64], 64, (add RAX, RCX, RDX,
-                                                      R8, R9, R10, R11, RIP)>;
+                                                      R8, R9, R10, R11,
+                                                      RIP, RSP)>;
 
 // GR8_NOREX - GR8 registers which do not require a REX prefix.
 def GR8_NOREX : RegisterClass<"X86", [i8], 8,
@@ -499,12 +502,20 @@ def LOW32_ADDR_ACCESS_RBP : RegisterClass<"X86", [i32], 32,
 def GR32_AD : RegisterClass<"X86", [i32], 32, (add EAX, EDX)>;
 def GR64_AD : RegisterClass<"X86", [i64], 64, (add RAX, RDX)>;
 
+// Classes to support the 64-bit assembler constraint tied to a fixed
+// register in 32-bit mode. The second register is always the next in
+// the list. Wrap around causes an error.
+def GR32_DC : RegisterClass<"X86", [i32], 32, (add EDX, ECX)>;
+def GR32_CB : RegisterClass<"X86", [i32], 32, (add ECX, EBX)>;
+def GR32_BSI : RegisterClass<"X86", [i32], 32, (add EBX, ESI)>;
+def GR32_SIDI : RegisterClass<"X86", [i32], 32, (add ESI, EDI)>;
+def GR32_DIBP : RegisterClass<"X86", [i32], 32, (add EDI, EBP)>;
+def GR32_BPSP : RegisterClass<"X86", [i32], 32, (add EBP, ESP)>;
+
 // Scalar SSE2 floating point registers.
 def FR32 : RegisterClass<"X86", [f32], 32, (sequence "XMM%u", 0, 15)>;
 
 def FR64 : RegisterClass<"X86", [f64], 64, (add FR32)>;
-
-def FR128 : RegisterClass<"X86", [f128], 128, (add FR32)>;
 
 
 // FIXME: This sets up the floating point register files as though they are f64
@@ -513,9 +524,15 @@ def FR128 : RegisterClass<"X86", [f128], 128, (add FR32)>;
 // faster on common hardware.  In reality, this should be controlled by a
 // command line option or something.
 
+
 def RFP32 : RegisterClass<"X86",[f32], 32, (sequence "FP%u", 0, 6)>;
 def RFP64 : RegisterClass<"X86",[f64], 32, (add RFP32)>;
 def RFP80 : RegisterClass<"X86",[f80], 32, (add RFP32)>;
+
+// st(7) may be is not allocatable.
+def RFP80_7 : RegisterClass<"X86",[f80], 32, (add FP7)> {
+  let isAllocatable = 0;
+}
 
 // Floating point stack registers (these are not allocatable by the
 // register allocator - the floating point stackifier is responsible
@@ -524,19 +541,22 @@ def RST : RegisterClass<"X86", [f80, f64, f32], 32, (sequence "ST%u", 0, 7)> {
   let isAllocatable = 0;
 }
 
+// Helper to allow %st to print as %st(0) when its encoded in the instruction.
+def RSTi : RegisterOperand<RST, "printSTiRegOperand">;
+
 // Generic vector registers: VR64 and VR128.
 // Ensure that float types are declared first - only float is legal on SSE1.
 def VR64: RegisterClass<"X86", [x86mmx], 64, (sequence "MM%u", 0, 7)>;
-def VR128 : RegisterClass<"X86", [v4f32, v2f64, v16i8, v8i16, v4i32, v2i64],
+def VR128 : RegisterClass<"X86", [v4f32, v2f64, v16i8, v8i16, v4i32, v2i64, f128],
                           128, (add FR32)>;
 def VR256 : RegisterClass<"X86", [v8f32, v4f64, v32i8, v16i16, v8i32, v4i64],
                           256, (sequence "YMM%u", 0, 15)>;
 
 // Special classes that help the assembly parser choose some alternate
 // instructions to favor 2-byte VEX encodings.
-def VR128L : RegisterClass<"X86", [v4f32, v2f64, v16i8, v8i16, v4i32, v2i64],
+def VR128L : RegisterClass<"X86", [v4f32, v2f64, v16i8, v8i16, v4i32, v2i64, f128],
                            128, (sequence "XMM%u", 0, 7)>;
-def VR128H : RegisterClass<"X86", [v4f32, v2f64, v16i8, v8i16, v4i32, v2i64],
+def VR128H : RegisterClass<"X86", [v4f32, v2f64, v16i8, v8i16, v4i32, v2i64, f128],
                            128, (sequence "XMM%u", 8, 15)>;
 def VR256L : RegisterClass<"X86", [v8f32, v4f64, v32i8, v16i16, v8i32, v4i64],
                            256, (sequence "YMM%u", 0, 7)>;
@@ -567,7 +587,7 @@ def FR32X : RegisterClass<"X86", [f32], 32, (sequence "XMM%u", 0, 31)>;
 def FR64X : RegisterClass<"X86", [f64], 64, (add FR32X)>;
 
 // Extended VR128 and VR256 for AVX-512 instructions
-def VR128X : RegisterClass<"X86", [v4f32, v2f64, v16i8, v8i16, v4i32, v2i64],
+def VR128X : RegisterClass<"X86", [v4f32, v2f64, v16i8, v8i16, v4i32, v2i64, f128],
                            128, (add FR32X)>;
 def VR256X : RegisterClass<"X86", [v8f32, v4f64, v32i8, v16i16, v8i32, v4i64],
                            256, (sequence "YMM%u", 0, 31)>;

@@ -1,9 +1,8 @@
 //===- ObjCARCOpts.cpp - ObjC ARC Optimization ----------------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -600,6 +599,17 @@ ObjCARCOpt::OptimizeRetainRVCall(Function &F, Instruction *RetainRV) {
     }
   }
 
+  // Track PHIs which are equivalent to our Arg.
+  SmallDenseSet<const Value*, 2> EquivalentArgs;
+  EquivalentArgs.insert(Arg);
+
+  // Add PHIs that are equivalent to Arg to ArgUsers.
+  if (const PHINode *PN = dyn_cast<PHINode>(Arg)) {
+    SmallVector<const Value *, 2> ArgUsers;
+    getEquivalentPHIs(*PN, ArgUsers);
+    EquivalentArgs.insert(ArgUsers.begin(), ArgUsers.end());
+  }
+
   // Check for being preceded by an objc_autoreleaseReturnValue on the same
   // pointer. In this case, we can delete the pair.
   BasicBlock::iterator I = RetainRV->getIterator(),
@@ -609,7 +619,7 @@ ObjCARCOpt::OptimizeRetainRVCall(Function &F, Instruction *RetainRV) {
       --I;
     while (I != Begin && IsNoopInstruction(&*I));
     if (GetBasicARCInstKind(&*I) == ARCInstKind::AutoreleaseRV &&
-        GetArgRCIdentityRoot(&*I) == Arg) {
+        EquivalentArgs.count(GetArgRCIdentityRoot(&*I))) {
       Changed = true;
       ++NumPeeps;
 
@@ -631,7 +641,7 @@ ObjCARCOpt::OptimizeRetainRVCall(Function &F, Instruction *RetainRV) {
                        "Old = "
                     << *RetainRV << "\n");
 
-  Constant *NewDecl = EP.get(ARCRuntimeEntryPointKind::Retain);
+  Function *NewDecl = EP.get(ARCRuntimeEntryPointKind::Retain);
   cast<CallInst>(RetainRV)->setCalledFunction(NewDecl);
 
   LLVM_DEBUG(dbgs() << "New = " << *RetainRV << "\n");
@@ -680,7 +690,7 @@ void ObjCARCOpt::OptimizeAutoreleaseRVCall(Function &F,
              << *AutoreleaseRV << "\n");
 
   CallInst *AutoreleaseRVCI = cast<CallInst>(AutoreleaseRV);
-  Constant *NewDecl = EP.get(ARCRuntimeEntryPointKind::Autorelease);
+  Function *NewDecl = EP.get(ARCRuntimeEntryPointKind::Autorelease);
   AutoreleaseRVCI->setCalledFunction(NewDecl);
   AutoreleaseRVCI->setTailCall(false); // Never tail call objc_autorelease.
   Class = ARCInstKind::Autorelease;
@@ -819,7 +829,7 @@ void ObjCARCOpt::OptimizeIndividualCalls(Function &F) {
         // Create the declaration lazily.
         LLVMContext &C = Inst->getContext();
 
-        Constant *Decl = EP.get(ARCRuntimeEntryPointKind::Release);
+        Function *Decl = EP.get(ARCRuntimeEntryPointKind::Release);
         CallInst *NewCall = CallInst::Create(Decl, Call->getArgOperand(0), "",
                                              Call);
         NewCall->setMetadata(MDKindCache.get(ARCMDKindID::ImpreciseRelease),
@@ -914,8 +924,8 @@ void ObjCARCOpt::OptimizeIndividualCalls(Function &F) {
           GetRCIdentityRoot(PN->getIncomingValue(i));
         if (IsNullOrUndef(Incoming))
           HasNull = true;
-        else if (cast<TerminatorInst>(PN->getIncomingBlock(i)->back())
-                   .getNumSuccessors() != 1) {
+        else if (PN->getIncomingBlock(i)->getTerminator()->getNumSuccessors() !=
+                 1) {
           HasCriticalEdges = true;
           break;
         }
@@ -1084,18 +1094,15 @@ ObjCARCOpt::CheckForCFGHazards(const BasicBlock *BB,
            "Unknown top down sequence state.");
 
     const Value *Arg = I->first;
-    const TerminatorInst *TI = cast<TerminatorInst>(&BB->back());
     bool SomeSuccHasSame = false;
     bool AllSuccsHaveSame = true;
     bool NotAllSeqEqualButKnownSafe = false;
 
-    succ_const_iterator SI(TI), SE(TI, false);
-
-    for (; SI != SE; ++SI) {
+    for (const BasicBlock *Succ : successors(BB)) {
       // If VisitBottomUp has pointer information for this successor, take
       // what we know about it.
       const DenseMap<const BasicBlock *, BBState>::iterator BBI =
-        BBStates.find(*SI);
+          BBStates.find(Succ);
       assert(BBI != BBStates.end());
       const BottomUpPtrState &SuccS = BBI->second.getPtrBottomUpState(Arg);
       const Sequence SuccSSeq = SuccS.GetSeq();
@@ -1414,21 +1421,20 @@ ComputePostOrders(Function &F,
   BasicBlock *EntryBB = &F.getEntryBlock();
   BBState &MyStates = BBStates[EntryBB];
   MyStates.SetAsEntry();
-  TerminatorInst *EntryTI = cast<TerminatorInst>(&EntryBB->back());
+  Instruction *EntryTI = EntryBB->getTerminator();
   SuccStack.push_back(std::make_pair(EntryBB, succ_iterator(EntryTI)));
   Visited.insert(EntryBB);
   OnStack.insert(EntryBB);
   do {
   dfs_next_succ:
     BasicBlock *CurrBB = SuccStack.back().first;
-    TerminatorInst *TI = cast<TerminatorInst>(&CurrBB->back());
-    succ_iterator SE(TI, false);
+    succ_iterator SE(CurrBB->getTerminator(), false);
 
     while (SuccStack.back().second != SE) {
       BasicBlock *SuccBB = *SuccStack.back().second++;
       if (Visited.insert(SuccBB).second) {
-        TerminatorInst *TI = cast<TerminatorInst>(&SuccBB->back());
-        SuccStack.push_back(std::make_pair(SuccBB, succ_iterator(TI)));
+        SuccStack.push_back(
+            std::make_pair(SuccBB, succ_iterator(SuccBB->getTerminator())));
         BBStates[CurrBB].addSucc(SuccBB);
         BBState &SuccStates = BBStates[SuccBB];
         SuccStates.addPred(CurrBB);
@@ -1521,7 +1527,7 @@ void ObjCARCOpt::MoveCalls(Value *Arg, RRInfo &RetainsToMove,
   for (Instruction *InsertPt : ReleasesToMove.ReverseInsertPts) {
     Value *MyArg = ArgTy == ParamTy ? Arg :
                    new BitCastInst(Arg, ParamTy, "", InsertPt);
-    Constant *Decl = EP.get(ARCRuntimeEntryPointKind::Retain);
+    Function *Decl = EP.get(ARCRuntimeEntryPointKind::Retain);
     CallInst *Call = CallInst::Create(Decl, MyArg, "", InsertPt);
     Call->setDoesNotThrow();
     Call->setTailCall();
@@ -1534,7 +1540,7 @@ void ObjCARCOpt::MoveCalls(Value *Arg, RRInfo &RetainsToMove,
   for (Instruction *InsertPt : RetainsToMove.ReverseInsertPts) {
     Value *MyArg = ArgTy == ParamTy ? Arg :
                    new BitCastInst(Arg, ParamTy, "", InsertPt);
-    Constant *Decl = EP.get(ARCRuntimeEntryPointKind::Release);
+    Function *Decl = EP.get(ARCRuntimeEntryPointKind::Release);
     CallInst *Call = CallInst::Create(Decl, MyArg, "", InsertPt);
     // Attach a clang.imprecise_release metadata tag, if appropriate.
     if (MDNode *M = ReleasesToMove.ReleaseMetadata)
@@ -1870,7 +1876,7 @@ void ObjCARCOpt::OptimizeWeakCalls(Function &F) {
           Changed = true;
           // If the load has a builtin retain, insert a plain retain for it.
           if (Class == ARCInstKind::LoadWeakRetained) {
-            Constant *Decl = EP.get(ARCRuntimeEntryPointKind::Retain);
+            Function *Decl = EP.get(ARCRuntimeEntryPointKind::Retain);
             CallInst *CI = CallInst::Create(Decl, EarlierCall, "", Call);
             CI->setTailCall();
           }
@@ -1899,7 +1905,7 @@ void ObjCARCOpt::OptimizeWeakCalls(Function &F) {
           Changed = true;
           // If the load has a builtin retain, insert a plain retain for it.
           if (Class == ARCInstKind::LoadWeakRetained) {
-            Constant *Decl = EP.get(ARCRuntimeEntryPointKind::Retain);
+            Function *Decl = EP.get(ARCRuntimeEntryPointKind::Retain);
             CallInst *CI = CallInst::Create(Decl, EarlierCall, "", Call);
             CI->setTailCall();
           }

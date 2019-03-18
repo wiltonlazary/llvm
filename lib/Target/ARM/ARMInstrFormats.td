@@ -1,9 +1,8 @@
 //===-- ARMInstrFormats.td - ARM Instruction Formats -------*- tablegen -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -109,6 +108,7 @@ def AddrModeT2_pc   : AddrMode<14>;
 def AddrModeT2_i8s4 : AddrMode<15>;
 def AddrMode_i12    : AddrMode<16>;
 def AddrMode5FP16   : AddrMode<17>;
+def AddrModeT2_ldrex : AddrMode<18>;
 
 // Load / store index mode.
 class IndexMode<bits<2> val> {
@@ -1555,6 +1555,8 @@ class AHI5<bits<4> opcod1, bits<2> opcod2, dag oops, dag iops,
 
   // Loads & stores operate on both NEON and VFP pipelines.
   let D = VFPNeonDomain;
+
+  let isUnpredicable = 1; // FP16 instructions cannot in general be conditional
 }
 
 // VFP Load / store multiple pseudo instructions.
@@ -1902,6 +1904,8 @@ class AHuI<bits<5> opcod1, bits<2> opcod2, bits<4> opcod3, bits<2> opcod4,
   let Inst{11-8}  = 0b1001;   // Half precision
   let Inst{7-6}   = opcod4;
   let Inst{4}     = opcod5;
+
+  let isUnpredicable = 1; // FP16 instructions cannot in general be conditional
 }
 
 // Half precision, unary, non-predicated
@@ -1930,6 +1934,8 @@ class AHuInp<bits<5> opcod1, bits<2> opcod2, bits<4> opcod3, bits<2> opcod4,
   let Inst{11-8}  = 0b1001;   // Half precision
   let Inst{7-6}   = opcod4;
   let Inst{4}     = opcod5;
+
+  let isUnpredicable = 1; // FP16 instructions cannot in general be conditional
 }
 
 // Half precision, binary
@@ -1956,6 +1962,8 @@ class AHbI<bits<5> opcod1, bits<2> opcod2, bit op6, bit op4, dag oops, dag iops,
   let Inst{11-8}  = 0b1001;   // Half precision
   let Inst{6}     = op6;
   let Inst{4}     = op4;
+
+  let isUnpredicable = 1; // FP16 instructions cannot in general be conditional
 }
 
 // Half precision, binary, not predicated
@@ -1985,6 +1993,8 @@ class AHbInp<bits<5> opcod1, bits<2> opcod2, bit opcod3, dag oops, dag iops,
   let Inst{11-8}  = 0b1001;   // Half precision
   let Inst{6}     = opcod3;
   let Inst{4}     = 0;
+
+  let isUnpredicable = 1; // FP16 instructions cannot in general be conditional
 }
 
 // VFP conversion instructions
@@ -2577,6 +2587,37 @@ class N3VLaneCP8<bit op23, bits<2> op21_20, bit op6, bit op4,
   // Bit 5 set by sub-classes
   let Inst{4}     = op4;
   let Inst{3-0}   = Vm{3-0};
+}
+
+// In Armv8.2-A, some NEON instructions are added that encode Vn and Vm
+// differently:
+//    if Q == ‘1’ then UInt(N:Vn) else UInt(Vn:N);
+//    if Q == ‘1’ then UInt(M:Vm) else UInt(Vm:M);
+// Class N3VCP8 above describes the Q=1 case, and this class the Q=0 case.
+class N3VCP8Q0<bits<2> op24_23, bits<2> op21_20, bit op6, bit op4,
+             dag oops, dag iops, InstrItinClass itin,
+             string opc, string dt, string asm, string cstr, list<dag> pattern>
+  : NeonInp<oops, iops, AddrModeNone, IndexModeNone, N3RegCplxFrm, itin, opc, dt, asm, cstr, pattern> {
+  bits<5> Vd;
+  bits<5> Vn;
+  bits<5> Vm;
+
+  let DecoderNamespace = "VFPV8";
+  // These have the same encodings in ARM and Thumb2
+  let PostEncoderMethod = "";
+
+  let Inst{31-25} = 0b1111110;
+  let Inst{24-23} = op24_23;
+  let Inst{22}    = Vd{4};
+  let Inst{21-20} = op21_20;
+  let Inst{19-16} = Vn{4-1};
+  let Inst{15-12} = Vd{3-0};
+  let Inst{11-8}  = 0b1000;
+  let Inst{7}     = Vn{0};
+  let Inst{6}     = op6;
+  let Inst{5}     = Vm{0};
+  let Inst{4}     = op4;
+  let Inst{3-0}   = Vm{4-1};
 }
 
 // Operand types for complex instructions

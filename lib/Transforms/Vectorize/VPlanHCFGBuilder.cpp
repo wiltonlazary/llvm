@@ -1,9 +1,8 @@
 //===-- VPlanHCFGBuilder.cpp ----------------------------------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 ///
@@ -64,7 +63,9 @@ private:
   void setVPBBPredsFromBB(VPBasicBlock *VPBB, BasicBlock *BB);
   void fixPhiNodes();
   VPBasicBlock *getOrCreateVPBB(BasicBlock *BB);
+#ifndef NDEBUG
   bool isExternalDef(Value *Val);
+#endif
   VPValue *getOrCreateVPOperand(Value *IRVal);
   void createVPInstructionsForVPBB(VPBasicBlock *VPBB, BasicBlock *BB);
 
@@ -119,6 +120,7 @@ VPBasicBlock *PlainCFGBuilder::getOrCreateVPBB(BasicBlock *BB) {
   return VPBB;
 }
 
+#ifndef NDEBUG
 // Return true if \p Val is considered an external definition. An external
 // definition is either:
 // 1. A Value that is not an Instruction. This will be refined in the future.
@@ -154,6 +156,7 @@ bool PlainCFGBuilder::isExternalDef(Value *Val) {
   // Check whether Instruction definition is in loop body.
   return !TheLoop->contains(Inst);
 }
+#endif
 
 // Create a new VPValue or retrieve an existing one for the Instruction's
 // operand \p IRVal. This function must only be used to create/retrieve VPValues
@@ -268,7 +271,7 @@ VPRegionBlock *PlainCFGBuilder::buildPlainCFG() {
     // Set VPBB successors. We create empty VPBBs for successors if they don't
     // exist already. Recipes will be created when the successor is visited
     // during the RPO traversal.
-    TerminatorInst *TI = BB->getTerminator();
+    Instruction *TI = BB->getTerminator();
     assert(TI && "Terminator expected.");
     unsigned NumSuccs = TI->getNumSuccessors();
 
@@ -324,13 +327,28 @@ VPRegionBlock *PlainCFGBuilder::buildPlainCFG() {
   return TopRegion;
 }
 
-// Public interface to build a H-CFG.
-void VPlanHCFGBuilder::buildHierarchicalCFG(VPlan &Plan) {
-  // Build Top Region enclosing the plain CFG and set it as VPlan entry.
+VPRegionBlock *VPlanHCFGBuilder::buildPlainCFG() {
   PlainCFGBuilder PCFGBuilder(TheLoop, LI, Plan);
-  VPRegionBlock *TopRegion = PCFGBuilder.buildPlainCFG();
+  return PCFGBuilder.buildPlainCFG();
+}
+
+// Public interface to build a H-CFG.
+void VPlanHCFGBuilder::buildHierarchicalCFG() {
+  // Build Top Region enclosing the plain CFG and set it as VPlan entry.
+  VPRegionBlock *TopRegion = buildPlainCFG();
   Plan.setEntry(TopRegion);
   LLVM_DEBUG(Plan.setName("HCFGBuilder: Plain CFG\n"); dbgs() << Plan);
 
   Verifier.verifyHierarchicalCFG(TopRegion);
+
+  // Compute plain CFG dom tree for VPLInfo.
+  VPDomTree.recalculate(*TopRegion);
+  LLVM_DEBUG(dbgs() << "Dominator Tree after building the plain CFG.\n";
+             VPDomTree.print(dbgs()));
+
+  // Compute VPLInfo and keep it in Plan.
+  VPLoopInfo &VPLInfo = Plan.getVPLoopInfo();
+  VPLInfo.analyze(VPDomTree);
+  LLVM_DEBUG(dbgs() << "VPLoop Info After buildPlainCFG:\n";
+             VPLInfo.print(dbgs()));
 }

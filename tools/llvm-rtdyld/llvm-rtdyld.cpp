@@ -1,9 +1,8 @@
 //===-- llvm-rtdyld.cpp - MCJIT Testing Tool ------------------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -88,25 +87,30 @@ CheckFiles("check",
            cl::desc("File containing RuntimeDyld verifier checks."),
            cl::ZeroOrMore);
 
-static cl::opt<uint64_t>
+// Tracking BUG: 19665
+// http://llvm.org/bugs/show_bug.cgi?id=19665
+//
+// Do not change these options to cl::opt<uint64_t> since this silently breaks
+// argument parsing.
+static cl::opt<unsigned long long>
 PreallocMemory("preallocate",
               cl::desc("Allocate memory upfront rather than on-demand"),
               cl::init(0));
 
-static cl::opt<uint64_t>
+static cl::opt<unsigned long long>
 TargetAddrStart("target-addr-start",
                 cl::desc("For -verify only: start of phony target address "
                          "range."),
                 cl::init(4096), // Start at "page 1" - no allocating at "null".
                 cl::Hidden);
 
-static cl::opt<uint64_t>
+static cl::opt<unsigned long long>
 TargetAddrEnd("target-addr-end",
               cl::desc("For -verify only: end of phony target address range."),
               cl::init(~0ULL),
               cl::Hidden);
 
-static cl::opt<uint64_t>
+static cl::opt<unsigned long long>
 TargetSectionSep("target-section-sep",
                  cl::desc("For -verify only: Separation between sections in "
                           "phony target address space."),
@@ -304,7 +308,7 @@ static int printLineInfoForInput(bool LoadObjects, bool UseDebugObj) {
     if (!MaybeObj) {
       std::string Buf;
       raw_string_ostream OS(Buf);
-      logAllUnhandledErrors(MaybeObj.takeError(), OS, "");
+      logAllUnhandledErrors(MaybeObj.takeError(), OS);
       OS.flush();
       ErrorAndExit("unable to create object file: '" + Buf + "'");
     }
@@ -363,6 +367,8 @@ static int printLineInfoForInput(bool LoadObjects, bool UseDebugObj) {
         }
         uint64_t Addr = *AddrOrErr;
 
+        object::SectionedAddress Address;
+
         uint64_t Size = P.second;
         // If we're not using the debug object, compute the address of the
         // symbol in memory (rather than that in the unrelocated object file)
@@ -377,16 +383,20 @@ static int printLineInfoForInput(bool LoadObjects, bool UseDebugObj) {
           object::section_iterator Sec = *SecOrErr;
           StringRef SecName;
           Sec->getName(SecName);
+          Address.SectionIndex = Sec->getIndex();
           uint64_t SectionLoadAddress =
             LoadedObjInfo->getSectionLoadAddress(*Sec);
           if (SectionLoadAddress != 0)
             Addr += SectionLoadAddress - Sec->getAddress();
-        }
+        } else if (auto SecOrErr = Sym.getSection())
+          Address.SectionIndex = SecOrErr.get()->getIndex();
 
         outs() << "Function: " << *Name << ", Size = " << Size
                << ", Addr = " << Addr << "\n";
 
-        DILineInfoTable Lines = Context->getLineInfoForAddressRange(Addr, Size);
+        Address.Address = Addr;
+        DILineInfoTable Lines =
+            Context->getLineInfoForAddressRange(Address, Size);
         for (auto &D : Lines) {
           outs() << "  Line info @ " << D.first - Addr << ": "
                  << D.second.FileName << ", line:" << D.second.Line << "\n";
@@ -433,7 +443,7 @@ static int executeInput() {
     if (!MaybeObj) {
       std::string Buf;
       raw_string_ostream OS(Buf);
-      logAllUnhandledErrors(MaybeObj.takeError(), OS, "");
+      logAllUnhandledErrors(MaybeObj.takeError(), OS);
       OS.flush();
       ErrorAndExit("unable to create object file: '" + Buf + "'");
     }
@@ -577,7 +587,11 @@ static void remapSectionsAndSymbols(const llvm::Triple &TargetTriple,
     if (LoadAddr &&
         *LoadAddr != static_cast<uint64_t>(
                        reinterpret_cast<uintptr_t>(Tmp->first))) {
-      AlreadyAllocated[*LoadAddr] = Tmp->second;
+      // A section will have a LoadAddr of 0 if it wasn't loaded for whatever
+      // reason (e.g. zero byte COFF sections). Don't include those sections in
+      // the allocation map.
+      if (*LoadAddr != 0)
+        AlreadyAllocated[*LoadAddr] = Tmp->second;
       Worklist.erase(Tmp);
     }
   }
@@ -701,7 +715,7 @@ static int linkAndVerify() {
     if (!MaybeObj) {
       std::string Buf;
       raw_string_ostream OS(Buf);
-      logAllUnhandledErrors(MaybeObj.takeError(), OS, "");
+      logAllUnhandledErrors(MaybeObj.takeError(), OS);
       OS.flush();
       ErrorAndExit("unable to create object file: '" + Buf + "'");
     }

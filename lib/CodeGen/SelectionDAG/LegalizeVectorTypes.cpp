@@ -1,9 +1,8 @@
 //===------- LegalizeVectorTypes.cpp - Legalization of vector types -------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -113,12 +112,19 @@ void DAGTypeLegalizer::ScalarizeVectorResult(SDNode *N, unsigned ResNo) {
   case ISD::FMUL:
   case ISD::FMINNUM:
   case ISD::FMAXNUM:
-  case ISD::FMINNAN:
-  case ISD::FMAXNAN:
+  case ISD::FMINNUM_IEEE:
+  case ISD::FMAXNUM_IEEE:
+  case ISD::FMINIMUM:
+  case ISD::FMAXIMUM:
   case ISD::SMIN:
   case ISD::SMAX:
   case ISD::UMIN:
   case ISD::UMAX:
+
+  case ISD::SADDSAT:
+  case ISD::UADDSAT:
+  case ISD::SSUBSAT:
+  case ISD::USUBSAT:
 
   case ISD::FPOW:
   case ISD::FREM:
@@ -138,6 +144,44 @@ void DAGTypeLegalizer::ScalarizeVectorResult(SDNode *N, unsigned ResNo) {
     break;
   case ISD::FMA:
     R = ScalarizeVecRes_TernaryOp(N);
+    break;
+  case ISD::STRICT_FADD:
+  case ISD::STRICT_FSUB:
+  case ISD::STRICT_FMUL:
+  case ISD::STRICT_FDIV:
+  case ISD::STRICT_FREM:
+  case ISD::STRICT_FSQRT:
+  case ISD::STRICT_FMA:
+  case ISD::STRICT_FPOW:
+  case ISD::STRICT_FPOWI:
+  case ISD::STRICT_FSIN:
+  case ISD::STRICT_FCOS:
+  case ISD::STRICT_FEXP:
+  case ISD::STRICT_FEXP2:
+  case ISD::STRICT_FLOG:
+  case ISD::STRICT_FLOG10:
+  case ISD::STRICT_FLOG2:
+  case ISD::STRICT_FRINT:
+  case ISD::STRICT_FNEARBYINT:
+  case ISD::STRICT_FMAXNUM:
+  case ISD::STRICT_FMINNUM:
+  case ISD::STRICT_FCEIL:
+  case ISD::STRICT_FFLOOR:
+  case ISD::STRICT_FROUND:
+  case ISD::STRICT_FTRUNC:
+    R = ScalarizeVecRes_StrictFPOp(N);
+    break;
+  case ISD::UADDO:
+  case ISD::SADDO:
+  case ISD::USUBO:
+  case ISD::SSUBO:
+  case ISD::UMULO:
+  case ISD::SMULO:
+    R = ScalarizeVecRes_OverflowOp(N, ResNo);
+    break;
+  case ISD::SMULFIX:
+  case ISD::UMULFIX:
+    R = ScalarizeVecRes_MULFIX(N);
     break;
   }
 
@@ -159,6 +203,81 @@ SDValue DAGTypeLegalizer::ScalarizeVecRes_TernaryOp(SDNode *N) {
   SDValue Op2 = GetScalarizedVector(N->getOperand(2));
   return DAG.getNode(N->getOpcode(), SDLoc(N),
                      Op0.getValueType(), Op0, Op1, Op2);
+}
+
+SDValue DAGTypeLegalizer::ScalarizeVecRes_MULFIX(SDNode *N) {
+  SDValue Op0 = GetScalarizedVector(N->getOperand(0));
+  SDValue Op1 = GetScalarizedVector(N->getOperand(1));
+  SDValue Op2 = N->getOperand(2);
+  return DAG.getNode(N->getOpcode(), SDLoc(N), Op0.getValueType(), Op0, Op1,
+                     Op2);
+}
+
+SDValue DAGTypeLegalizer::ScalarizeVecRes_StrictFPOp(SDNode *N) {
+  EVT VT = N->getValueType(0).getVectorElementType();
+  unsigned NumOpers = N->getNumOperands();
+  SDValue Chain = N->getOperand(0);
+  EVT ValueVTs[] = {VT, MVT::Other};
+  SDLoc dl(N);
+
+  SmallVector<SDValue, 4> Opers;
+
+  // The Chain is the first operand.
+  Opers.push_back(Chain);
+
+  // Now process the remaining operands.
+  for (unsigned i = 1; i < NumOpers; ++i) {
+    SDValue Oper = N->getOperand(i);
+
+    if (Oper.getValueType().isVector())
+      Oper = GetScalarizedVector(Oper);
+
+    Opers.push_back(Oper);
+  }
+
+  SDValue Result = DAG.getNode(N->getOpcode(), dl, ValueVTs, Opers);
+
+  // Legalize the chain result - switch anything that used the old chain to
+  // use the new one.
+  ReplaceValueWith(SDValue(N, 1), Result.getValue(1));
+  return Result;
+}
+
+SDValue DAGTypeLegalizer::ScalarizeVecRes_OverflowOp(SDNode *N,
+                                                     unsigned ResNo) {
+  SDLoc DL(N);
+  EVT ResVT = N->getValueType(0);
+  EVT OvVT = N->getValueType(1);
+
+  SDValue ScalarLHS, ScalarRHS;
+  if (getTypeAction(ResVT) == TargetLowering::TypeScalarizeVector) {
+    ScalarLHS = GetScalarizedVector(N->getOperand(0));
+    ScalarRHS = GetScalarizedVector(N->getOperand(1));
+  } else {
+    SmallVector<SDValue, 1> ElemsLHS, ElemsRHS;
+    DAG.ExtractVectorElements(N->getOperand(0), ElemsLHS);
+    DAG.ExtractVectorElements(N->getOperand(1), ElemsRHS);
+    ScalarLHS = ElemsLHS[0];
+    ScalarRHS = ElemsRHS[0];
+  }
+
+  SDVTList ScalarVTs = DAG.getVTList(
+      ResVT.getVectorElementType(), OvVT.getVectorElementType());
+  SDNode *ScalarNode = DAG.getNode(
+      N->getOpcode(), DL, ScalarVTs, ScalarLHS, ScalarRHS).getNode();
+
+  // Replace the other vector result not being explicitly scalarized here.
+  unsigned OtherNo = 1 - ResNo;
+  EVT OtherVT = N->getValueType(OtherNo);
+  if (getTypeAction(OtherVT) == TargetLowering::TypeScalarizeVector) {
+    SetScalarizedVector(SDValue(N, OtherNo), SDValue(ScalarNode, OtherNo));
+  } else {
+    SDValue OtherVal = DAG.getNode(
+        ISD::SCALAR_TO_VECTOR, DL, OtherVT, SDValue(ScalarNode, OtherNo));
+    ReplaceValueWith(SDValue(N, OtherNo), OtherVal);
+  }
+
+  return SDValue(ScalarNode, ResNo);
 }
 
 SDValue DAGTypeLegalizer::ScalarizeVecRes_MERGE_VALUES(SDNode *N,
@@ -487,6 +606,21 @@ bool DAGTypeLegalizer::ScalarizeVectorOperand(SDNode *N, unsigned OpNo) {
     case ISD::FP_ROUND:
       Res = ScalarizeVecOp_FP_ROUND(N, OpNo);
       break;
+    case ISD::VECREDUCE_FADD:
+    case ISD::VECREDUCE_FMUL:
+    case ISD::VECREDUCE_ADD:
+    case ISD::VECREDUCE_MUL:
+    case ISD::VECREDUCE_AND:
+    case ISD::VECREDUCE_OR:
+    case ISD::VECREDUCE_XOR:
+    case ISD::VECREDUCE_SMAX:
+    case ISD::VECREDUCE_SMIN:
+    case ISD::VECREDUCE_UMAX:
+    case ISD::VECREDUCE_UMIN:
+    case ISD::VECREDUCE_FMAX:
+    case ISD::VECREDUCE_FMIN:
+      Res = ScalarizeVecOp_VECREDUCE(N);
+      break;
     }
   }
 
@@ -617,6 +751,14 @@ SDValue DAGTypeLegalizer::ScalarizeVecOp_FP_ROUND(SDNode *N, unsigned OpNo) {
   return DAG.getNode(ISD::SCALAR_TO_VECTOR, SDLoc(N), N->getValueType(0), Res);
 }
 
+SDValue DAGTypeLegalizer::ScalarizeVecOp_VECREDUCE(SDNode *N) {
+  SDValue Res = GetScalarizedVector(N->getOperand(0));
+  // Result type may be wider than element type.
+  if (Res.getValueType() != N->getValueType(0))
+    Res = DAG.getNode(ISD::ANY_EXTEND, SDLoc(N), N->getValueType(0), Res);
+  return Res;
+}
+
 //===----------------------------------------------------------------------===//
 //  Result Vector Splitting
 //===----------------------------------------------------------------------===//
@@ -731,8 +873,8 @@ void DAGTypeLegalizer::SplitVectorResult(SDNode *N, unsigned ResNo) {
   case ISD::FMUL:
   case ISD::FMINNUM:
   case ISD::FMAXNUM:
-  case ISD::FMINNAN:
-  case ISD::FMAXNAN:
+  case ISD::FMINIMUM:
+  case ISD::FMAXIMUM:
   case ISD::SDIV:
   case ISD::UDIV:
   case ISD::FDIV:
@@ -750,10 +892,52 @@ void DAGTypeLegalizer::SplitVectorResult(SDNode *N, unsigned ResNo) {
   case ISD::SMAX:
   case ISD::UMIN:
   case ISD::UMAX:
+  case ISD::SADDSAT:
+  case ISD::UADDSAT:
+  case ISD::SSUBSAT:
+  case ISD::USUBSAT:
     SplitVecRes_BinOp(N, Lo, Hi);
     break;
   case ISD::FMA:
     SplitVecRes_TernaryOp(N, Lo, Hi);
+    break;
+  case ISD::STRICT_FADD:
+  case ISD::STRICT_FSUB:
+  case ISD::STRICT_FMUL:
+  case ISD::STRICT_FDIV:
+  case ISD::STRICT_FREM:
+  case ISD::STRICT_FSQRT:
+  case ISD::STRICT_FMA:
+  case ISD::STRICT_FPOW:
+  case ISD::STRICT_FPOWI:
+  case ISD::STRICT_FSIN:
+  case ISD::STRICT_FCOS:
+  case ISD::STRICT_FEXP:
+  case ISD::STRICT_FEXP2:
+  case ISD::STRICT_FLOG:
+  case ISD::STRICT_FLOG10:
+  case ISD::STRICT_FLOG2:
+  case ISD::STRICT_FRINT:
+  case ISD::STRICT_FNEARBYINT:
+  case ISD::STRICT_FMAXNUM:
+  case ISD::STRICT_FMINNUM:
+  case ISD::STRICT_FCEIL:
+  case ISD::STRICT_FFLOOR:
+  case ISD::STRICT_FROUND:
+  case ISD::STRICT_FTRUNC:
+    SplitVecRes_StrictFPOp(N, Lo, Hi);
+    break;
+  case ISD::UADDO:
+  case ISD::SADDO:
+  case ISD::USUBO:
+  case ISD::SSUBO:
+  case ISD::UMULO:
+  case ISD::SMULO:
+    SplitVecRes_OverflowOp(N, ResNo, Lo, Hi);
+    break;
+  case ISD::SMULFIX:
+  case ISD::UMULFIX:
+    SplitVecRes_MULFIX(N, Lo, Hi);
     break;
   }
 
@@ -790,6 +974,19 @@ void DAGTypeLegalizer::SplitVecRes_TernaryOp(SDNode *N, SDValue &Lo,
                    Op0Lo, Op1Lo, Op2Lo);
   Hi = DAG.getNode(N->getOpcode(), dl, Op0Hi.getValueType(),
                    Op0Hi, Op1Hi, Op2Hi);
+}
+
+void DAGTypeLegalizer::SplitVecRes_MULFIX(SDNode *N, SDValue &Lo, SDValue &Hi) {
+  SDValue LHSLo, LHSHi;
+  GetSplitVector(N->getOperand(0), LHSLo, LHSHi);
+  SDValue RHSLo, RHSHi;
+  GetSplitVector(N->getOperand(1), RHSLo, RHSHi);
+  SDLoc dl(N);
+  SDValue Op2 = N->getOperand(2);
+
+  unsigned Opcode = N->getOpcode();
+  Lo = DAG.getNode(Opcode, dl, LHSLo.getValueType(), LHSLo, RHSLo, Op2);
+  Hi = DAG.getNode(Opcode, dl, LHSHi.getValueType(), LHSHi, RHSHi, Op2);
 }
 
 void DAGTypeLegalizer::SplitVecRes_BITCAST(SDNode *N, SDValue &Lo,
@@ -1034,6 +1231,97 @@ void DAGTypeLegalizer::SplitVecRes_ExtVecInRegOp(SDNode *N, SDValue &Lo,
   Hi = DAG.getNode(Opcode, dl, OutHiVT, InHi);
 }
 
+void DAGTypeLegalizer::SplitVecRes_StrictFPOp(SDNode *N, SDValue &Lo,
+                                              SDValue &Hi) {
+  unsigned NumOps = N->getNumOperands();
+  SDValue Chain = N->getOperand(0);
+  EVT LoVT, HiVT;
+  SDLoc dl(N);
+  std::tie(LoVT, HiVT) = DAG.GetSplitDestVTs(N->getValueType(0));
+
+  SmallVector<SDValue, 4> OpsLo;
+  SmallVector<SDValue, 4> OpsHi;
+
+  // The Chain is the first operand.
+  OpsLo.push_back(Chain);
+  OpsHi.push_back(Chain);
+
+  // Now process the remaining operands.
+  for (unsigned i = 1; i < NumOps; ++i) {
+    SDValue Op = N->getOperand(i);
+    SDValue OpLo = Op;
+    SDValue OpHi = Op;
+
+    EVT InVT = Op.getValueType();
+    if (InVT.isVector()) {
+      // If the input also splits, handle it directly for a
+      // compile time speedup. Otherwise split it by hand.
+      if (getTypeAction(InVT) == TargetLowering::TypeSplitVector)
+        GetSplitVector(Op, OpLo, OpHi);
+      else
+        std::tie(OpLo, OpHi) = DAG.SplitVectorOperand(N, i);
+    }
+
+    OpsLo.push_back(OpLo);
+    OpsHi.push_back(OpHi);
+  }
+
+  EVT LoValueVTs[] = {LoVT, MVT::Other};
+  EVT HiValueVTs[] = {HiVT, MVT::Other};
+  Lo = DAG.getNode(N->getOpcode(), dl, LoValueVTs, OpsLo);
+  Hi = DAG.getNode(N->getOpcode(), dl, HiValueVTs, OpsHi);
+
+  // Build a factor node to remember that this Op is independent of the
+  // other one.
+  Chain = DAG.getNode(ISD::TokenFactor, dl, MVT::Other,
+                      Lo.getValue(1), Hi.getValue(1));
+
+  // Legalize the chain result - switch anything that used the old chain to
+  // use the new one.
+  ReplaceValueWith(SDValue(N, 1), Chain);
+}
+
+void DAGTypeLegalizer::SplitVecRes_OverflowOp(SDNode *N, unsigned ResNo,
+                                              SDValue &Lo, SDValue &Hi) {
+  SDLoc dl(N);
+  EVT ResVT = N->getValueType(0);
+  EVT OvVT = N->getValueType(1);
+  EVT LoResVT, HiResVT, LoOvVT, HiOvVT;
+  std::tie(LoResVT, HiResVT) = DAG.GetSplitDestVTs(ResVT);
+  std::tie(LoOvVT, HiOvVT) = DAG.GetSplitDestVTs(OvVT);
+
+  SDValue LoLHS, HiLHS, LoRHS, HiRHS;
+  if (getTypeAction(ResVT) == TargetLowering::TypeSplitVector) {
+    GetSplitVector(N->getOperand(0), LoLHS, HiLHS);
+    GetSplitVector(N->getOperand(1), LoRHS, HiRHS);
+  } else {
+    std::tie(LoLHS, HiLHS) = DAG.SplitVectorOperand(N, 0);
+    std::tie(LoRHS, HiRHS) = DAG.SplitVectorOperand(N, 1);
+  }
+
+  unsigned Opcode = N->getOpcode();
+  SDVTList LoVTs = DAG.getVTList(LoResVT, LoOvVT);
+  SDVTList HiVTs = DAG.getVTList(HiResVT, HiOvVT);
+  SDNode *LoNode = DAG.getNode(Opcode, dl, LoVTs, LoLHS, LoRHS).getNode();
+  SDNode *HiNode = DAG.getNode(Opcode, dl, HiVTs, HiLHS, HiRHS).getNode();
+
+  Lo = SDValue(LoNode, ResNo);
+  Hi = SDValue(HiNode, ResNo);
+
+  // Replace the other vector result not being explicitly split here.
+  unsigned OtherNo = 1 - ResNo;
+  EVT OtherVT = N->getValueType(OtherNo);
+  if (getTypeAction(OtherVT) == TargetLowering::TypeSplitVector) {
+    SetSplitVector(SDValue(N, OtherNo),
+                   SDValue(LoNode, OtherNo), SDValue(HiNode, OtherNo));
+  } else {
+    SDValue OtherVal = DAG.getNode(
+        ISD::CONCAT_VECTORS, dl, OtherVT,
+        SDValue(LoNode, OtherNo), SDValue(HiNode, OtherNo));
+    ReplaceValueWith(SDValue(N, OtherNo), OtherVal);
+  }
+}
+
 void DAGTypeLegalizer::SplitVecRes_INSERT_VECTOR_ELT(SDNode *N, SDValue &Lo,
                                                      SDValue &Hi) {
   SDValue Vec = N->getOperand(0);
@@ -1169,7 +1457,7 @@ void DAGTypeLegalizer::SplitVecRes_MLOAD(MaskedLoadSDNode *MLD,
   SDValue Ch = MLD->getChain();
   SDValue Ptr = MLD->getBasePtr();
   SDValue Mask = MLD->getMask();
-  SDValue Src0 = MLD->getSrc0();
+  SDValue PassThru = MLD->getPassThru();
   unsigned Alignment = MLD->getOriginalAlignment();
   ISD::LoadExtType ExtType = MLD->getExtensionType();
 
@@ -1190,18 +1478,18 @@ void DAGTypeLegalizer::SplitVecRes_MLOAD(MaskedLoadSDNode *MLD,
   EVT LoMemVT, HiMemVT;
   std::tie(LoMemVT, HiMemVT) = DAG.GetSplitDestVTs(MemoryVT);
 
-  SDValue Src0Lo, Src0Hi;
-  if (getTypeAction(Src0.getValueType()) == TargetLowering::TypeSplitVector)
-    GetSplitVector(Src0, Src0Lo, Src0Hi);
+  SDValue PassThruLo, PassThruHi;
+  if (getTypeAction(PassThru.getValueType()) == TargetLowering::TypeSplitVector)
+    GetSplitVector(PassThru, PassThruLo, PassThruHi);
   else
-    std::tie(Src0Lo, Src0Hi) = DAG.SplitVector(Src0, dl);
+    std::tie(PassThruLo, PassThruHi) = DAG.SplitVector(PassThru, dl);
 
   MachineMemOperand *MMO = DAG.getMachineFunction().
     getMachineMemOperand(MLD->getPointerInfo(),
                          MachineMemOperand::MOLoad,  LoMemVT.getStoreSize(),
                          Alignment, MLD->getAAInfo(), MLD->getRanges());
 
-  Lo = DAG.getMaskedLoad(LoVT, dl, Ch, Ptr, MaskLo, Src0Lo, LoMemVT, MMO,
+  Lo = DAG.getMaskedLoad(LoVT, dl, Ch, Ptr, MaskLo, PassThruLo, LoMemVT, MMO,
                          ExtType, MLD->isExpandingLoad());
 
   Ptr = TLI.IncrementMemoryAddress(Ptr, MaskLo, dl, LoMemVT, DAG,
@@ -1213,7 +1501,7 @@ void DAGTypeLegalizer::SplitVecRes_MLOAD(MaskedLoadSDNode *MLD,
       HiMemVT.getStoreSize(), SecondHalfAlignment, MLD->getAAInfo(),
       MLD->getRanges());
 
-  Hi = DAG.getMaskedLoad(HiVT, dl, Ch, Ptr, MaskHi, Src0Hi, HiMemVT, MMO,
+  Hi = DAG.getMaskedLoad(HiVT, dl, Ch, Ptr, MaskHi, PassThruHi, HiMemVT, MMO,
                          ExtType, MLD->isExpandingLoad());
 
   // Build a factor node to remember that this load is independent of the
@@ -1236,7 +1524,7 @@ void DAGTypeLegalizer::SplitVecRes_MGATHER(MaskedGatherSDNode *MGT,
   SDValue Ch = MGT->getChain();
   SDValue Ptr = MGT->getBasePtr();
   SDValue Mask = MGT->getMask();
-  SDValue Src0 = MGT->getValue();
+  SDValue PassThru = MGT->getPassThru();
   SDValue Index = MGT->getIndex();
   SDValue Scale = MGT->getScale();
   unsigned Alignment = MGT->getOriginalAlignment();
@@ -1253,11 +1541,11 @@ void DAGTypeLegalizer::SplitVecRes_MGATHER(MaskedGatherSDNode *MGT,
   // Split MemoryVT
   std::tie(LoMemVT, HiMemVT) = DAG.GetSplitDestVTs(MemoryVT);
 
-  SDValue Src0Lo, Src0Hi;
-  if (getTypeAction(Src0.getValueType()) == TargetLowering::TypeSplitVector)
-    GetSplitVector(Src0, Src0Lo, Src0Hi);
+  SDValue PassThruLo, PassThruHi;
+  if (getTypeAction(PassThru.getValueType()) == TargetLowering::TypeSplitVector)
+    GetSplitVector(PassThru, PassThruLo, PassThruHi);
   else
-    std::tie(Src0Lo, Src0Hi) = DAG.SplitVector(Src0, dl);
+    std::tie(PassThruLo, PassThruHi) = DAG.SplitVector(PassThru, dl);
 
   SDValue IndexHi, IndexLo;
   if (getTypeAction(Index.getValueType()) == TargetLowering::TypeSplitVector)
@@ -1270,11 +1558,11 @@ void DAGTypeLegalizer::SplitVecRes_MGATHER(MaskedGatherSDNode *MGT,
                          MachineMemOperand::MOLoad,  LoMemVT.getStoreSize(),
                          Alignment, MGT->getAAInfo(), MGT->getRanges());
 
-  SDValue OpsLo[] = {Ch, Src0Lo, MaskLo, Ptr, IndexLo, Scale};
+  SDValue OpsLo[] = {Ch, PassThruLo, MaskLo, Ptr, IndexLo, Scale};
   Lo = DAG.getMaskedGather(DAG.getVTList(LoVT, MVT::Other), LoVT, dl, OpsLo,
                            MMO);
 
-  SDValue OpsHi[] = {Ch, Src0Hi, MaskHi, Ptr, IndexHi, Scale};
+  SDValue OpsHi[] = {Ch, PassThruHi, MaskHi, Ptr, IndexHi, Scale};
   Hi = DAG.getMaskedGather(DAG.getVTList(HiVT, MVT::Other), HiVT, dl, OpsHi,
                            MMO);
 
@@ -1551,13 +1839,6 @@ bool DAGTypeLegalizer::SplitVectorOperand(SDNode *N, unsigned OpNo) {
     case ISD::VSELECT:
       Res = SplitVecOp_VSELECT(N, OpNo);
       break;
-    case ISD::FP_TO_SINT:
-    case ISD::FP_TO_UINT:
-      if (N->getValueType(0).bitsLT(N->getOperand(0).getValueType()))
-        Res = SplitVecOp_TruncateHelper(N);
-      else
-        Res = SplitVecOp_UnaryOp(N);
-      break;
     case ISD::SINT_TO_FP:
     case ISD::UINT_TO_FP:
       if (N->getValueType(0).bitsLT(N->getOperand(0).getValueType()))
@@ -1565,6 +1846,8 @@ bool DAGTypeLegalizer::SplitVectorOperand(SDNode *N, unsigned OpNo) {
       else
         Res = SplitVecOp_UnaryOp(N);
       break;
+    case ISD::FP_TO_SINT:
+    case ISD::FP_TO_UINT:
     case ISD::CTTZ:
     case ISD::CTLZ:
     case ISD::CTPOP:
@@ -1677,10 +1960,10 @@ SDValue DAGTypeLegalizer::SplitVecOp_VECREDUCE(SDNode *N, unsigned OpNo) {
   case ISD::VECREDUCE_UMAX: CombineOpc = ISD::UMAX; break;
   case ISD::VECREDUCE_UMIN: CombineOpc = ISD::UMIN; break;
   case ISD::VECREDUCE_FMAX:
-    CombineOpc = NoNaN ? ISD::FMAXNUM : ISD::FMAXNAN;
+    CombineOpc = NoNaN ? ISD::FMAXNUM : ISD::FMAXIMUM;
     break;
   case ISD::VECREDUCE_FMIN:
-    CombineOpc = NoNaN ? ISD::FMINNUM : ISD::FMINNAN;
+    CombineOpc = NoNaN ? ISD::FMINNUM : ISD::FMINIMUM;
     break;
   default:
     llvm_unreachable("Unexpected reduce ISD node");
@@ -1754,7 +2037,6 @@ SDValue DAGTypeLegalizer::SplitVecOp_EXTRACT_VECTOR_ELT(SDNode *N) {
 
   if (isa<ConstantSDNode>(Idx)) {
     uint64_t IdxVal = cast<ConstantSDNode>(Idx)->getZExtValue();
-    assert(IdxVal < VecVT.getVectorNumElements() && "Invalid vector index!");
 
     SDValue Lo, Hi;
     GetSplitVector(Vec, Lo, Hi);
@@ -1791,6 +2073,15 @@ SDValue DAGTypeLegalizer::SplitVecOp_EXTRACT_VECTOR_ELT(SDNode *N) {
 
   // Load back the required element.
   StackPtr = TLI.getVectorElementPointer(DAG, StackPtr, VecVT, Idx);
+
+  // FIXME: This is to handle i1 vectors with elements promoted to i8.
+  // i1 vector handling needs general improvement.
+  if (N->getValueType(0).bitsLT(EltVT)) {
+    SDValue Load = DAG.getLoad(EltVT, dl, Store, StackPtr,
+      MachinePointerInfo::getUnknownStack(DAG.getMachineFunction()));
+    return DAG.getZExtOrTrunc(Load, dl, N->getValueType(0));
+  }
+
   return DAG.getExtLoad(
       ISD::EXTLOAD, dl, N->getValueType(0), Store, StackPtr,
       MachinePointerInfo::getUnknownStack(DAG.getMachineFunction()), EltVT);
@@ -1817,7 +2108,7 @@ SDValue DAGTypeLegalizer::SplitVecOp_MGATHER(MaskedGatherSDNode *MGT,
   SDValue Index = MGT->getIndex();
   SDValue Scale = MGT->getScale();
   SDValue Mask = MGT->getMask();
-  SDValue Src0 = MGT->getValue();
+  SDValue PassThru = MGT->getPassThru();
   unsigned Alignment = MGT->getOriginalAlignment();
 
   SDValue MaskLo, MaskHi;
@@ -1831,11 +2122,11 @@ SDValue DAGTypeLegalizer::SplitVecOp_MGATHER(MaskedGatherSDNode *MGT,
   EVT LoMemVT, HiMemVT;
   std::tie(LoMemVT, HiMemVT) = DAG.GetSplitDestVTs(MemoryVT);
 
-  SDValue Src0Lo, Src0Hi;
-  if (getTypeAction(Src0.getValueType()) == TargetLowering::TypeSplitVector)
-    GetSplitVector(Src0, Src0Lo, Src0Hi);
+  SDValue PassThruLo, PassThruHi;
+  if (getTypeAction(PassThru.getValueType()) == TargetLowering::TypeSplitVector)
+    GetSplitVector(PassThru, PassThruLo, PassThruHi);
   else
-    std::tie(Src0Lo, Src0Hi) = DAG.SplitVector(Src0, dl);
+    std::tie(PassThruLo, PassThruHi) = DAG.SplitVector(PassThru, dl);
 
   SDValue IndexHi, IndexLo;
   if (getTypeAction(Index.getValueType()) == TargetLowering::TypeSplitVector)
@@ -1848,7 +2139,7 @@ SDValue DAGTypeLegalizer::SplitVecOp_MGATHER(MaskedGatherSDNode *MGT,
                          MachineMemOperand::MOLoad,  LoMemVT.getStoreSize(),
                          Alignment, MGT->getAAInfo(), MGT->getRanges());
 
-  SDValue OpsLo[] = {Ch, Src0Lo, MaskLo, Ptr, IndexLo, Scale};
+  SDValue OpsLo[] = {Ch, PassThruLo, MaskLo, Ptr, IndexLo, Scale};
   SDValue Lo = DAG.getMaskedGather(DAG.getVTList(LoVT, MVT::Other), LoVT, dl,
                                    OpsLo, MMO);
 
@@ -1858,7 +2149,7 @@ SDValue DAGTypeLegalizer::SplitVecOp_MGATHER(MaskedGatherSDNode *MGT,
                          Alignment, MGT->getAAInfo(),
                          MGT->getRanges());
 
-  SDValue OpsHi[] = {Ch, Src0Hi, MaskHi, Ptr, IndexHi, Scale};
+  SDValue OpsHi[] = {Ch, PassThruHi, MaskHi, Ptr, IndexHi, Scale};
   SDValue Hi = DAG.getMaskedGather(DAG.getVTList(HiVT, MVT::Other), HiVT, dl,
                                    OpsHi, MMO);
 
@@ -2095,16 +2386,31 @@ SDValue DAGTypeLegalizer::SplitVecOp_TruncateHelper(SDNode *N) {
   unsigned InElementSize = InVT.getScalarSizeInBits();
   unsigned OutElementSize = OutVT.getScalarSizeInBits();
 
+  // Determine the split output VT. If its legal we can just split dirctly.
+  EVT LoOutVT, HiOutVT;
+  std::tie(LoOutVT, HiOutVT) = DAG.GetSplitDestVTs(OutVT);
+  assert(LoOutVT == HiOutVT && "Unequal split?");
+
   // If the input elements are only 1/2 the width of the result elements,
   // just use the normal splitting. Our trick only work if there's room
   // to split more than once.
-  if (InElementSize <= OutElementSize * 2)
+  if (isTypeLegal(LoOutVT) ||
+      InElementSize <= OutElementSize * 2)
     return SplitVecOp_UnaryOp(N);
   SDLoc DL(N);
+
+  // Don't touch if this will be scalarized.
+  EVT FinalVT = InVT;
+  while (getTypeAction(FinalVT) == TargetLowering::TypeSplitVector)
+    FinalVT = FinalVT.getHalfNumVectorElementsVT(*DAG.getContext());
+
+  if (getTypeAction(FinalVT) == TargetLowering::TypeScalarizeVector)
+    return SplitVecOp_UnaryOp(N);
 
   // Get the split input vector.
   SDValue InLoVec, InHiVec;
   GetSplitVector(InVec, InLoVec, InHiVec);
+
   // Truncate them to 1/2 the element size.
   EVT HalfElementVT = IsFloat ?
     EVT::getFloatingPointVT(InElementSize/2) :
@@ -2229,12 +2535,16 @@ void DAGTypeLegalizer::WidenVectorResult(SDNode *N, unsigned ResNo) {
   case ISD::XOR:
   case ISD::FMINNUM:
   case ISD::FMAXNUM:
-  case ISD::FMINNAN:
-  case ISD::FMAXNAN:
+  case ISD::FMINIMUM:
+  case ISD::FMAXIMUM:
   case ISD::SMIN:
   case ISD::SMAX:
   case ISD::UMIN:
   case ISD::UMAX:
+  case ISD::UADDSAT:
+  case ISD::SADDSAT:
+  case ISD::USUBSAT:
+  case ISD::SSUBSAT:
     Res = WidenVecRes_Binary(N);
     break;
 
@@ -2249,6 +2559,42 @@ void DAGTypeLegalizer::WidenVectorResult(SDNode *N, unsigned ResNo) {
   case ISD::SREM:
   case ISD::UREM:
     Res = WidenVecRes_BinaryCanTrap(N);
+    break;
+
+  case ISD::STRICT_FADD:
+  case ISD::STRICT_FSUB:
+  case ISD::STRICT_FMUL:
+  case ISD::STRICT_FDIV:
+  case ISD::STRICT_FREM:
+  case ISD::STRICT_FSQRT:
+  case ISD::STRICT_FMA:
+  case ISD::STRICT_FPOW:
+  case ISD::STRICT_FPOWI:
+  case ISD::STRICT_FSIN:
+  case ISD::STRICT_FCOS:
+  case ISD::STRICT_FEXP:
+  case ISD::STRICT_FEXP2:
+  case ISD::STRICT_FLOG:
+  case ISD::STRICT_FLOG10:
+  case ISD::STRICT_FLOG2:
+  case ISD::STRICT_FRINT:
+  case ISD::STRICT_FNEARBYINT:
+  case ISD::STRICT_FMAXNUM:
+  case ISD::STRICT_FMINNUM:
+  case ISD::STRICT_FCEIL:
+  case ISD::STRICT_FFLOOR:
+  case ISD::STRICT_FROUND:
+  case ISD::STRICT_FTRUNC:
+    Res = WidenVecRes_StrictFP(N);
+    break;
+
+  case ISD::UADDO:
+  case ISD::SADDO:
+  case ISD::USUBO:
+  case ISD::SSUBO:
+  case ISD::UMULO:
+  case ISD::SMULO:
+    Res = WidenVecRes_OverflowOp(N, ResNo);
     break;
 
   case ISD::FCOPYSIGN:
@@ -2284,11 +2630,6 @@ void DAGTypeLegalizer::WidenVectorResult(SDNode *N, unsigned ResNo) {
     Res = WidenVecRes_Convert(N);
     break;
 
-  case ISD::BITREVERSE:
-  case ISD::BSWAP:
-  case ISD::CTLZ:
-  case ISD::CTPOP:
-  case ISD::CTTZ:
   case ISD::FABS:
   case ISD::FCEIL:
   case ISD::FCOS:
@@ -2299,12 +2640,37 @@ void DAGTypeLegalizer::WidenVectorResult(SDNode *N, unsigned ResNo) {
   case ISD::FLOG10:
   case ISD::FLOG2:
   case ISD::FNEARBYINT:
-  case ISD::FNEG:
   case ISD::FRINT:
   case ISD::FROUND:
   case ISD::FSIN:
   case ISD::FSQRT:
-  case ISD::FTRUNC:
+  case ISD::FTRUNC: {
+    // We're going to widen this vector op to a legal type by padding with undef
+    // elements. If the wide vector op is eventually going to be expanded to
+    // scalar libcalls, then unroll into scalar ops now to avoid unnecessary
+    // libcalls on the undef elements. We are assuming that if the scalar op
+    // requires expanding, then the vector op needs expanding too.
+    EVT VT = N->getValueType(0);
+    if (TLI.isOperationExpand(N->getOpcode(), VT.getScalarType())) {
+      EVT WideVecVT = TLI.getTypeToTransformTo(*DAG.getContext(), VT);
+      assert(!TLI.isOperationLegalOrCustom(N->getOpcode(), WideVecVT) &&
+             "Target supports vector op, but scalar requires expansion?");
+      Res = DAG.UnrollVectorOp(N, WideVecVT.getVectorNumElements());
+      break;
+    }
+  }
+  // If the target has custom/legal support for the scalar FP intrinsic ops
+  // (they are probably not destined to become libcalls), then widen those like
+  // any other unary ops.
+  LLVM_FALLTHROUGH;
+
+  case ISD::BITREVERSE:
+  case ISD::BSWAP:
+  case ISD::CTLZ:
+  case ISD::CTPOP:
+  case ISD::CTTZ:
+  case ISD::FNEG:
+  case ISD::FCANONICALIZE:
     Res = WidenVecRes_Unary(N);
     break;
   case ISD::FMA:
@@ -2334,6 +2700,88 @@ SDValue DAGTypeLegalizer::WidenVecRes_Binary(SDNode *N) {
   SDValue InOp1 = GetWidenedVector(N->getOperand(0));
   SDValue InOp2 = GetWidenedVector(N->getOperand(1));
   return DAG.getNode(N->getOpcode(), dl, WidenVT, InOp1, InOp2, N->getFlags());
+}
+
+// Given a vector of operations that have been broken up to widen, see
+// if we can collect them together into the next widest legal VT. This
+// implementation is trap-safe.
+static SDValue CollectOpsToWiden(SelectionDAG &DAG, const TargetLowering &TLI,
+                                 SmallVectorImpl<SDValue> &ConcatOps,
+                                 unsigned ConcatEnd, EVT VT, EVT MaxVT,
+                                 EVT WidenVT) {
+  // Check to see if we have a single operation with the widen type.
+  if (ConcatEnd == 1) {
+    VT = ConcatOps[0].getValueType();
+    if (VT == WidenVT)
+      return ConcatOps[0];
+  }
+
+  SDLoc dl(ConcatOps[0]);
+  EVT WidenEltVT = WidenVT.getVectorElementType();
+  int Idx = 0;
+
+  // while (Some element of ConcatOps is not of type MaxVT) {
+  //   From the end of ConcatOps, collect elements of the same type and put
+  //   them into an op of the next larger supported type
+  // }
+  while (ConcatOps[ConcatEnd-1].getValueType() != MaxVT) {
+    Idx = ConcatEnd - 1;
+    VT = ConcatOps[Idx--].getValueType();
+    while (Idx >= 0 && ConcatOps[Idx].getValueType() == VT)
+      Idx--;
+
+    int NextSize = VT.isVector() ? VT.getVectorNumElements() : 1;
+    EVT NextVT;
+    do {
+      NextSize *= 2;
+      NextVT = EVT::getVectorVT(*DAG.getContext(), WidenEltVT, NextSize);
+    } while (!TLI.isTypeLegal(NextVT));
+
+    if (!VT.isVector()) {
+      // Scalar type, create an INSERT_VECTOR_ELEMENT of type NextVT
+      SDValue VecOp = DAG.getUNDEF(NextVT);
+      unsigned NumToInsert = ConcatEnd - Idx - 1;
+      for (unsigned i = 0, OpIdx = Idx+1; i < NumToInsert; i++, OpIdx++) {
+        VecOp = DAG.getNode(
+            ISD::INSERT_VECTOR_ELT, dl, NextVT, VecOp, ConcatOps[OpIdx],
+            DAG.getConstant(i, dl, TLI.getVectorIdxTy(DAG.getDataLayout())));
+      }
+      ConcatOps[Idx+1] = VecOp;
+      ConcatEnd = Idx + 2;
+    } else {
+      // Vector type, create a CONCAT_VECTORS of type NextVT
+      SDValue undefVec = DAG.getUNDEF(VT);
+      unsigned OpsToConcat = NextSize/VT.getVectorNumElements();
+      SmallVector<SDValue, 16> SubConcatOps(OpsToConcat);
+      unsigned RealVals = ConcatEnd - Idx - 1;
+      unsigned SubConcatEnd = 0;
+      unsigned SubConcatIdx = Idx + 1;
+      while (SubConcatEnd < RealVals)
+        SubConcatOps[SubConcatEnd++] = ConcatOps[++Idx];
+      while (SubConcatEnd < OpsToConcat)
+        SubConcatOps[SubConcatEnd++] = undefVec;
+      ConcatOps[SubConcatIdx] = DAG.getNode(ISD::CONCAT_VECTORS, dl,
+                                            NextVT, SubConcatOps);
+      ConcatEnd = SubConcatIdx + 1;
+    }
+  }
+
+  // Check to see if we have a single operation with the widen type.
+  if (ConcatEnd == 1) {
+    VT = ConcatOps[0].getValueType();
+    if (VT == WidenVT)
+      return ConcatOps[0];
+  }
+
+  // add undefs of size MaxVT until ConcatOps grows to length of WidenVT
+  unsigned NumOps = WidenVT.getVectorNumElements()/MaxVT.getVectorNumElements();
+  if (NumOps != ConcatEnd ) {
+    SDValue UndefVal = DAG.getUNDEF(MaxVT);
+    for (unsigned j = ConcatEnd; j < NumOps; ++j)
+      ConcatOps[j] = UndefVal;
+  }
+  return DAG.getNode(ISD::CONCAT_VECTORS, dl, WidenVT,
+                     makeArrayRef(ConcatOps.data(), NumOps));
 }
 
 SDValue DAGTypeLegalizer::WidenVecRes_BinaryCanTrap(SDNode *N) {
@@ -2408,75 +2856,171 @@ SDValue DAGTypeLegalizer::WidenVecRes_BinaryCanTrap(SDNode *N) {
     }
   }
 
-  // Check to see if we have a single operation with the widen type.
-  if (ConcatEnd == 1) {
-    VT = ConcatOps[0].getValueType();
-    if (VT == WidenVT)
-      return ConcatOps[0];
+  return CollectOpsToWiden(DAG, TLI, ConcatOps, ConcatEnd, VT, MaxVT, WidenVT);
+}
+
+SDValue DAGTypeLegalizer::WidenVecRes_StrictFP(SDNode *N) {
+  // StrictFP op widening for operations that can trap.
+  unsigned NumOpers = N->getNumOperands();
+  unsigned Opcode = N->getOpcode();
+  SDLoc dl(N);
+  EVT WidenVT = TLI.getTypeToTransformTo(*DAG.getContext(), N->getValueType(0));
+  EVT WidenEltVT = WidenVT.getVectorElementType();
+  EVT VT = WidenVT;
+  unsigned NumElts = VT.getVectorNumElements();
+  while (!TLI.isTypeLegal(VT) && NumElts != 1) {
+    NumElts = NumElts / 2;
+    VT = EVT::getVectorVT(*DAG.getContext(), WidenEltVT, NumElts);
   }
 
-  // while (Some element of ConcatOps is not of type MaxVT) {
-  //   From the end of ConcatOps, collect elements of the same type and put
-  //   them into an op of the next larger supported type
+  // No legal vector version so unroll the vector operation and then widen.
+  if (NumElts == 1)
+    return DAG.UnrollVectorOp(N, WidenVT.getVectorNumElements());
+
+  // Since the operation can trap, apply operation on the original vector.
+  EVT MaxVT = VT;
+  SmallVector<SDValue, 4> InOps;
+  unsigned CurNumElts = N->getValueType(0).getVectorNumElements();
+
+  SmallVector<SDValue, 16> ConcatOps(CurNumElts);
+  SmallVector<SDValue, 16> Chains;
+  unsigned ConcatEnd = 0;  // Current ConcatOps index.
+  int Idx = 0;        // Current Idx into input vectors.
+
+  // The Chain is the first operand.
+  InOps.push_back(N->getOperand(0));
+
+  // Now process the remaining operands.
+  for (unsigned i = 1; i < NumOpers; ++i) {
+    SDValue Oper = N->getOperand(i);
+
+    if (Oper.getValueType().isVector()) {
+      assert(Oper.getValueType() == N->getValueType(0) && 
+             "Invalid operand type to widen!");
+      Oper = GetWidenedVector(Oper);
+    }
+
+    InOps.push_back(Oper);
+  }
+
+  // NumElts := greatest legal vector size (at most WidenVT)
+  // while (orig. vector has unhandled elements) {
+  //   take munches of size NumElts from the beginning and add to ConcatOps
+  //   NumElts := next smaller supported vector size or 1
   // }
-  while (ConcatOps[ConcatEnd-1].getValueType() != MaxVT) {
-    Idx = ConcatEnd - 1;
-    VT = ConcatOps[Idx--].getValueType();
-    while (Idx >= 0 && ConcatOps[Idx].getValueType() == VT)
-      Idx--;
+  while (CurNumElts != 0) {
+    while (CurNumElts >= NumElts) {
+      SmallVector<SDValue, 4> EOps;
+      
+      for (unsigned i = 0; i < NumOpers; ++i) {
+        SDValue Op = InOps[i];
+        
+        if (Op.getValueType().isVector()) 
+          Op = DAG.getNode(
+            ISD::EXTRACT_SUBVECTOR, dl, VT, Op,
+            DAG.getConstant(Idx, dl, TLI.getVectorIdxTy(DAG.getDataLayout())));
 
-    int NextSize = VT.isVector() ? VT.getVectorNumElements() : 1;
-    EVT NextVT;
-    do {
-      NextSize *= 2;
-      NextVT = EVT::getVectorVT(*DAG.getContext(), WidenEltVT, NextSize);
-    } while (!TLI.isTypeLegal(NextVT));
-
-    if (!VT.isVector()) {
-      // Scalar type, create an INSERT_VECTOR_ELEMENT of type NextVT
-      SDValue VecOp = DAG.getUNDEF(NextVT);
-      unsigned NumToInsert = ConcatEnd - Idx - 1;
-      for (unsigned i = 0, OpIdx = Idx+1; i < NumToInsert; i++, OpIdx++) {
-        VecOp = DAG.getNode(
-            ISD::INSERT_VECTOR_ELT, dl, NextVT, VecOp, ConcatOps[OpIdx],
-            DAG.getConstant(i, dl, TLI.getVectorIdxTy(DAG.getDataLayout())));
+        EOps.push_back(Op);
       }
-      ConcatOps[Idx+1] = VecOp;
-      ConcatEnd = Idx + 2;
-    } else {
-      // Vector type, create a CONCAT_VECTORS of type NextVT
-      SDValue undefVec = DAG.getUNDEF(VT);
-      unsigned OpsToConcat = NextSize/VT.getVectorNumElements();
-      SmallVector<SDValue, 16> SubConcatOps(OpsToConcat);
-      unsigned RealVals = ConcatEnd - Idx - 1;
-      unsigned SubConcatEnd = 0;
-      unsigned SubConcatIdx = Idx + 1;
-      while (SubConcatEnd < RealVals)
-        SubConcatOps[SubConcatEnd++] = ConcatOps[++Idx];
-      while (SubConcatEnd < OpsToConcat)
-        SubConcatOps[SubConcatEnd++] = undefVec;
-      ConcatOps[SubConcatIdx] = DAG.getNode(ISD::CONCAT_VECTORS, dl,
-                                            NextVT, SubConcatOps);
-      ConcatEnd = SubConcatIdx + 1;
+
+      EVT OperVT[] = {VT, MVT::Other};
+      SDValue Oper = DAG.getNode(Opcode, dl, OperVT, EOps);
+      ConcatOps[ConcatEnd++] = Oper;
+      Chains.push_back(Oper.getValue(1));
+      Idx += NumElts;
+      CurNumElts -= NumElts;
+    }
+    do {
+      NumElts = NumElts / 2;
+      VT = EVT::getVectorVT(*DAG.getContext(), WidenEltVT, NumElts);
+    } while (!TLI.isTypeLegal(VT) && NumElts != 1);
+
+    if (NumElts == 1) {
+      for (unsigned i = 0; i != CurNumElts; ++i, ++Idx) {
+        SmallVector<SDValue, 4> EOps;
+
+        for (unsigned i = 0; i < NumOpers; ++i) {
+          SDValue Op = InOps[i];
+
+          if (Op.getValueType().isVector())
+            Op = DAG.getNode(
+              ISD::EXTRACT_VECTOR_ELT, dl, WidenEltVT, Op,
+              DAG.getConstant(Idx, dl, 
+                              TLI.getVectorIdxTy(DAG.getDataLayout())));
+
+          EOps.push_back(Op);
+        }
+
+        EVT WidenVT[] = {WidenEltVT, MVT::Other}; 
+        SDValue Oper = DAG.getNode(Opcode, dl, WidenVT, EOps);
+        ConcatOps[ConcatEnd++] = Oper;
+        Chains.push_back(Oper.getValue(1));
+      }
+      CurNumElts = 0;
     }
   }
 
-  // Check to see if we have a single operation with the widen type.
-  if (ConcatEnd == 1) {
-    VT = ConcatOps[0].getValueType();
-    if (VT == WidenVT)
-      return ConcatOps[0];
+  // Build a factor node to remember all the Ops that have been created.
+  SDValue NewChain;
+  if (Chains.size() == 1)
+    NewChain = Chains[0];
+  else
+    NewChain = DAG.getNode(ISD::TokenFactor, dl, MVT::Other, Chains);
+  ReplaceValueWith(SDValue(N, 1), NewChain);
+
+  return CollectOpsToWiden(DAG, TLI, ConcatOps, ConcatEnd, VT, MaxVT, WidenVT);
+}
+
+SDValue DAGTypeLegalizer::WidenVecRes_OverflowOp(SDNode *N, unsigned ResNo) {
+  SDLoc DL(N);
+  EVT ResVT = N->getValueType(0);
+  EVT OvVT = N->getValueType(1);
+  EVT WideResVT, WideOvVT;
+  SDValue WideLHS, WideRHS;
+
+  // TODO: This might result in a widen/split loop.
+  if (ResNo == 0) {
+    WideResVT = TLI.getTypeToTransformTo(*DAG.getContext(), ResVT);
+    WideOvVT = EVT::getVectorVT(
+        *DAG.getContext(), OvVT.getVectorElementType(),
+        WideResVT.getVectorNumElements());
+
+    WideLHS = GetWidenedVector(N->getOperand(0));
+    WideRHS = GetWidenedVector(N->getOperand(1));
+  } else {
+    WideOvVT = TLI.getTypeToTransformTo(*DAG.getContext(), OvVT);
+    WideResVT = EVT::getVectorVT(
+        *DAG.getContext(), ResVT.getVectorElementType(),
+        WideOvVT.getVectorNumElements());
+
+    SDValue Zero = DAG.getConstant(
+        0, DL, TLI.getVectorIdxTy(DAG.getDataLayout()));
+    WideLHS = DAG.getNode(
+        ISD::INSERT_SUBVECTOR, DL, WideResVT, DAG.getUNDEF(WideResVT),
+        N->getOperand(0), Zero);
+    WideRHS = DAG.getNode(
+        ISD::INSERT_SUBVECTOR, DL, WideResVT, DAG.getUNDEF(WideResVT),
+        N->getOperand(1), Zero);
   }
 
-  // add undefs of size MaxVT until ConcatOps grows to length of WidenVT
-  unsigned NumOps = WidenVT.getVectorNumElements()/MaxVT.getVectorNumElements();
-  if (NumOps != ConcatEnd ) {
-    SDValue UndefVal = DAG.getUNDEF(MaxVT);
-    for (unsigned j = ConcatEnd; j < NumOps; ++j)
-      ConcatOps[j] = UndefVal;
+  SDVTList WideVTs = DAG.getVTList(WideResVT, WideOvVT);
+  SDNode *WideNode = DAG.getNode(
+      N->getOpcode(), DL, WideVTs, WideLHS, WideRHS).getNode();
+
+  // Replace the other vector result not being explicitly widened here.
+  unsigned OtherNo = 1 - ResNo;
+  EVT OtherVT = N->getValueType(OtherNo);
+  if (getTypeAction(OtherVT) == TargetLowering::TypeWidenVector) {
+    SetWidenedVector(SDValue(N, OtherNo), SDValue(WideNode, OtherNo));
+  } else {
+    SDValue Zero = DAG.getConstant(
+        0, DL, TLI.getVectorIdxTy(DAG.getDataLayout()));
+    SDValue OtherVal = DAG.getNode(
+        ISD::EXTRACT_SUBVECTOR, DL, OtherVT, SDValue(WideNode, OtherNo), Zero);
+    ReplaceValueWith(SDValue(N, OtherNo), OtherVal);
   }
-  return DAG.getNode(ISD::CONCAT_VECTORS, dl, WidenVT,
-                     makeArrayRef(ConcatOps.data(), NumOps));
+
+  return SDValue(WideNode, ResNo);
 }
 
 SDValue DAGTypeLegalizer::WidenVecRes_Convert(SDNode *N) {
@@ -2506,10 +3050,12 @@ SDValue DAGTypeLegalizer::WidenVecRes_Convert(SDNode *N) {
       // If both input and result vector types are of same width, extend
       // operations should be done with SIGN/ZERO_EXTEND_VECTOR_INREG, which
       // accepts fewer elements in the result than in the input.
+      if (Opcode == ISD::ANY_EXTEND)
+        return DAG.getNode(ISD::ANY_EXTEND_VECTOR_INREG, DL, WidenVT, InOp);
       if (Opcode == ISD::SIGN_EXTEND)
-        return DAG.getSignExtendVectorInReg(InOp, DL, WidenVT);
+        return DAG.getNode(ISD::SIGN_EXTEND_VECTOR_INREG, DL, WidenVT, InOp);
       if (Opcode == ISD::ZERO_EXTEND)
-        return DAG.getZeroExtendVectorInReg(InOp, DL, WidenVT);
+        return DAG.getNode(ISD::ZERO_EXTEND_VECTOR_INREG, DL, WidenVT, InOp);
     }
   }
 
@@ -2522,11 +3068,8 @@ SDValue DAGTypeLegalizer::WidenVecRes_Convert(SDNode *N) {
     if (WidenNumElts % InVTNumElts == 0) {
       // Widen the input and call convert on the widened input vector.
       unsigned NumConcat = WidenNumElts/InVTNumElts;
-      SmallVector<SDValue, 16> Ops(NumConcat);
+      SmallVector<SDValue, 16> Ops(NumConcat, DAG.getUNDEF(InVT));
       Ops[0] = InOp;
-      SDValue UndefVal = DAG.getUNDEF(InVT);
-      for (unsigned i = 1; i != NumConcat; ++i)
-        Ops[i] = UndefVal;
       SDValue InVec = DAG.getNode(ISD::CONCAT_VECTORS, DL, InWidenVT, Ops);
       if (N->getNumOperands() == 1)
         return DAG.getNode(Opcode, DL, WidenVT, InVec);
@@ -2545,11 +3088,12 @@ SDValue DAGTypeLegalizer::WidenVecRes_Convert(SDNode *N) {
   }
 
   // Otherwise unroll into some nasty scalar code and rebuild the vector.
-  SmallVector<SDValue, 16> Ops(WidenNumElts);
   EVT EltVT = WidenVT.getVectorElementType();
-  unsigned MinElts = std::min(InVTNumElts, WidenNumElts);
-  unsigned i;
-  for (i=0; i < MinElts; ++i) {
+  SmallVector<SDValue, 16> Ops(WidenNumElts, DAG.getUNDEF(EltVT));
+  // Use the original element count so we don't do more scalar opts than
+  // necessary.
+  unsigned MinElts = N->getValueType(0).getVectorNumElements();
+  for (unsigned i=0; i < MinElts; ++i) {
     SDValue Val = DAG.getNode(
         ISD::EXTRACT_VECTOR_ELT, DL, InEltVT, InOp,
         DAG.getConstant(i, DL, TLI.getVectorIdxTy(DAG.getDataLayout())));
@@ -2558,10 +3102,6 @@ SDValue DAGTypeLegalizer::WidenVecRes_Convert(SDNode *N) {
     else
       Ops[i] = DAG.getNode(Opcode, DL, EltVT, Val, N->getOperand(1), Flags);
   }
-
-  SDValue UndefVal = DAG.getUNDEF(EltVT);
-  for (; i < WidenNumElts; ++i)
-    Ops[i] = UndefVal;
 
   return DAG.getBuildVector(WidenVT, DL, Ops);
 }
@@ -2585,11 +3125,9 @@ SDValue DAGTypeLegalizer::WidenVecRes_EXTEND_VECTOR_INREG(SDNode *N) {
     if (InVT.getSizeInBits() == WidenVT.getSizeInBits()) {
       switch (Opcode) {
       case ISD::ANY_EXTEND_VECTOR_INREG:
-        return DAG.getAnyExtendVectorInReg(InOp, DL, WidenVT);
       case ISD::SIGN_EXTEND_VECTOR_INREG:
-        return DAG.getSignExtendVectorInReg(InOp, DL, WidenVT);
       case ISD::ZERO_EXTEND_VECTOR_INREG:
-        return DAG.getZeroExtendVectorInReg(InOp, DL, WidenVT);
+        return DAG.getNode(Opcode, DL, WidenVT, InOp);
       }
     }
   }
@@ -2741,22 +3279,20 @@ SDValue DAGTypeLegalizer::WidenVecRes_BITCAST(SDNode *N) {
     }
 
     if (TLI.isTypeLegal(NewInVT)) {
-      // Because the result and the input are different vector types, widening
-      // the result could create a legal type but widening the input might make
-      // it an illegal type that might lead to repeatedly splitting the input
-      // and then widening it. To avoid this, we widen the input only if
-      // it results in a legal type.
-      SmallVector<SDValue, 16> Ops(NewNumElts);
-      SDValue UndefVal = DAG.getUNDEF(InVT);
-      Ops[0] = InOp;
-      for (unsigned i = 1; i < NewNumElts; ++i)
-        Ops[i] = UndefVal;
-
       SDValue NewVec;
-      if (InVT.isVector())
+      if (InVT.isVector()) {
+        // Because the result and the input are different vector types, widening
+        // the result could create a legal type but widening the input might make
+        // it an illegal type that might lead to repeatedly splitting the input
+        // and then widening it. To avoid this, we widen the input only if
+        // it results in a legal type.
+        SmallVector<SDValue, 16> Ops(NewNumElts, DAG.getUNDEF(InVT));
+        Ops[0] = InOp;
+
         NewVec = DAG.getNode(ISD::CONCAT_VECTORS, dl, NewInVT, Ops);
-      else
-        NewVec = DAG.getBuildVector(NewInVT, dl, Ops);
+      } else {
+        NewVec = DAG.getNode(ISD::SCALAR_TO_VECTOR, dl, NewInVT, InOp);
+      }
       return DAG.getNode(ISD::BITCAST, dl, WidenVT, NewVec);
     }
   }
@@ -2934,7 +3470,7 @@ SDValue DAGTypeLegalizer::WidenVecRes_MLOAD(MaskedLoadSDNode *N) {
   EVT WidenVT = TLI.getTypeToTransformTo(*DAG.getContext(),N->getValueType(0));
   SDValue Mask = N->getMask();
   EVT MaskVT = Mask.getValueType();
-  SDValue Src0 = GetWidenedVector(N->getSrc0());
+  SDValue PassThru = GetWidenedVector(N->getPassThru());
   ISD::LoadExtType ExtType = N->getExtensionType();
   SDLoc dl(N);
 
@@ -2945,9 +3481,9 @@ SDValue DAGTypeLegalizer::WidenVecRes_MLOAD(MaskedLoadSDNode *N) {
   Mask = ModifyToType(Mask, WideMaskVT, true);
 
   SDValue Res = DAG.getMaskedLoad(WidenVT, dl, N->getChain(), N->getBasePtr(),
-                                  Mask, Src0, N->getMemoryVT(),
+                                  Mask, PassThru, N->getMemoryVT(),
                                   N->getMemOperand(), ExtType,
-                                        N->isExpandingLoad());
+                                  N->isExpandingLoad());
   // Legalize the chain result - switch anything that used the old chain to
   // use the new one.
   ReplaceValueWith(SDValue(N, 1), Res.getValue(1));
@@ -2959,7 +3495,7 @@ SDValue DAGTypeLegalizer::WidenVecRes_MGATHER(MaskedGatherSDNode *N) {
   EVT WideVT = TLI.getTypeToTransformTo(*DAG.getContext(), N->getValueType(0));
   SDValue Mask = N->getMask();
   EVT MaskVT = Mask.getValueType();
-  SDValue Src0 = GetWidenedVector(N->getValue());
+  SDValue PassThru = GetWidenedVector(N->getPassThru());
   SDValue Scale = N->getScale();
   unsigned NumElts = WideVT.getVectorNumElements();
   SDLoc dl(N);
@@ -2976,7 +3512,8 @@ SDValue DAGTypeLegalizer::WidenVecRes_MGATHER(MaskedGatherSDNode *N) {
                                      Index.getValueType().getScalarType(),
                                      NumElts);
   Index = ModifyToType(Index, WideIndexVT);
-  SDValue Ops[] = { N->getChain(), Src0, Mask, N->getBasePtr(), Index, Scale };
+  SDValue Ops[] = { N->getChain(), PassThru, Mask, N->getBasePtr(), Index,
+                    Scale };
   SDValue Res = DAG.getMaskedGather(DAG.getVTList(WideVT, MVT::Other),
                                     N->getMemoryVT(), dl, Ops,
                                     N->getMemOperand());
@@ -3086,16 +3623,6 @@ SDValue DAGTypeLegalizer::convertMask(SDValue InMask, EVT MaskVT,
   return Mask;
 }
 
-// Get the target mask VT, and widen if needed.
-EVT DAGTypeLegalizer::getSETCCWidenedResultTy(SDValue SetCC) {
-  assert(SetCC->getOpcode() == ISD::SETCC);
-  LLVMContext &Ctx = *DAG.getContext();
-  EVT MaskVT = getSetCCResultType(SetCC->getOperand(0).getValueType());
-  if (getTypeAction(MaskVT) == TargetLowering::TypeWidenVector)
-    MaskVT = TLI.getTypeToTransformTo(Ctx, MaskVT);
-  return MaskVT;
-}
-
 // This method tries to handle VSELECT and its mask by legalizing operands
 // (which may require widening) and if needed adjusting the mask vector type
 // to match that of the VSELECT. Without it, many cases end up with
@@ -3163,7 +3690,7 @@ SDValue DAGTypeLegalizer::WidenVSELECTAndMask(SDNode *N) {
 
   SDValue Mask;
   if (Cond->getOpcode() == ISD::SETCC) {
-    EVT MaskVT = getSETCCWidenedResultTy(Cond);
+    EVT MaskVT = getSetCCResultType(Cond.getOperand(0).getValueType());
     Mask = convertMask(Cond, MaskVT, ToMaskVT);
   } else if (isLogicalMaskOp(Cond->getOpcode()) &&
              Cond->getOperand(0).getOpcode() == ISD::SETCC &&
@@ -3171,8 +3698,8 @@ SDValue DAGTypeLegalizer::WidenVSELECTAndMask(SDNode *N) {
     // Cond is (AND/OR/XOR (SETCC, SETCC))
     SDValue SETCC0 = Cond->getOperand(0);
     SDValue SETCC1 = Cond->getOperand(1);
-    EVT VT0 = getSETCCWidenedResultTy(SETCC0);
-    EVT VT1 = getSETCCWidenedResultTy(SETCC1);
+    EVT VT0 = getSetCCResultType(SETCC0.getOperand(0).getValueType());
+    EVT VT1 = getSetCCResultType(SETCC1.getOperand(0).getValueType());
     unsigned ScalarBits0 = VT0.getScalarSizeInBits();
     unsigned ScalarBits1 = VT1.getScalarSizeInBits();
     unsigned ScalarBits_ToMask = ToMaskVT.getScalarSizeInBits();
@@ -3304,8 +3831,15 @@ SDValue DAGTypeLegalizer::WidenVecRes_SETCC(SDNode *N) {
     return Res;
   }
 
-  InOp1 = GetWidenedVector(InOp1);
-  SDValue InOp2 = GetWidenedVector(N->getOperand(1));
+  // If the inputs also widen, handle them directly. Otherwise widen by hand.
+  SDValue InOp2 = N->getOperand(1);
+  if (getTypeAction(InVT) == TargetLowering::TypeWidenVector) {
+    InOp1 = GetWidenedVector(InOp1);
+    InOp2 = GetWidenedVector(InOp2);
+  } else {
+    InOp1 = DAG.WidenVector(InOp1, SDLoc(N));
+    InOp2 = DAG.WidenVector(InOp2, SDLoc(N));
+  }
 
   // Assume that the input and output will be widen appropriately.  If not,
   // we will have to unroll it at some point.
@@ -3345,8 +3879,10 @@ bool DAGTypeLegalizer::WidenVectorOperand(SDNode *N, unsigned OpNo) {
   case ISD::EXTRACT_VECTOR_ELT: Res = WidenVecOp_EXTRACT_VECTOR_ELT(N); break;
   case ISD::STORE:              Res = WidenVecOp_STORE(N); break;
   case ISD::MSTORE:             Res = WidenVecOp_MSTORE(N, OpNo); break;
+  case ISD::MGATHER:            Res = WidenVecOp_MGATHER(N, OpNo); break;
   case ISD::MSCATTER:           Res = WidenVecOp_MSCATTER(N, OpNo); break;
   case ISD::SETCC:              Res = WidenVecOp_SETCC(N); break;
+  case ISD::VSELECT:            Res = WidenVecOp_VSELECT(N); break;
   case ISD::FCOPYSIGN:          Res = WidenVecOp_FCOPYSIGN(N); break;
 
   case ISD::ANY_EXTEND:
@@ -3362,6 +3898,22 @@ bool DAGTypeLegalizer::WidenVectorOperand(SDNode *N, unsigned OpNo) {
   case ISD::UINT_TO_FP:
   case ISD::TRUNCATE:
     Res = WidenVecOp_Convert(N);
+    break;
+
+  case ISD::VECREDUCE_FADD:
+  case ISD::VECREDUCE_FMUL:
+  case ISD::VECREDUCE_ADD:
+  case ISD::VECREDUCE_MUL:
+  case ISD::VECREDUCE_AND:
+  case ISD::VECREDUCE_OR:
+  case ISD::VECREDUCE_XOR:
+  case ISD::VECREDUCE_SMAX:
+  case ISD::VECREDUCE_SMIN:
+  case ISD::VECREDUCE_UMAX:
+  case ISD::VECREDUCE_UMIN:
+  case ISD::VECREDUCE_FMAX:
+  case ISD::VECREDUCE_FMIN:
+    Res = WidenVecOp_VECREDUCE(N);
     break;
   }
 
@@ -3434,11 +3986,11 @@ SDValue DAGTypeLegalizer::WidenVecOp_EXTEND(SDNode *N) {
   default:
     llvm_unreachable("Extend legalization on extend operation!");
   case ISD::ANY_EXTEND:
-    return DAG.getAnyExtendVectorInReg(InOp, DL, VT);
+    return DAG.getNode(ISD::ANY_EXTEND_VECTOR_INREG, DL, VT, InOp);
   case ISD::SIGN_EXTEND:
-    return DAG.getSignExtendVectorInReg(InOp, DL, VT);
+    return DAG.getNode(ISD::SIGN_EXTEND_VECTOR_INREG, DL, VT, InOp);
   case ISD::ZERO_EXTEND:
-    return DAG.getZeroExtendVectorInReg(InOp, DL, VT);
+    return DAG.getNode(ISD::ZERO_EXTEND_VECTOR_INREG, DL, VT, InOp);
   }
 }
 
@@ -3468,8 +4020,9 @@ SDValue DAGTypeLegalizer::WidenVecOp_Convert(SDNode *N) {
                                 InVT.getVectorNumElements());
   if (TLI.isTypeLegal(WideVT)) {
     SDValue Res = DAG.getNode(Opcode, dl, WideVT, InOp);
-    return DAG.getNode(ISD::EXTRACT_SUBVECTOR, dl, VT, Res,
-                       DAG.getIntPtrConstant(0, dl));
+    return DAG.getNode(
+        ISD::EXTRACT_SUBVECTOR, dl, VT, Res,
+        DAG.getConstant(0, dl, TLI.getVectorIdxTy(DAG.getDataLayout())));
   }
 
   EVT InEltVT = InVT.getVectorElementType();
@@ -3511,20 +4064,31 @@ SDValue DAGTypeLegalizer::WidenVecOp_BITCAST(SDNode *N) {
 }
 
 SDValue DAGTypeLegalizer::WidenVecOp_CONCAT_VECTORS(SDNode *N) {
-  // If the input vector is not legal, it is likely that we will not find a
-  // legal vector of the same size. Replace the concatenate vector with a
-  // nasty build vector.
   EVT VT = N->getValueType(0);
   EVT EltVT = VT.getVectorElementType();
+  EVT InVT = N->getOperand(0).getValueType();
   SDLoc dl(N);
+
+  // If the widen width for this operand is the same as the width of the concat
+  // and all but the first operand is undef, just use the widened operand.
+  unsigned NumOperands = N->getNumOperands();
+  if (VT == TLI.getTypeToTransformTo(*DAG.getContext(), InVT)) {
+    unsigned i;
+    for (i = 1; i < NumOperands; ++i)
+      if (!N->getOperand(i).isUndef())
+        break;
+
+    if (i == NumOperands)
+      return GetWidenedVector(N->getOperand(0));
+  }
+
+  // Otherwise, fall back to a nasty build vector.
   unsigned NumElts = VT.getVectorNumElements();
   SmallVector<SDValue, 16> Ops(NumElts);
 
-  EVT InVT = N->getOperand(0).getValueType();
   unsigned NumInElts = InVT.getVectorNumElements();
 
   unsigned Idx = 0;
-  unsigned NumOperands = N->getNumOperands();
   for (unsigned i=0; i < NumOperands; ++i) {
     SDValue InOp = N->getOperand(i);
     assert(getTypeAction(InOp.getValueType()) ==
@@ -3572,60 +4136,97 @@ SDValue DAGTypeLegalizer::WidenVecOp_STORE(SDNode *N) {
 }
 
 SDValue DAGTypeLegalizer::WidenVecOp_MSTORE(SDNode *N, unsigned OpNo) {
-  assert(OpNo == 3 && "Can widen only data operand of mstore");
+  assert((OpNo == 1 || OpNo == 3) &&
+         "Can widen only data or mask operand of mstore");
   MaskedStoreSDNode *MST = cast<MaskedStoreSDNode>(N);
   SDValue Mask = MST->getMask();
   EVT MaskVT = Mask.getValueType();
   SDValue StVal = MST->getValue();
-  // Widen the value
-  SDValue WideVal = GetWidenedVector(StVal);
   SDLoc dl(N);
 
-  // The mask should be widened as well.
-  EVT WideVT = WideVal.getValueType();
-  EVT WideMaskVT = EVT::getVectorVT(*DAG.getContext(),
-                                    MaskVT.getVectorElementType(),
-                                    WideVT.getVectorNumElements());
-  Mask = ModifyToType(Mask, WideMaskVT, true);
+  if (OpNo == 1) {
+    // Widen the value.
+    StVal = GetWidenedVector(StVal);
+
+    // The mask should be widened as well.
+    EVT WideVT = StVal.getValueType();
+    EVT WideMaskVT = EVT::getVectorVT(*DAG.getContext(),
+                                      MaskVT.getVectorElementType(),
+                                      WideVT.getVectorNumElements());
+    Mask = ModifyToType(Mask, WideMaskVT, true);
+  } else {
+    // Widen the mask.
+    EVT WideMaskVT = TLI.getTypeToTransformTo(*DAG.getContext(), MaskVT);
+    Mask = ModifyToType(Mask, WideMaskVT, true);
+
+    EVT ValueVT = StVal.getValueType();
+    EVT WideVT = EVT::getVectorVT(*DAG.getContext(),
+                                  ValueVT.getVectorElementType(),
+                                  WideMaskVT.getVectorNumElements());
+    StVal = ModifyToType(StVal, WideVT);
+  }
 
   assert(Mask.getValueType().getVectorNumElements() ==
-         WideVal.getValueType().getVectorNumElements() &&
+         StVal.getValueType().getVectorNumElements() &&
          "Mask and data vectors should have the same number of elements");
-  return DAG.getMaskedStore(MST->getChain(), dl, WideVal, MST->getBasePtr(),
+  return DAG.getMaskedStore(MST->getChain(), dl, StVal, MST->getBasePtr(),
                             Mask, MST->getMemoryVT(), MST->getMemOperand(),
                             false, MST->isCompressingStore());
 }
 
+SDValue DAGTypeLegalizer::WidenVecOp_MGATHER(SDNode *N, unsigned OpNo) {
+  assert(OpNo == 4 && "Can widen only the index of mgather");
+  auto *MG = cast<MaskedGatherSDNode>(N);
+  SDValue DataOp = MG->getPassThru();
+  SDValue Mask = MG->getMask();
+  SDValue Scale = MG->getScale();
+
+  // Just widen the index. It's allowed to have extra elements.
+  SDValue Index = GetWidenedVector(MG->getIndex());
+
+  SDLoc dl(N);
+  SDValue Ops[] = {MG->getChain(), DataOp, Mask, MG->getBasePtr(), Index,
+                   Scale};
+  SDValue Res = DAG.getMaskedGather(MG->getVTList(), MG->getMemoryVT(), dl, Ops,
+                                    MG->getMemOperand());
+  ReplaceValueWith(SDValue(N, 1), Res.getValue(1));
+  ReplaceValueWith(SDValue(N, 0), Res.getValue(0));
+  return SDValue();
+}
+
 SDValue DAGTypeLegalizer::WidenVecOp_MSCATTER(SDNode *N, unsigned OpNo) {
-  assert(OpNo == 1 && "Can widen only data operand of mscatter");
   MaskedScatterSDNode *MSC = cast<MaskedScatterSDNode>(N);
   SDValue DataOp = MSC->getValue();
   SDValue Mask = MSC->getMask();
-  EVT MaskVT = Mask.getValueType();
+  SDValue Index = MSC->getIndex();
   SDValue Scale = MSC->getScale();
 
-  // Widen the value.
-  SDValue WideVal = GetWidenedVector(DataOp);
-  EVT WideVT = WideVal.getValueType();
-  unsigned NumElts = WideVT.getVectorNumElements();
-  SDLoc dl(N);
+  unsigned NumElts;
+  if (OpNo == 1) {
+    DataOp = GetWidenedVector(DataOp);
+    NumElts = DataOp.getValueType().getVectorNumElements();
 
-  // The mask should be widened as well.
-  EVT WideMaskVT = EVT::getVectorVT(*DAG.getContext(),
-                                    MaskVT.getVectorElementType(), NumElts);
-  Mask = ModifyToType(Mask, WideMaskVT, true);
+    // Widen index.
+    EVT IndexVT = Index.getValueType();
+    EVT WideIndexVT = EVT::getVectorVT(*DAG.getContext(),
+                                       IndexVT.getVectorElementType(), NumElts);
+    Index = ModifyToType(Index, WideIndexVT);
 
-  // Widen index.
-  SDValue Index = MSC->getIndex();
-  EVT WideIndexVT = EVT::getVectorVT(*DAG.getContext(),
-                                     Index.getValueType().getScalarType(),
-                                     NumElts);
-  Index = ModifyToType(Index, WideIndexVT);
+    // The mask should be widened as well.
+    EVT MaskVT = Mask.getValueType();
+    EVT WideMaskVT = EVT::getVectorVT(*DAG.getContext(),
+                                      MaskVT.getVectorElementType(), NumElts);
+    Mask = ModifyToType(Mask, WideMaskVT, true);
+  } else if (OpNo == 4) {
+    // Just widen the index. It's allowed to have extra elements.
+    Index = GetWidenedVector(Index);
+  } else
+    llvm_unreachable("Can't widen this operand of mscatter");
 
-  SDValue Ops[] = {MSC->getChain(), WideVal, Mask, MSC->getBasePtr(), Index,
+  SDValue Ops[] = {MSC->getChain(), DataOp, Mask, MSC->getBasePtr(), Index,
                    Scale};
   return DAG.getMaskedScatter(DAG.getVTList(MVT::Other),
-                              MSC->getMemoryVT(), dl, Ops,
+                              MSC->getMemoryVT(), SDLoc(N), Ops,
                               MSC->getMemOperand());
 }
 
@@ -3662,6 +4263,80 @@ SDValue DAGTypeLegalizer::WidenVecOp_SETCC(SDNode *N) {
   return PromoteTargetBoolean(CC, VT);
 }
 
+SDValue DAGTypeLegalizer::WidenVecOp_VECREDUCE(SDNode *N) {
+  SDLoc dl(N);
+  SDValue Op = GetWidenedVector(N->getOperand(0));
+  EVT OrigVT = N->getOperand(0).getValueType();
+  EVT WideVT = Op.getValueType();
+  EVT ElemVT = OrigVT.getVectorElementType();
+
+  SDValue NeutralElem;
+  switch (N->getOpcode()) {
+  case ISD::VECREDUCE_ADD:
+  case ISD::VECREDUCE_OR:
+  case ISD::VECREDUCE_XOR:
+  case ISD::VECREDUCE_UMAX:
+    NeutralElem = DAG.getConstant(0, dl, ElemVT);
+    break;
+  case ISD::VECREDUCE_MUL:
+    NeutralElem = DAG.getConstant(1, dl, ElemVT);
+    break;
+  case ISD::VECREDUCE_AND:
+  case ISD::VECREDUCE_UMIN:
+    NeutralElem = DAG.getAllOnesConstant(dl, ElemVT);
+    break;
+  case ISD::VECREDUCE_SMAX:
+    NeutralElem = DAG.getConstant(
+        APInt::getSignedMinValue(ElemVT.getSizeInBits()), dl, ElemVT);
+    break;
+  case ISD::VECREDUCE_SMIN:
+    NeutralElem = DAG.getConstant(
+        APInt::getSignedMaxValue(ElemVT.getSizeInBits()), dl, ElemVT);
+    break;
+  case ISD::VECREDUCE_FADD:
+    NeutralElem = DAG.getConstantFP(0.0, dl, ElemVT);
+    break;
+  case ISD::VECREDUCE_FMUL:
+    NeutralElem = DAG.getConstantFP(1.0, dl, ElemVT);
+    break;
+  case ISD::VECREDUCE_FMAX:
+    NeutralElem = DAG.getConstantFP(
+        std::numeric_limits<double>::infinity(), dl, ElemVT);
+    break;
+  case ISD::VECREDUCE_FMIN:
+    NeutralElem = DAG.getConstantFP(
+        -std::numeric_limits<double>::infinity(), dl, ElemVT);
+    break;
+  }
+
+  // Pad the vector with the neutral element.
+  unsigned OrigElts = OrigVT.getVectorNumElements();
+  unsigned WideElts = WideVT.getVectorNumElements();
+  for (unsigned Idx = OrigElts; Idx < WideElts; Idx++)
+    Op = DAG.getNode(ISD::INSERT_VECTOR_ELT, dl, WideVT, Op, NeutralElem,
+        DAG.getConstant(Idx, dl, TLI.getVectorIdxTy(DAG.getDataLayout())));
+
+  return DAG.getNode(N->getOpcode(), dl, N->getValueType(0), Op, N->getFlags());
+}
+
+SDValue DAGTypeLegalizer::WidenVecOp_VSELECT(SDNode *N) {
+  // This only gets called in the case that the left and right inputs and
+  // result are of a legal odd vector type, and the condition is illegal i1 of
+  // the same odd width that needs widening.
+  EVT VT = N->getValueType(0);
+  assert(VT.isVector() && !VT.isPow2VectorType() && isTypeLegal(VT));
+
+  SDValue Cond = GetWidenedVector(N->getOperand(0));
+  SDValue LeftIn = DAG.WidenVector(N->getOperand(1), SDLoc(N));
+  SDValue RightIn = DAG.WidenVector(N->getOperand(2), SDLoc(N));
+  SDLoc DL(N);
+
+  SDValue Select = DAG.getNode(N->getOpcode(), DL, LeftIn.getValueType(), Cond,
+                               LeftIn, RightIn);
+  return DAG.getNode(
+      ISD::EXTRACT_SUBVECTOR, DL, VT, Select,
+      DAG.getConstant(0, DL, TLI.getVectorIdxTy(DAG.getDataLayout())));
+}
 
 //===----------------------------------------------------------------------===//
 // Vector Widening Utilities

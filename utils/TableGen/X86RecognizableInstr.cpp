@@ -1,9 +1,8 @@
 //===- X86RecognizableInstr.cpp - Disassembler instruction spec --*- C++ -*-===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -842,6 +841,7 @@ OperandType RecognizableInstr::typeFromString(const std::string &s,
   TYPE("f32mem",              TYPE_M)
   TYPE("ssmem",               TYPE_M)
   TYPE("RST",                 TYPE_ST)
+  TYPE("RSTi",                TYPE_ST)
   TYPE("i128mem",             TYPE_M)
   TYPE("i256mem",             TYPE_M)
   TYPE("i512mem",             TYPE_M)
@@ -849,9 +849,7 @@ OperandType RecognizableInstr::typeFromString(const std::string &s,
   TYPE("i16imm_pcrel",        TYPE_REL)
   TYPE("i32imm_pcrel",        TYPE_REL)
   TYPE("SSECC",               TYPE_IMM3)
-  TYPE("XOPCC",               TYPE_IMM3)
   TYPE("AVXCC",               TYPE_IMM5)
-  TYPE("AVX512ICC",           TYPE_AVX512ICC)
   TYPE("AVX512RC",            TYPE_IMM)
   TYPE("brtarget32",          TYPE_REL)
   TYPE("brtarget16",          TYPE_REL)
@@ -932,9 +930,7 @@ RecognizableInstr::immediateEncodingFromString(const std::string &s,
   }
   ENCODING("i32i8imm",        ENCODING_IB)
   ENCODING("SSECC",           ENCODING_IB)
-  ENCODING("XOPCC",           ENCODING_IB)
   ENCODING("AVXCC",           ENCODING_IB)
-  ENCODING("AVX512ICC",       ENCODING_IB)
   ENCODING("AVX512RC",        ENCODING_IRC)
   ENCODING("i16imm",          ENCODING_Iv)
   ENCODING("i16i8imm",        ENCODING_IB)
@@ -964,6 +960,7 @@ OperandEncoding
 RecognizableInstr::rmRegisterEncodingFromString(const std::string &s,
                                                 uint8_t OpSize) {
   ENCODING("RST",             ENCODING_FP)
+  ENCODING("RSTi",            ENCODING_FP)
   ENCODING("GR16",            ENCODING_RM)
   ENCODING("GR32",            ENCODING_RM)
   ENCODING("GR32orGR64",      ENCODING_RM)
@@ -1132,8 +1129,8 @@ RecognizableInstr::relocationEncodingFromString(const std::string &s,
   ENCODING("i64i32imm_pcrel", ENCODING_ID)
   ENCODING("i16imm_pcrel",    ENCODING_IW)
   ENCODING("i32imm_pcrel",    ENCODING_ID)
-  ENCODING("brtarget32",      ENCODING_Iv)
-  ENCODING("brtarget16",      ENCODING_Iv)
+  ENCODING("brtarget32",      ENCODING_ID)
+  ENCODING("brtarget16",      ENCODING_IW)
   ENCODING("brtarget8",       ENCODING_IB)
   ENCODING("i64imm",          ENCODING_IO)
   ENCODING("offset16_8",      ENCODING_Ia)

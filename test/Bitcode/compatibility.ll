@@ -761,8 +761,41 @@ define void @atomics(i32* %word) {
   ret void
 }
 
+define void @fp_atomics(float* %word) {
+; CHECK: %atomicrmw.xchg = atomicrmw xchg float* %word, float 1.000000e+00 monotonic
+  %atomicrmw.xchg = atomicrmw xchg float* %word, float 1.0 monotonic
+
+; CHECK: %atomicrmw.fadd = atomicrmw fadd float* %word, float 1.000000e+00 monotonic
+  %atomicrmw.fadd = atomicrmw fadd float* %word, float 1.0 monotonic
+
+; CHECK: %atomicrmw.fsub = atomicrmw fsub float* %word, float 1.000000e+00 monotonic
+  %atomicrmw.fsub = atomicrmw fsub float* %word, float 1.0 monotonic
+
+  ret void
+}
+
 ;; Fast Math Flags
-define void @fastmathflags(float %op1, float %op2) {
+define void @fastmathflags_unop(float %op1) {
+  %f.nnan = fneg nnan float %op1
+  ; CHECK: %f.nnan = fneg nnan float %op1
+  %f.ninf = fneg ninf float %op1
+  ; CHECK: %f.ninf = fneg ninf float %op1
+  %f.nsz = fneg nsz float %op1
+  ; CHECK: %f.nsz = fneg nsz float %op1
+  %f.arcp = fneg arcp float %op1
+  ; CHECK: %f.arcp = fneg arcp float %op1
+  %f.contract = fneg contract float %op1
+  ; CHECK: %f.contract = fneg contract float %op1
+  %f.afn = fneg afn float %op1
+  ; CHECK: %f.afn = fneg afn float %op1
+  %f.reassoc = fneg reassoc float %op1
+  ; CHECK: %f.reassoc = fneg reassoc float %op1
+  %f.fast = fneg fast float %op1
+  ; CHECK: %f.fast = fneg fast float %op1
+  ret void
+}
+
+define void @fastmathflags_binops(float %op1, float %op2) {
   %f.nnan = fadd nnan float %op1, %op2
   ; CHECK: %f.nnan = fadd nnan float %op1, %op2
   %f.ninf = fadd ninf float %op1, %op2
@@ -995,6 +1028,13 @@ terminate:
 
 continue:
   ret i32 0
+}
+
+; Instructions -- Unary Operations
+define void @instructions.unops(double %op1) {
+  fneg double %op1
+  ; CHECK: fneg double %op1
+  ret void
 }
 
 ; Instructions -- Binary Operations
@@ -1640,6 +1680,10 @@ define i8** @constexpr() {
   ; CHECK: ret i8** getelementptr inbounds ({ [4 x i8*], [4 x i8*] }, { [4 x i8*], [4 x i8*] }* null, i32 0, inrange i32 1, i32 2)
   ret i8** getelementptr inbounds ({ [4 x i8*], [4 x i8*] }, { [4 x i8*], [4 x i8*] }* null, i32 0, inrange i32 1, i32 2)
 }
+
+; immarg attribute
+declare void @llvm.test.immarg.intrinsic(i32 immarg)
+; CHECK: declare void @llvm.test.immarg.intrinsic(i32 immarg)
 
 ; CHECK: attributes #0 = { alignstack=4 }
 ; CHECK: attributes #1 = { alignstack=8 }

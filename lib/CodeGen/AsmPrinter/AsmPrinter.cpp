@@ -1,9 +1,8 @@
 //===- AsmPrinter.cpp - Common AsmPrinter code ----------------------------===//
 //
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 //
@@ -12,10 +11,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/CodeGen/AsmPrinter.h"
-#include "AsmPrinterHandler.h"
 #include "CodeViewDebug.h"
 #include "DwarfDebug.h"
 #include "DwarfException.h"
+#include "WasmException.h"
 #include "WinCFGuard.h"
 #include "WinException.h"
 #include "llvm/ADT/APFloat.h"
@@ -32,8 +31,10 @@
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/EHPersonalities.h"
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
+#include "llvm/BinaryFormat/COFF.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/BinaryFormat/ELF.h"
+#include "llvm/CodeGen/AsmPrinterHandler.h"
 #include "llvm/CodeGen/GCMetadata.h"
 #include "llvm/CodeGen/GCMetadataPrinter.h"
 #include "llvm/CodeGen/GCStrategy.h"
@@ -52,12 +53,12 @@
 #include "llvm/CodeGen/MachineModuleInfoImpls.h"
 #include "llvm/CodeGen/MachineOperand.h"
 #include "llvm/CodeGen/MachineOptimizationRemarkEmitter.h"
+#include "llvm/CodeGen/StackMaps.h"
 #include "llvm/CodeGen/TargetFrameLowering.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetLowering.h"
 #include "llvm/CodeGen/TargetOpcodes.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
-#include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Comdat.h"
 #include "llvm/IR/Constant.h"
@@ -87,6 +88,7 @@
 #include "llvm/MC/MCExpr.h"
 #include "llvm/MC/MCInst.h"
 #include "llvm/MC/MCSection.h"
+#include "llvm/MC/MCSectionCOFF.h"
 #include "llvm/MC/MCSectionELF.h"
 #include "llvm/MC/MCSectionMachO.h"
 #include "llvm/MC/MCStreamer.h"
@@ -138,10 +140,6 @@ static const char *const CodeViewLineTablesGroupDescription =
   "CodeView Line Tables";
 
 STATISTIC(EmittedInsts, "Number of machine instrs printed");
-
-static cl::opt<bool>
-    PrintSchedule("print-schedule", cl::Hidden, cl::init(false),
-                  cl::desc("Print 'sched: [latency:throughput]' in .s output"));
 
 char AsmPrinter::ID = 0;
 
@@ -228,6 +226,12 @@ void AsmPrinter::EmitToStreamer(MCStreamer &S, const MCInst &Inst) {
   S.EmitInstruction(Inst, getSubtargetInfo());
 }
 
+void AsmPrinter::emitInitialRawDwarfLocDirective(const MachineFunction &MF) {
+  assert(DD && "Dwarf debug file is not defined.");
+  assert(OutStreamer->hasRawTextSupport() && "Expected assembly output mode.");
+  (void)DD->emitInitialLocDirective(MF, /*CUID=*/0);
+}
+
 /// getCurrentSection() - Return the current section we are emitting to.
 const MCSection *AsmPrinter::getCurrentSection() const {
   return OutStreamer->getCurrentSectionOnly();
@@ -259,7 +263,7 @@ bool AsmPrinter::doInitialization(Module &M) {
   // use the directive, where it would need the same conditionalization
   // anyway.
   const Triple &Target = TM.getTargetTriple();
-  OutStreamer->EmitVersionForTarget(Target);
+  OutStreamer->EmitVersionForTarget(Target, M.getSDKVersion());
 
   // Allow the target to emit any magic that it wants at the start of the file.
   EmitStartOfAsmFile(M);
@@ -354,7 +358,7 @@ bool AsmPrinter::doInitialization(Module &M) {
     }
     break;
   case ExceptionHandling::Wasm:
-    // TODO to prevent warning
+    ES = new WasmException(this);
     break;
   }
   if (ES)
@@ -362,7 +366,7 @@ bool AsmPrinter::doInitialization(Module &M) {
                                    DWARFGroupName, DWARFGroupDescription));
 
   if (mdconst::extract_or_null<ConstantInt>(
-          MMI->getModule()->getModuleFlag("cfguard")))
+          MMI->getModule()->getModuleFlag("cfguardtable")))
     Handlers.push_back(HandlerInfo(new WinCFGuard(this), CFGuardName,
                                    CFGuardDescription, DWARFGroupName,
                                    DWARFGroupDescription));
@@ -626,8 +630,7 @@ void AsmPrinter::EmitGlobalVariable(const GlobalVariable *GV) {
 ///
 /// \p Value - The value to emit.
 /// \p Size - The size of the integer (in bytes) to emit.
-void AsmPrinter::EmitDebugThreadLocal(const MCExpr *Value,
-                                      unsigned Size) const {
+void AsmPrinter::EmitDebugValue(const MCExpr *Value, unsigned Size) const {
   OutStreamer->EmitValue(Value, Size);
 }
 
@@ -654,6 +657,9 @@ void AsmPrinter::EmitFunctionHeader() {
 
   if (MAI->hasDotTypeDotSizeDirective())
     OutStreamer->EmitSymbolAttribute(CurrentFnSym, MCSA_ELF_TypeFunction);
+
+  if (F.hasFnAttribute(Attribute::Cold))
+    OutStreamer->EmitSymbolAttribute(CurrentFnSym, MCSA_Cold);
 
   if (isVerbose()) {
     F.printAsOperand(OutStreamer->GetCommentOS(),
@@ -735,62 +741,30 @@ void AsmPrinter::EmitFunctionEntryLabel() {
 }
 
 /// emitComments - Pretty-print comments for instructions.
-/// It returns true iff the sched comment was emitted.
-///   Otherwise it returns false.
-static bool emitComments(const MachineInstr &MI, raw_ostream &CommentOS,
-                         AsmPrinter *AP) {
+static void emitComments(const MachineInstr &MI, raw_ostream &CommentOS) {
   const MachineFunction *MF = MI.getMF();
   const TargetInstrInfo *TII = MF->getSubtarget().getInstrInfo();
 
   // Check for spills and reloads
-  int FI;
-
-  const MachineFrameInfo &MFI = MF->getFrameInfo();
-  bool Commented = false;
 
   // We assume a single instruction only has a spill or reload, not
   // both.
-  const MachineMemOperand *MMO;
-  if (TII->isLoadFromStackSlotPostFE(MI, FI)) {
-    if (MFI.isSpillSlotObjectIndex(FI)) {
-      MMO = *MI.memoperands_begin();
-      CommentOS << MMO->getSize() << "-byte Reload";
-      Commented = true;
-    }
-  } else if (TII->hasLoadFromStackSlot(MI, MMO, FI)) {
-    if (MFI.isSpillSlotObjectIndex(FI)) {
-      CommentOS << MMO->getSize() << "-byte Folded Reload";
-      Commented = true;
-    }
-  } else if (TII->isStoreToStackSlotPostFE(MI, FI)) {
-    if (MFI.isSpillSlotObjectIndex(FI)) {
-      MMO = *MI.memoperands_begin();
-      CommentOS << MMO->getSize() << "-byte Spill";
-      Commented = true;
-    }
-  } else if (TII->hasStoreToStackSlot(MI, MMO, FI)) {
-    if (MFI.isSpillSlotObjectIndex(FI)) {
-      CommentOS << MMO->getSize() << "-byte Folded Spill";
-      Commented = true;
-    }
+  Optional<unsigned> Size;
+  if ((Size = MI.getRestoreSize(TII))) {
+    CommentOS << *Size << "-byte Reload\n";
+  } else if ((Size = MI.getFoldedRestoreSize(TII))) {
+    if (*Size)
+      CommentOS << *Size << "-byte Folded Reload\n";
+  } else if ((Size = MI.getSpillSize(TII))) {
+    CommentOS << *Size << "-byte Spill\n";
+  } else if ((Size = MI.getFoldedSpillSize(TII))) {
+    if (*Size)
+      CommentOS << *Size << "-byte Folded Spill\n";
   }
 
   // Check for spill-induced copies
-  if (MI.getAsmPrinterFlag(MachineInstr::ReloadReuse)) {
-    Commented = true;
-    CommentOS << " Reload Reuse";
-  }
-
-  if (Commented) {
-    if (AP->EnablePrintSchedInfo) {
-      // If any comment was added above and we need sched info comment then add
-      // this new comment just after the above comment w/o "\n" between them.
-      CommentOS << " " << MF->getSubtarget().getSchedInfoStr(MI) << "\n";
-      return true;
-    }
-    CommentOS << "\n";
-  }
-  return false;
+  if (MI.getAsmPrinterFlag(MachineInstr::ReloadReuse))
+    CommentOS << " Reload Reuse\n";
 }
 
 /// emitImplicitDef - This method emits the specified machine instruction
@@ -1065,6 +1039,10 @@ void AsmPrinter::EmitFunctionBody() {
         ++NumInstsInFunction;
       }
 
+      // If there is a pre-instruction symbol, emit a label for it here.
+      if (MCSymbol *S = MI.getPreInstrSymbol())
+        OutStreamer->EmitLabel(S);
+
       if (ShouldPrintDebugScopes) {
         for (const HandlerInfo &HI : Handlers) {
           NamedRegionTimer T(HI.TimerName, HI.TimerDescription,
@@ -1074,10 +1052,8 @@ void AsmPrinter::EmitFunctionBody() {
         }
       }
 
-      if (isVerbose() && emitComments(MI, OutStreamer->GetCommentOS(), this)) {
-        MachineInstr *MIP = const_cast<MachineInstr *>(&MI);
-        MIP->setAsmPrinterFlag(MachineInstr::NoSchedComment);
-      }
+      if (isVerbose())
+        emitComments(MI, OutStreamer->GetCommentOS());
 
       switch (MI.getOpcode()) {
       case TargetOpcode::CFI_INSTRUCTION:
@@ -1091,6 +1067,7 @@ void AsmPrinter::EmitFunctionBody() {
         OutStreamer->EmitLabel(MI.getOperand(0).getMCSymbol());
         break;
       case TargetOpcode::INLINEASM:
+      case TargetOpcode::INLINEASM_BR:
         EmitInlineAsm(&MI);
         break;
       case TargetOpcode::DBG_VALUE:
@@ -1115,6 +1092,10 @@ void AsmPrinter::EmitFunctionBody() {
         EmitInstruction(&MI);
         break;
       }
+
+      // If there is a post-instruction symbol, emit a label for it here.
+      if (MCSymbol *S = MI.getPostInstrSymbol())
+        OutStreamer->EmitLabel(S);
 
       if (ShouldPrintDebugScopes) {
         for (const HandlerInfo &HI : Handlers) {
@@ -1306,9 +1287,19 @@ void AsmPrinter::emitGlobalIndirectSymbol(Module &M,
   else
     assert(GIS.hasLocalLinkage() && "Invalid alias or ifunc linkage");
 
+  bool IsFunction = GIS.getType()->getPointerElementType()->isFunctionTy();
+
+  // Treat bitcasts of functions as functions also. This is important at least
+  // on WebAssembly where object and function addresses can't alias each other.
+  if (!IsFunction)
+    if (auto *CE = dyn_cast<ConstantExpr>(GIS.getIndirectSymbol()))
+      if (CE->getOpcode() == Instruction::BitCast)
+        IsFunction =
+          CE->getOperand(0)->getType()->getPointerElementType()->isFunctionTy();
+
   // Set the symbol type to function if the alias has a function type.
   // This affects codegen when the aliasee is not a function.
-  if (GIS.getType()->getPointerElementType()->isFunctionTy()) {
+  if (IsFunction) {
     OutStreamer->EmitSymbolAttribute(Name, MCSA_ELF_TypeFunction);
     if (isa<GlobalIFunc>(GIS))
       OutStreamer->EmitSymbolAttribute(Name, MCSA_ELF_TypeIndFunction);
@@ -1393,6 +1384,33 @@ bool AsmPrinter::doFinalization(Module &M) {
     }
   }
 
+  if (TM.getTargetTriple().isOSBinFormatCOFF()) {
+    MachineModuleInfoCOFF &MMICOFF =
+        MMI->getObjFileInfo<MachineModuleInfoCOFF>();
+
+    // Output stubs for external and common global variables.
+    MachineModuleInfoCOFF::SymbolListTy Stubs = MMICOFF.GetGVStubList();
+    if (!Stubs.empty()) {
+      const DataLayout &DL = M.getDataLayout();
+
+      for (const auto &Stub : Stubs) {
+        SmallString<256> SectionName = StringRef(".rdata$");
+        SectionName += Stub.first->getName();
+        OutStreamer->SwitchSection(OutContext.getCOFFSection(
+            SectionName,
+            COFF::IMAGE_SCN_CNT_INITIALIZED_DATA | COFF::IMAGE_SCN_MEM_READ |
+                COFF::IMAGE_SCN_LNK_COMDAT,
+            SectionKind::getReadOnly(), Stub.first->getName(),
+            COFF::IMAGE_COMDAT_SELECT_ANY));
+        EmitAlignment(Log2_32(DL.getPointerSize()));
+        OutStreamer->EmitSymbolAttribute(Stub.first, MCSA_Global);
+        OutStreamer->EmitLabel(Stub.first);
+        OutStreamer->EmitSymbolValue(Stub.second.getPointer(),
+                                     DL.getPointerSize());
+      }
+    }
+  }
+
   // Finalize debug and EH information.
   for (const HandlerInfo &HI : Handlers) {
     NamedRegionTimer T(HI.TimerName, HI.TimerDescription, HI.TimerGroupName,
@@ -1448,6 +1466,9 @@ bool AsmPrinter::doFinalization(Module &M) {
 
   // Emit llvm.ident metadata in an '.ident' directive.
   EmitModuleIdents(M);
+
+  // Emit bytes for llvm.commandline metadata.
+  EmitModuleCommandLines(M);
 
   // Emit __morestack address if needed for indirect calls.
   if (MMI->usesMorestackAddr()) {
@@ -1529,6 +1550,16 @@ bool AsmPrinter::doFinalization(Module &M) {
     }
   }
 
+  if (TM.Options.EmitAddrsig) {
+    // Emit address-significance attributes for all globals.
+    OutStreamer->EmitAddrsig();
+    for (const GlobalValue &GV : M.global_values())
+      if (!GV.use_empty() && !GV.isThreadLocal() &&
+          !GV.hasDLLImportStorageClass() && !GV.getName().startswith("llvm.") &&
+          !GV.hasAtLeastLocalUnnamedAddr())
+        OutStreamer->EmitAddrsigSym(getSymbol(&GV));
+  }
+
   // Allow the target to emit any magic that it wants at the end of the file,
   // after everything else has gone out.
   EmitEndOfAsmFile(M);
@@ -1565,11 +1596,6 @@ void AsmPrinter::SetupMachineFunction(MachineFunction &MF) {
   }
 
   ORE = &getAnalysis<MachineOptimizationRemarkEmitterPass>().getORE();
-
-  const TargetSubtargetInfo &STI = MF.getSubtarget();
-  EnablePrintSchedInfo = PrintSchedule.getNumOccurrences()
-                             ? PrintSchedule
-                             : STI.supportPrintSchedInfo();
 }
 
 namespace {
@@ -1842,8 +1868,7 @@ bool AsmPrinter::EmitSpecialLLVMGlobal(const GlobalVariable *GV) {
 }
 
 /// EmitLLVMUsedList - For targets that define a MAI::UsedDirective, mark each
-/// global in the specified llvm.used list for which emitUsedDirectiveFor
-/// is true, as being used with this directive.
+/// global in the specified llvm.used list.
 void AsmPrinter::EmitLLVMUsedList(const ConstantArray *InitList) {
   // Should be an array of 'i8*'.
   for (unsigned i = 0, e = InitList->getNumOperands(); i != e; ++i) {
@@ -1946,6 +1971,29 @@ void AsmPrinter::EmitModuleIdents(Module &M) {
       OutStreamer->EmitIdent(S->getString());
     }
   }
+}
+
+void AsmPrinter::EmitModuleCommandLines(Module &M) {
+  MCSection *CommandLine = getObjFileLowering().getSectionForCommandLines();
+  if (!CommandLine)
+    return;
+
+  const NamedMDNode *NMD = M.getNamedMetadata("llvm.commandline");
+  if (!NMD || !NMD->getNumOperands())
+    return;
+
+  OutStreamer->PushSection();
+  OutStreamer->SwitchSection(CommandLine);
+  OutStreamer->EmitZeros(1);
+  for (unsigned i = 0, e = NMD->getNumOperands(); i != e; ++i) {
+    const MDNode *N = NMD->getOperand(i);
+    assert(N->getNumOperands() == 1 &&
+           "llvm.commandline metadata entry can have only one operand");
+    const MDString *S = cast<MDString>(N->getOperand(0));
+    OutStreamer->EmitBytes(S->getString());
+    OutStreamer->EmitZeros(1);
+  }
+  OutStreamer->PopSection();
 }
 
 //===--------------------------------------------------------------------===//
@@ -2654,6 +2702,25 @@ MCSymbol *AsmPrinter::GetBlockAddressSymbol(const BasicBlock *BB) const {
 
 /// GetCPISymbol - Return the symbol for the specified constant pool entry.
 MCSymbol *AsmPrinter::GetCPISymbol(unsigned CPID) const {
+  if (getSubtargetInfo().getTargetTriple().isKnownWindowsMSVCEnvironment()) {
+    const MachineConstantPoolEntry &CPE =
+        MF->getConstantPool()->getConstants()[CPID];
+    if (!CPE.isMachineConstantPoolEntry()) {
+      const DataLayout &DL = MF->getDataLayout();
+      SectionKind Kind = CPE.getSectionKind(&DL);
+      const Constant *C = CPE.Val.ConstVal;
+      unsigned Align = CPE.Alignment;
+      if (const MCSectionCOFF *S = dyn_cast<MCSectionCOFF>(
+              getObjFileLowering().getSectionForConstant(DL, Kind, C, Align))) {
+        if (MCSymbol *Sym = S->getCOMDATSymbol()) {
+          if (Sym->isUndefined())
+            OutStreamer->EmitSymbolAttribute(Sym, MCSA_Global);
+          return Sym;
+        }
+      }
+    }
+  }
+
   const DataLayout &DL = getDataLayout();
   return OutContext.getOrCreateSymbol(Twine(DL.getPrivateGlobalPrefix()) +
                                       "CPI" + Twine(getFunctionNumber()) + "_" +
@@ -2898,11 +2965,6 @@ GCMetadataPrinter *AsmPrinter::GetOrCreateGCPrinter(GCStrategy &S) {
   if (!S.usesMetadata())
     return nullptr;
 
-  assert(!S.useStatepoints() && "statepoints do not currently support custom"
-         " stackmap formats, please see the documentation for a description of"
-         " the default format.  If you really need a custom serialized format,"
-         " please file a bug");
-
   gcp_map_type &GCMap = getGCMap(GCMetadataPrinters);
   gcp_map_type::iterator GCPI = GCMap.find(&S);
   if (GCPI != GCMap.end())
@@ -2921,6 +2983,27 @@ GCMetadataPrinter *AsmPrinter::GetOrCreateGCPrinter(GCStrategy &S) {
     }
 
   report_fatal_error("no GCMetadataPrinter registered for GC: " + Twine(Name));
+}
+
+void AsmPrinter::emitStackMaps(StackMaps &SM) {
+  GCModuleInfo *MI = getAnalysisIfAvailable<GCModuleInfo>();
+  assert(MI && "AsmPrinter didn't require GCModuleInfo?");
+  bool NeedsDefault = false;
+  if (MI->begin() == MI->end())
+    // No GC strategy, use the default format.
+    NeedsDefault = true;
+  else
+    for (auto &I : *MI) {
+      if (GCMetadataPrinter *MP = GetOrCreateGCPrinter(*I))
+        if (MP->emitStackMaps(SM, *this))
+          continue;
+      // The strategy doesn't have printer or doesn't emit custom stack maps.
+      // Use the default format.
+      NeedsDefault = true;
+    }
+
+  if (NeedsDefault)
+    SM.serializeToStackMapSection();
 }
 
 /// Pin vtable to this file.

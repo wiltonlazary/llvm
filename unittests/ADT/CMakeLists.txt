@@ -3,6 +3,7 @@ set(LLVM_LINK_COMPONENTS
   )
 
 add_llvm_unittest(ADTTests
+  AnyTest.cpp
   APFloatTest.cpp
   APIntTest.cpp
   APSIntTest.cpp
@@ -17,6 +18,7 @@ add_llvm_unittest(ADTTests
   DenseSetTest.cpp
   DepthFirstIteratorTest.cpp
   EquivalenceClassesTest.cpp
+  FallibleIteratorTest.cpp
   FoldingSet.cpp
   FunctionExtrasTest.cpp
   FunctionRefTest.cpp
@@ -27,6 +29,7 @@ add_llvm_unittest(ADTTests
   IListNodeTest.cpp
   IListSentinelTest.cpp
   IListTest.cpp
+  ImmutableListTest.cpp
   ImmutableMapTest.cpp
   ImmutableSetTest.cpp
   IntEqClassesTest.cpp
@@ -68,5 +71,7 @@ add_llvm_unittest(ADTTests
   TwineTest.cpp
   VariadicFunctionTest.cpp
   )
+
+target_link_libraries(ADTTests PRIVATE LLVMTestingSupport)
 
 add_dependencies(ADTTests intrinsics_gen)
